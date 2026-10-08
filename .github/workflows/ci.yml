@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - name: musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: static musl binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/inlet | grep -Eq "statically linked|static-pie linked"
+      - name: release RSS
+        run: cargo test --release --test live empty_daemon_rss_when_asked -- --exact
+        env:
+          INLET_RSS: "1"
