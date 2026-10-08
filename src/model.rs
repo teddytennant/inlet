@@ -140,12 +140,31 @@ pub enum Record {
     Sign {
         ts: u64,
     },
+    Vote {
+        id: String,
+        voter: String,
+        role: String,
+        target: String,
+        channel: String,
+        choice: String,
+        weight: u64,
+        ts: u64,
+    },
+    /// Board outcome. Mute, demote, move, flag, or a pin recommendation.
+    Moderation {
+        id: String,
+        target: String,
+        action: String,
+        channel: String,
+        weight: u64,
+        ts: u64,
+    },
 }
 
 #[derive(Debug)]
 pub enum Decoded {
     Rec(Box<Record>),
-    /// A future kind (`vote`, `moderation`, …). Valid framing, not our problem yet.
+    /// A kind this binary does not apply. Valid framing, left in the log.
     Opaque,
 }
 
@@ -156,7 +175,7 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
-        | "reset" | "result" | "promote" | "bind" | "clear" | "sign" => {
+        | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation" => {
             Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
         }
         _ => Ok(Decoded::Opaque),

@@ -45,6 +45,7 @@ pub fn run() -> Result<()> {
             let v = proto::rpc(&home, json!({"op":"post","text": text}))?;
             print_ok(&v)
         }
+        Some("vote") => vote(&home, &args[1..]),
         Some("pin") => {
             let name = args.get(1).ok_or_else(|| err("usage: inlet pin <name>"))?;
             let v = proto::rpc(&home, json!({"op":"pin","name": name}))?;
@@ -73,6 +74,7 @@ inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--seed DIR]
 inlet add -f tasks.jsonl
 inlet post <text>
+inlet vote <target> <choice> [--channel NAME] [--human]
 inlet bind <text>
 inlet clear <id>
 inlet sign
@@ -83,6 +85,38 @@ inlet pin <name>
 inlet watch [--debug N] [--worker ID]
 inlet status [--json]
 ";
+
+fn vote(home: &Path, args: &[String]) -> Result<()> {
+    let usage = "usage: inlet vote <target> <choice> [--channel NAME] [--human]";
+    let mut target = None;
+    let mut choice = None;
+    let mut channel = String::from("general");
+    let mut human = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--human" {
+            human = true;
+        } else if arg == "--channel" {
+            i += 1;
+            channel = args.get(i).cloned().ok_or_else(|| err(usage))?;
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else if choice.is_none() {
+            choice = Some(arg.clone());
+        } else {
+            return Err(err(usage));
+        }
+        i += 1;
+    }
+    let target = target.ok_or_else(|| err(usage))?;
+    let choice = choice.ok_or_else(|| err(usage))?;
+    let v = proto::rpc(
+        home,
+        json!({"op":"vote","target": target, "choice": choice, "channel": channel, "human": human}),
+    )?;
+    print_ok(&v)
+}
 
 fn init(home: &Path, args: &[String]) -> Result<()> {
     if !args.is_empty() {

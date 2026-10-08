@@ -216,6 +216,7 @@ Lines starting with `/` are operator commands and do not appear as chat:
 /kill <id>
 /budget <id> <tokens>   top-up, goes through the gate
 /pin <recipe>
+/vote <target> <choice> [channel]
 /debug <0-4>
 /follow <id>            tail one worker in the same view, esc leaves
 /sign                   sign the policy draft
@@ -234,6 +235,7 @@ inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--s
           [--memory-mb N] [--pids N] [--value N] [-t <tag>]... [--parent <id>] [--seed <dir>]
 inlet add -f tasks.jsonl
 inlet post <text>
+inlet vote <target> <choice> [--channel NAME] [--human]
 inlet bind <text>
 inlet clear <id>
 inlet watch [--debug N] [--worker id]

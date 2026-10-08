@@ -95,6 +95,21 @@ impl Ui {
                 "clear {}",
                 short(value["id"].as_str().unwrap_or(""))
             )),
+            Some("vote") => self.push(format!(
+                "vote {} {} {}",
+                short(value["voter"].as_str().unwrap_or("")),
+                value["choice"].as_str().unwrap_or(""),
+                short(value["target"].as_str().unwrap_or(""))
+            )),
+            Some("moderation") => {
+                let action = value["action"].as_str().unwrap_or("");
+                let target = value["target"].as_str().unwrap_or("");
+                if action == "mute" {
+                    let prefix = format!("{target}  ");
+                    self.lines.retain(|line| !line.starts_with(&prefix));
+                }
+                self.push(format!("moderation {action} {}", short(target)));
+            }
             Some("admit") | Some("spawn") | Some("kill") | Some("task") | Some("reset") => {
                 self.push(format!(
                     "{ev} {id}",
@@ -214,6 +229,27 @@ impl Ui {
                     self.secret = Some(Pending::Clear(id));
                     self.push("passphrase".into());
                     KeyAction::None
+                }
+                "vote" => {
+                    let Some(target) = parts.first() else {
+                        self.push("vote needs a target and a choice".into());
+                        return KeyAction::None;
+                    };
+                    let Some(choice) = parts.get(1) else {
+                        self.push("vote needs a target and a choice".into());
+                        return KeyAction::None;
+                    };
+                    let channel = parts.get(2).map(String::as_str).unwrap_or("general");
+                    KeyAction::Send(
+                        serde_json::json!({
+                            "op": "vote",
+                            "target": target,
+                            "choice": choice,
+                            "channel": channel,
+                            "human": true,
+                        })
+                        .to_string(),
+                    )
                 }
                 "kill" => {
                     let Some(id) = parts.first() else {
@@ -464,6 +500,19 @@ mod tests {
                 assert!(line.contains("@all"));
             }
             _ => panic!("text should post"),
+        }
+        match ui.command("/vote abc mute code".into()) {
+            KeyAction::Send(line) => {
+                assert!(line.contains("\"op\":\"vote\""));
+                assert!(line.contains("\"human\":true"));
+                assert!(line.contains("mute"));
+                assert!(line.contains("code"));
+            }
+            _ => panic!("vote"),
+        }
+        match ui.command("/budget x 1".into()) {
+            KeyAction::None => {}
+            _ => panic!("budget stays off the board"),
         }
         match ui.command("/debug 3".into()) {
             KeyAction::Send(line) => assert!(line.contains("\"level\":3")),

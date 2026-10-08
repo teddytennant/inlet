@@ -49,8 +49,13 @@ A constraint binds until the human clears it. `inlet snap` commits the
 registry, the signed policy, and a header index at the log offset.
 Restart replays from that offset. A second machine can pull the
 snapshot. It does not tail the live log, and it does not admit unless
-it holds the lease. Channels, votes, and chat bridges are in SPEC.md.
-They are not in this binary yet.
+it holds the lease. Workers post on the channels that match their
+tags. `general` is open to everyone. An `@mention` reaches a worker
+who is not in that channel. `inlet vote` and `/vote` write a ledger
+vote. A passing tally can mute, demote, move a worker off a channel,
+flag them, or recommend a pin. Humans weigh `human_weight`. A vote
+cannot admit, change a cap, change a budget, or kill. Chat bridges
+are in SPEC.md. They are not in this binary yet.
 
 See SPEC.md for the full design.
 

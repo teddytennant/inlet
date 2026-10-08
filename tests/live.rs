@@ -489,7 +489,7 @@ fn torn_tail_and_damage_and_opaque() {
     thread::sleep(Duration::from_millis(250));
     drop(daemon);
 
-    let body = br#"{"kind":"vote","voter":"you","choice":"pin","weight":4}"#;
+    let body = br#"{"kind":"future","voter":"you","choice":"pin","weight":4}"#;
     let mut frame = Vec::new();
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(&ledger::crc32(body).to_le_bytes());
@@ -4446,5 +4446,447 @@ fn worker_line_posts() {
         thread::sleep(Duration::from_millis(40));
     }
     assert!(found, "{}", daemon.log());
+    let _ = daemon;
+}
+
+fn inlet_out(home: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--home").arg(home);
+    cmd.args(args);
+    cmd.output().unwrap()
+}
+
+fn post_texts(v: &Value) -> Vec<String> {
+    v.get("posts")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|post| {
+                    post.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn has_moderation(v: &Value, action: &str, target: &str) -> bool {
+    v.get("moderation")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|item| item["action"] == action && item["target"] == target)
+        })
+        .unwrap_or(false)
+}
+
+fn append_frame(path: &Path, body: &[u8]) {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&ledger::crc32(body).to_le_bytes());
+    frame.extend_from_slice(body);
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(&frame)
+        .unwrap();
+}
+
+#[test]
+fn channels_follow_tags() {
+    let home = scratch("channels");
+    policy(
+        &home,
+        &base_policy(
+            r#"mathy = { cmd = { "/bin/sleep", "60" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "code-nap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "30",
+        ],
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "mathy",
+            "--goal",
+            "math-nap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .filter(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+            .count()
+            == 2
+    });
+    let code = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "sleeper")
+        .unwrap();
+    let math = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "mathy")
+        .unwrap();
+    let code_id = code["id"].as_str().unwrap().to_string();
+    let math_id = math["id"].as_str().unwrap().to_string();
+    let code_tok = token_of(code["pid"].as_i64().unwrap());
+    let math_tok = token_of(math["pid"].as_i64().unwrap());
+    let posted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": code_tok, "channel":"code","text":"secret-code"}),
+    );
+    assert_eq!(posted["ok"], true, "{posted} {}", daemon.log());
+    let math_board = worker_rpc(&home, serde_json::json!({"op":"board","token": math_tok}));
+    assert!(
+        !post_texts(&math_board)
+            .iter()
+            .any(|t| t.contains("secret-code")),
+        "{math_board}"
+    );
+    let mention = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": code_tok, "channel":"code","text": format!("@{math_id} ping-math")}),
+    );
+    assert_eq!(mention["ok"], true, "{mention}");
+    let math_board = worker_rpc(&home, serde_json::json!({"op":"board","token": math_tok}));
+    assert!(
+        post_texts(&math_board)
+            .iter()
+            .any(|t| t.contains("ping-math")),
+        "{math_board}"
+    );
+    assert!(
+        !post_texts(&math_board)
+            .iter()
+            .any(|t| t.contains("secret-code")),
+        "{math_board}"
+    );
+    let rejected = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": math_tok, "channel":"code","text":"nope"}),
+    );
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    let foreign = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "post",
+            "token": math_tok,
+            "channel": code_id.to_ascii_lowercase(),
+            "text": "dm"
+        }),
+    );
+    assert_eq!(foreign["ok"], false, "{foreign}");
+    let general = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": math_tok, "text":"on-general"}),
+    );
+    assert_eq!(general["ok"], true, "{general}");
+    let code_board = worker_rpc(&home, serde_json::json!({"op":"board","token": code_tok}));
+    let seen = post_texts(&code_board);
+    assert!(seen.iter().any(|t| t.contains("secret-code")), "{seen:?}");
+    assert!(seen.iter().any(|t| t.contains("on-general")), "{seen:?}");
+    let _ = daemon;
+}
+
+#[test]
+fn board_votes_moderate() {
+    let home = scratch("votes");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    for goal in ["vote-0", "vote-1", "vote-2", "vote-3"] {
+        inlet(
+            &home,
+            &[
+                "add",
+                "--worker",
+                "sleeper",
+                "--goal",
+                goal,
+                "--no-verify",
+                "--tokens",
+                "20",
+                "--seconds",
+                "30",
+            ],
+        );
+    }
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .filter(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+            .count()
+            == 4
+    });
+    let (target, demote_id, target_tok, voter_toks) = {
+        let mut workers = tasks(&st);
+        workers.sort_by_key(|t| t["goal"].as_str().unwrap_or("").to_string());
+        let target = workers[0]["id"].as_str().unwrap().to_string();
+        let demote_id = workers[1]["id"].as_str().unwrap().to_string();
+        let target_tok = token_of(workers[0]["pid"].as_i64().unwrap());
+        let voter_toks: Vec<String> = workers[1..]
+            .iter()
+            .map(|t| token_of(t["pid"].as_i64().unwrap()))
+            .collect();
+        (target, demote_id, target_tok, voter_toks)
+    };
+    let posted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": target_tok, "text":"spam-post"}),
+    );
+    assert_eq!(posted["ok"], true, "{posted}");
+    let on_code = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": target_tok, "channel":"code","text":"code-secret"}),
+    );
+    assert_eq!(on_code["ok"], true, "{on_code}");
+    let available = status(&home)["available"].clone();
+    for token in &voter_toks {
+        let reply = worker_rpc(
+            &home,
+            serde_json::json!({"op":"vote","token": token, "target": target, "choice":"mute","human":true}),
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["weight"], 1, "{reply}");
+        assert!(reply["moderation"].is_null(), "{reply}");
+    }
+    let st = status(&home);
+    assert!(!has_moderation(&st, "mute", &target), "{st}");
+    assert!(post_texts(&st).iter().any(|t| t == "spam-post"), "{st}");
+    let killed = inlet_out(&home, &["vote", &target, "kill"]);
+    assert!(!killed.status.success(), "kill vote was accepted");
+    let err = String::from_utf8_lossy(&killed.stderr);
+    assert!(err.contains("a vote cannot kill"), "{err}");
+    let st = status(&home);
+    assert_eq!(st["available"], available, "{st}");
+    assert!(
+        tasks(&st)
+            .iter()
+            .any(|t| t["id"] == target && t["state"] == "running"),
+        "{st}"
+    );
+    inlet(&home, &["vote", &target, "mute", "--human"]);
+    let st = status(&home);
+    assert!(has_moderation(&st, "mute", &target), "{st}");
+    assert!(!post_texts(&st).iter().any(|t| t == "spam-post"), "{st}");
+    let again = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": target_tok, "text":"still-spam"}),
+    );
+    assert_eq!(again["ok"], true, "{again}");
+    assert!(!post_texts(&status(&home)).iter().any(|t| t == "still-spam"));
+    inlet(&home, &["vote", &demote_id, "demote", "--human"]);
+    let demoted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"vote","token": voter_toks[0], "target":"nope","choice":"pin"}),
+    );
+    assert_eq!(demoted["weight"], 0, "{demoted}");
+    assert!(demoted["moderation"].is_null(), "{demoted}");
+    assert!(!has_moderation(&status(&home), "pin", "nope"));
+    inlet(
+        &home,
+        &["vote", &target, "move", "--channel", "code", "--human"],
+    );
+    let stayed = inlet_out(
+        &home,
+        &["vote", &target, "move", "--channel", "general", "--human"],
+    );
+    assert!(!stayed.status.success(), "general was closed");
+    assert!(
+        String::from_utf8_lossy(&stayed.stderr).contains("general stays open"),
+        "{}",
+        String::from_utf8_lossy(&stayed.stderr)
+    );
+    let after = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": voter_toks[1], "channel":"code","text":"after-move-code"}),
+    );
+    assert_eq!(after["ok"], true, "{after}");
+    let ambient = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": voter_toks[1], "text":"still-general"}),
+    );
+    assert_eq!(ambient["ok"], true, "{ambient}");
+    let board = worker_rpc(&home, serde_json::json!({"op":"board","token": target_tok}));
+    let seen = post_texts(&board);
+    assert!(
+        !seen.iter().any(|t| t.contains("after-move-code")),
+        "{seen:?}"
+    );
+    assert!(seen.iter().any(|t| t.contains("still-general")), "{seen:?}");
+    assert!(!seen.iter().any(|t| t.contains("spam-post")), "{seen:?}");
+    inlet(&home, &["vote", &target, "flag"]);
+    assert!(!has_moderation(&status(&home), "flag", &target));
+    inlet(&home, &["vote", &target, "flag", "--human"]);
+    let st = status(&home);
+    assert!(has_moderation(&st, "flag", &target), "{st}");
+    assert!(
+        st["posts"].as_array().unwrap().iter().any(|post| {
+            post["author"] == "board"
+                && post["role"] == "operator"
+                && post["text"] == format!("flag {target}")
+        }),
+        "{st}"
+    );
+    assert!(
+        tasks(&st)
+            .iter()
+            .any(|t| t["id"] == target && t["state"] == "running"),
+        "{st}"
+    );
+    inlet(&home, &["vote", "nope", "pin", "--human"]);
+    assert!(has_moderation(&status(&home), "pin", "nope"));
+    assert!(!home.join("registry/recipes/nope/run").exists());
+    assert_eq!(status(&home)["available"], available);
+    thread::sleep(Duration::from_millis(300));
+    let decoded = read_log(&home);
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Post { text, .. } if text == "spam-post"))));
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Post { text, .. } if text == "still-spam"))));
+    assert!(decoded.iter().any(
+        |d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Vote { weight: 0, .. }))
+    ));
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Vote { role, weight, choice, .. } if role == "human" && *weight == 4 && choice == "mute"))));
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Vote { role, weight, choice, .. } if role == "operator" && *weight == 1 && choice == "flag"))));
+    assert!(!decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Vote { choice, .. } if choice == "kill"))));
+    for action in ["mute", "demote", "move", "flag", "pin"] {
+        assert!(
+            decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Moderation { action: got, .. } if got == action))),
+            "missing {action}"
+        );
+    }
+    let (offset, _) = parse_snap(&inlet(&home, &["snap"]));
+    assert!(offset > 64, "{offset}");
+    let index = fs::read_to_string(home.join("snap/index.json")).unwrap();
+    assert!(index.contains("spam-post"), "{index}");
+    assert!(index.contains("\"action\":\"mute\""), "{index}");
+    stop(&mut daemon);
+    let mut buf = fs::read(home.join("ledger/log")).unwrap();
+    assert!(buf.len() as u64 >= offset);
+    buf[12] ^= 0xff;
+    fs::write(home.join("ledger/log"), &buf).unwrap();
+    let daemon = start(&home);
+    let st = status(&home);
+    assert!(
+        has_moderation(&st, "mute", &target),
+        "{st} {}",
+        daemon.log()
+    );
+    assert!(!post_texts(&st).iter().any(|t| t == "spam-post"), "{st}");
+    assert!(
+        st["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|post| post["text"] == format!("flag {target}")),
+        "{st}"
+    );
+    assert_eq!(
+        st["moderation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["action"] == "mute" && item["target"] == target)
+            .count(),
+        1,
+        "{st}"
+    );
+    let _ = daemon;
+}
+
+#[test]
+fn vote_settles_after_restart() {
+    let home = scratch("votesettle");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "gap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let posted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": token, "text":"gap-spam"}),
+    );
+    assert_eq!(posted["ok"], true, "{posted}");
+    stop(&mut daemon);
+    let body = format!(
+        r#"{{"kind":"vote","id":"gapvote0001","voter":"you","role":"human","target":"{id}","channel":"general","choice":"mute","weight":4,"ts":1}}"#
+    );
+    append_frame(&home.join("ledger/log"), body.as_bytes());
+    let mut daemon = start(&home);
+    let st = status(&home);
+    assert!(has_moderation(&st, "mute", &id), "{st} {}", daemon.log());
+    assert!(!post_texts(&st).iter().any(|t| t == "gap-spam"), "{st}");
+    let available = st["available"].clone();
+    let spent = st["spent"].clone();
+    stop(&mut daemon);
+    let decoded = read_log(&home);
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Post { text, .. } if text == "gap-spam"))));
+    assert!(decoded
+        .iter()
+        .any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Vote { .. }))));
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Moderation { action, .. } if action == "mute"))));
+    let daemon = start(&home);
+    let st = status(&home);
+    assert_eq!(st["available"], available, "{st} {}", daemon.log());
+    assert_eq!(st["spent"], spent, "{st}");
+    assert!(!post_texts(&st).iter().any(|t| t == "gap-spam"), "{st}");
+    assert_eq!(
+        st["moderation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["action"] == "mute")
+            .count(),
+        1,
+        "{st}"
+    );
     let _ = daemon;
 }

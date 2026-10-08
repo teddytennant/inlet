@@ -15,7 +15,7 @@ use crate::error::{err, Result};
 use crate::model::{Budget, Decoded, TaskState};
 use crate::paths;
 use crate::purse::{OpenSlice, Purse};
-use crate::state::{ConstraintView, PostView, State, TaskView};
+use crate::state::{ConstraintView, ModerationView, PostView, State, TaskView, VoteView};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Lease {
@@ -35,6 +35,10 @@ pub(crate) struct Index {
     retried: Vec<String>,
     decision_spent: u64,
     purse: PurseSnap,
+    #[serde(default)]
+    votes: Vec<VoteSnap>,
+    #[serde(default)]
+    moderation: Vec<ModerationSnap>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -71,6 +75,28 @@ struct PostSnap {
     channel: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mentions: Vec<String>,
+    ts: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct VoteSnap {
+    id: String,
+    voter: String,
+    role: String,
+    target: String,
+    channel: String,
+    choice: String,
+    weight: u64,
+    ts: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ModerationSnap {
+    id: String,
+    target: String,
+    action: String,
+    channel: String,
+    weight: u64,
     ts: u64,
 }
 
@@ -223,6 +249,32 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
         constraints,
         retried,
         decision_spent: state.decision_spent,
+        votes: state
+            .votes
+            .values()
+            .map(|vote| VoteSnap {
+                id: vote.id.clone(),
+                voter: vote.voter.clone(),
+                role: vote.role.clone(),
+                target: vote.target.clone(),
+                channel: vote.channel.clone(),
+                choice: vote.choice.clone(),
+                weight: vote.weight,
+                ts: vote.ts,
+            })
+            .collect(),
+        moderation: state
+            .moderation
+            .iter()
+            .map(|item| ModerationSnap {
+                id: item.id.clone(),
+                target: item.target.clone(),
+                action: item.action.clone(),
+                channel: item.channel.clone(),
+                weight: item.weight,
+                ts: item.ts,
+            })
+            .collect(),
         purse: PurseSnap {
             cap: purse.cap,
             memory_cap: purse.memory_cap,
@@ -291,6 +343,41 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
         .collect();
     state.retried = index.retried.iter().cloned().collect();
     state.decision_spent = index.decision_spent;
+    state.votes = index
+        .votes
+        .iter()
+        .map(|vote| {
+            (
+                (
+                    vote.voter.clone(),
+                    vote.target.clone(),
+                    vote.channel.clone(),
+                ),
+                VoteView {
+                    id: vote.id.clone(),
+                    voter: vote.voter.clone(),
+                    role: vote.role.clone(),
+                    target: vote.target.clone(),
+                    channel: vote.channel.clone(),
+                    choice: vote.choice.clone(),
+                    weight: vote.weight,
+                    ts: vote.ts,
+                },
+            )
+        })
+        .collect();
+    state.moderation = index
+        .moderation
+        .iter()
+        .map(|item| ModerationView {
+            id: item.id.clone(),
+            target: item.target.clone(),
+            action: item.action.clone(),
+            channel: item.channel.clone(),
+            weight: item.weight,
+            ts: item.ts,
+        })
+        .collect();
     let mut open = BTreeMap::new();
     for slice in &index.purse.open {
         open.insert(

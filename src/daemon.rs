@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::board;
 use crate::cell::{self, SpawnRequest};
 use crate::config::{AdmitCtx, DecisionKind, OnCrash, Policy};
 use crate::decision::{self, Answer, Call, ConstraintIn, Header, PostIn};
@@ -27,7 +28,7 @@ use crate::proto::{self, NewTask, Request};
 use crate::proxy::{self, Hub, Note};
 use crate::registry;
 use crate::snap;
-use crate::state::State;
+use crate::state::{PostView, State};
 use crate::text::mentions;
 
 const SOFT_FLUSH: Duration = Duration::from_millis(50);
@@ -424,7 +425,7 @@ impl Daemon {
                 true,
             )?;
         }
-        Ok(())
+        self.settle()
     }
 
     fn commit(&mut self, recs: &[Record], hard: bool) -> Result<()> {
@@ -1236,23 +1237,23 @@ impl Daemon {
                     client.watch = true;
                 }
                 self.hub.set_debug(self.max_debug());
-                let mut status = self.status_json();
-                status["posts"] = json!(self
-                    .state
-                    .posts
-                    .iter()
-                    .map(|p| json!({
-                        "id": p.id,
-                        "author": p.author,
-                        "role": p.role,
-                        "text": p.text,
-                        "weight": p.weight,
-                        "channel": p.channel,
-                        "mentions": p.mentions,
-                        "ts": p.ts,
-                    }))
-                    .collect::<Vec<_>>());
-                self.reply(id, status);
+                self.reply(id, self.status_json());
+            }
+            Request::Vote {
+                target,
+                choice,
+                channel,
+                human,
+            } => {
+                let (voter, role) = if human {
+                    ("you", "human")
+                } else {
+                    ("operator", "operator")
+                };
+                match self.cast(voter, role, &target, &choice, &channel) {
+                    Ok(body) => self.reply(id, body),
+                    Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+                }
             }
             Request::Bind(text) => match self.bind_text(&text) {
                 Ok(cid) => self.reply(id, json!({"ok": true, "id": cid})),
@@ -1301,6 +1302,8 @@ impl Daemon {
         let reply = match value.get("op").and_then(|op| op.as_str()).unwrap_or("") {
             "spawn" => self.worker_spawn(&value),
             "post" => self.worker_post(&value),
+            "board" => self.worker_board(&value),
+            "vote" => self.worker_vote(&value),
             "draft" => self.worker_draft(&value),
             other => Err(err(format!("unknown op {other}"))),
         };
@@ -1395,6 +1398,18 @@ impl Daemon {
         if text.is_empty() {
             return Err(err("empty post"));
         }
+        let channel = value
+            .get("channel")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("general");
+        let tags = self
+            .state
+            .tasks
+            .get(&author)
+            .map(|task| task.tags.clone())
+            .unwrap_or_default();
+        board::ensure_post(&tags, &self.state, &author, channel)?;
         let id = id::ulid();
         self.commit(
             &[Record::Post {
@@ -1403,13 +1418,127 @@ impl Daemon {
                 role: "worker".into(),
                 text: text.into(),
                 weight: 1,
-                channel: "general".into(),
+                channel: channel.into(),
                 mentions: mentions(text),
                 ts: now_ms(),
             }],
             false,
         )?;
         Ok(json!({"ok": true, "id": id}))
+    }
+
+    fn worker_board(&self, value: &Value) -> Result<Value> {
+        let reader = self.worker_id(value)?;
+        let tags = self
+            .state
+            .tasks
+            .get(&reader)
+            .map(|task| task.tags.clone())
+            .unwrap_or_default();
+        let posts: Vec<Value> = self
+            .state
+            .posts
+            .iter()
+            .filter(|post| board::show_post(&self.state, &reader, &tags, post))
+            .map(post_json)
+            .collect();
+        Ok(json!({"ok": true, "posts": posts}))
+    }
+
+    fn worker_vote(&mut self, value: &Value) -> Result<Value> {
+        let voter = self.worker_id(value)?;
+        let target = value
+            .get("target")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim();
+        let choice = value
+            .get("choice")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim();
+        let channel = value
+            .get("channel")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("general");
+        self.cast(&voter, "worker", target, choice, channel)
+    }
+
+    fn cast(
+        &mut self,
+        voter: &str,
+        role: &str,
+        target: &str,
+        choice: &str,
+        channel: &str,
+    ) -> Result<Value> {
+        let target = target.trim();
+        let choice = choice.trim();
+        if target.is_empty() || choice.is_empty() {
+            return Err(err("missing target"));
+        }
+        board::ensure_choice(choice, channel)?;
+        let weight = board::weight_for(
+            role,
+            self.policy.cfg.human_weight,
+            board::demoted(&self.state, voter),
+        );
+        let id = id::ulid();
+        self.commit(
+            &[Record::Vote {
+                id: id.clone(),
+                voter: voter.to_string(),
+                role: role.to_string(),
+                target: target.to_string(),
+                channel: channel.to_string(),
+                choice: choice.to_string(),
+                weight,
+                ts: now_ms(),
+            }],
+            false,
+        )?;
+        self.settle()?;
+        let moderation = self
+            .state
+            .moderation
+            .iter()
+            .rev()
+            .find(|item| item.target == target && item.action == choice && item.channel == channel)
+            .map(|item| item.id.clone());
+        Ok(json!({"ok": true, "id": id, "weight": weight, "moderation": moderation}))
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        let due = board::passing(&self.state, self.policy.cfg.human_weight);
+        if due.is_empty() {
+            return Ok(());
+        }
+        let ts = now_ms();
+        let mut recs = Vec::new();
+        for item in due {
+            recs.push(Record::Moderation {
+                id: id::ulid(),
+                target: item.target.clone(),
+                action: item.action.clone(),
+                channel: item.channel.clone(),
+                weight: item.weight,
+                ts,
+            });
+            if item.action == "flag" {
+                recs.push(Record::Post {
+                    id: id::ulid(),
+                    author: "board".into(),
+                    role: "operator".into(),
+                    text: format!("flag {}", item.target),
+                    weight: 1,
+                    channel: item.channel,
+                    mentions: Vec::new(),
+                    ts,
+                });
+            }
+        }
+        self.commit(&recs, false)
     }
 
     fn worker_draft(&mut self, value: &Value) -> Result<Value> {
@@ -1605,6 +1734,15 @@ impl Daemon {
             "fence": self.fence,
             "snap_offset": self.snap_offset,
             "tasks": tasks,
+            "posts": self.state.posts.iter().filter(|post| board::operator_sees(&self.state, post)).map(post_json).collect::<Vec<_>>(),
+            "moderation": self.state.moderation.iter().map(|item| json!({
+                "id": item.id,
+                "target": item.target,
+                "action": item.action,
+                "channel": item.channel,
+                "weight": item.weight,
+                "ts": item.ts,
+            })).collect::<Vec<_>>(),
         })
     }
 
@@ -1711,6 +1849,11 @@ impl Daemon {
     }
 
     fn emit(&self, rec: &Record) {
+        if let Record::Post { author, .. } = rec {
+            if board::muted(&self.state, author) {
+                return;
+            }
+        }
         let (level, value) = match rec {
             Record::Post {
                 author,
@@ -1767,6 +1910,30 @@ impl Daemon {
             ),
             Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
             Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),
+            Record::Vote {
+                id,
+                voter,
+                role,
+                target,
+                channel,
+                choice,
+                weight,
+                ts,
+            } => (
+                0,
+                json!({"ev":"vote","id":id,"voter":voter,"role":role,"target":target,"channel":channel,"choice":choice,"weight":weight,"ts":ts}),
+            ),
+            Record::Moderation {
+                id,
+                target,
+                action,
+                channel,
+                weight,
+                ts,
+            } => (
+                0,
+                json!({"ev":"moderation","id":id,"target":target,"action":action,"channel":channel,"weight":weight,"ts":ts}),
+            ),
         };
         self.broadcast(level, value);
     }
@@ -1860,6 +2027,19 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+fn post_json(post: &PostView) -> Value {
+    json!({
+        "id": post.id,
+        "author": post.author,
+        "role": post.role,
+        "text": post.text,
+        "weight": post.weight,
+        "channel": post.channel,
+        "mentions": post.mentions,
+        "ts": post.ts,
+    })
 }
 
 fn header_of(task: &crate::state::TaskView) -> Header {

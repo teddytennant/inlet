@@ -96,6 +96,31 @@ pub struct State {
     pub decision_spent: u64,
     /// Lease generation. An admit with any other fence does not debit.
     pub fence: u64,
+    /// Last vote per (voter, target, channel). Earlier votes stay in the log.
+    pub votes: BTreeMap<(String, String, String), VoteView>,
+    pub moderation: Vec<ModerationView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoteView {
+    pub id: String,
+    pub voter: String,
+    pub role: String,
+    pub target: String,
+    pub channel: String,
+    pub choice: String,
+    pub weight: u64,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModerationView {
+    pub id: String,
+    pub target: String,
+    pub action: String,
+    pub channel: String,
+    pub weight: u64,
+    pub ts: u64,
 }
 
 impl State {
@@ -115,6 +140,8 @@ impl State {
             constraints: Vec::new(),
             decision_spent: 0,
             fence: 0,
+            votes: BTreeMap::new(),
+            moderation: Vec::new(),
         }
     }
 
@@ -283,6 +310,53 @@ impl State {
             }
             Record::Clear { id, .. } => {
                 self.constraints.retain(|c| &c.id != id);
+            }
+            Record::Vote {
+                id,
+                voter,
+                role,
+                target,
+                channel,
+                choice,
+                weight,
+                ts,
+            } => {
+                self.votes.insert(
+                    (voter.clone(), target.clone(), channel.clone()),
+                    VoteView {
+                        id: id.clone(),
+                        voter: voter.clone(),
+                        role: role.clone(),
+                        target: target.clone(),
+                        channel: channel.clone(),
+                        choice: choice.clone(),
+                        weight: *weight,
+                        ts: *ts,
+                    },
+                );
+            }
+            Record::Moderation {
+                id,
+                target,
+                action,
+                channel,
+                weight,
+                ts,
+            } => {
+                if !self
+                    .moderation
+                    .iter()
+                    .any(|m| m.target == *target && m.action == *action && m.channel == *channel)
+                {
+                    self.moderation.push(ModerationView {
+                        id: id.clone(),
+                        target: target.clone(),
+                        action: action.clone(),
+                        channel: channel.clone(),
+                        weight: *weight,
+                        ts: *ts,
+                    });
+                }
             }
             Record::Kill { .. }
             | Record::Reset { .. }

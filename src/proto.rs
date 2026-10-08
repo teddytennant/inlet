@@ -27,18 +27,35 @@ pub enum Request {
     Status,
     Add(Box<NewTask>),
     AddBatch(Vec<NewTask>),
-    Post { text: String, human: bool },
+    Post {
+        text: String,
+        human: bool,
+    },
     Kill(String),
-    Watch { debug: u8, worker: Option<String> },
-    Hello { debug: u8 },
+    Watch {
+        debug: u8,
+        worker: Option<String>,
+    },
+    Hello {
+        debug: u8,
+    },
     Debug(u8),
     Pin(String),
     Bind(String),
-    Clear { id: String, sig: String },
+    Clear {
+        id: String,
+        sig: String,
+    },
     Sign(String),
     Draft(String),
     Diff,
     Snap,
+    Vote {
+        target: String,
+        choice: String,
+        channel: String,
+        human: bool,
+    },
 }
 
 pub fn parse_request(line: &str) -> Result<Request> {
@@ -90,6 +107,17 @@ pub fn parse_request(line: &str) -> Result<Request> {
         "draft" => Ok(Request::Draft(string(&v, "text")?)),
         "diff" => Ok(Request::Diff),
         "snap" => Ok(Request::Snap),
+        "vote" => Ok(Request::Vote {
+            target: string(&v, "target")?,
+            choice: string(&v, "choice")?,
+            channel: v
+                .get("channel")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("general")
+                .to_string(),
+            human: v.get("human").and_then(|b| b.as_bool()).unwrap_or(false),
+        }),
         other => Err(err(format!("unknown op {other}"))),
     }
 }
