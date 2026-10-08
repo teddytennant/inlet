@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -422,7 +423,7 @@ fn crash_requeue_is_a_new_admission() {
     policy(
         &home,
         &base_policy(
-            r#"prover = { cmd = { "/bin/sh", "-c", "kill -9 $$" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
+            r#"prover = { cmd = { "/usr/bin/python3", "-c", "import os; os.abort()" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
             r#"return "allow""#,
             "max_tokens = 250,",
             "",
@@ -442,6 +443,8 @@ fn crash_requeue_is_a_new_admission() {
             "100",
             "--seconds",
             "10",
+            "--memory-mb",
+            "256",
         ],
     );
     let st = wait_status(&home, |v| {
@@ -744,7 +747,7 @@ fn code_crash_stays_failed() {
     policy(
         &home,
         &base_policy(
-            r#"bomber = { cmd = { "/bin/sh", "-c", "kill -9 $$" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"bomber = { cmd = { "/usr/bin/python3", "-c", "import os; os.abort()" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -764,6 +767,8 @@ fn code_crash_stays_failed() {
             "100",
             "--seconds",
             "10",
+            "--memory-mb",
+            "256",
         ],
     );
     let st = wait_status(&home, |v| {
@@ -1288,6 +1293,10 @@ fn say(home: &Path, text: &str) {
 
 fn proxy_post(sock: &Path, token: &str, max_tokens: u64) -> String {
     let body = format!(r#"{{"max_tokens":{max_tokens}}}"#);
+    proxy_post_body(sock, token, &body)
+}
+
+fn proxy_post_body(sock: &Path, token: &str, body: &str) -> String {
     let req = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: inlet\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -3629,5 +3638,813 @@ fn follower_pulls_the_snapshot_and_does_not_admit() {
         .iter()
         .any(|t| t["goal"] == "nope" && t["state"] == "queued"));
     assert_eq!(st["lease"].as_bool(), Some(false));
+    let _ = daemon;
+}
+
+fn cost_sum(home: &Path, id: &str) -> u64 {
+    read_log(home)
+        .iter()
+        .filter_map(|decoded| match decoded {
+            Decoded::Rec(rec) => match rec.as_ref() {
+                Record::Cost {
+                    id: cid, tokens, ..
+                } if cid == id => Some(*tokens),
+                _ => None,
+            },
+            _ => None,
+        })
+        .sum()
+}
+
+fn wait_cost(home: &Path, id: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut got = 0;
+    while Instant::now() < deadline {
+        got = cost_sum(home, id);
+        if got == want {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    got
+}
+
+fn wait_text(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Ok(text) = fs::read_to_string(path) {
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    panic!("missing {}", path.display());
+}
+
+fn spawn_upstream(usages: &[&str], delay_ms: u64) -> (u16, Arc<Mutex<Vec<u64>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_bg = seen.clone();
+    let usages: Vec<String> = usages.iter().map(|s| (*s).to_string()).collect();
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let usage = usages
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| usages.last().cloned().unwrap_or_else(|| "{}".into()));
+            let seen_bg = seen_bg.clone();
+            thread::spawn(move || serve_canned(conn, &usage, delay_ms, &seen_bg));
+        }
+    });
+    (port, seen)
+}
+
+fn serve_canned(mut sock: TcpStream, usage: &str, delay_ms: u64, seen: &Mutex<Vec<u64>>) {
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while buf.len() < 1024 * 1024 {
+        match sock.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let header = String::from_utf8_lossy(&buf);
+    let len = header
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(k, v)| {
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+            })
+        })
+        .flatten()
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        let _ = sock.read_exact(&mut body);
+    }
+    let want = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("max_tokens").and_then(|n| n.as_u64()))
+        .unwrap_or(0);
+    seen.lock().unwrap().push(want);
+    if delay_ms > 0 {
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
+    let payload = format!(r#"{{"usage":{usage}}}"#);
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    let _ = sock.write_all(resp.as_bytes());
+}
+
+#[test]
+fn verifier_cannot_touch_the_host() {
+    let home = scratch("seal");
+    let wizard = home.join(".wizard");
+    fs::create_dir_all(&wizard).unwrap();
+    let ledger = home.join("ledger/log");
+    let sock = home.join("run/operator.sock");
+    let mark_ledger = home.join("ledger/escape");
+    let mark_wizard = wizard.join("escape");
+    let mark_sock = home.join("run/sock-escape");
+    let evil = format!(
+        "touch {}; touch {}; touch {}; echo pwn >> {}; echo pwn >> {}; test \"$(./run)\" = ok",
+        mark_ledger.display(),
+        mark_wizard.display(),
+        mark_sock.display(),
+        ledger.display(),
+        sock.display()
+    );
+    let check = format!(
+        "cat > /work/check.sh << 'END'\n#!/bin/sh\necho ran > /work/ran\ntouch {}\ntouch {}\ntouch {}\necho pwn >> {}\necho pwn >> {}\nexit 0\nEND\nchmod +x /work/check.sh\n",
+        mark_ledger.display(),
+        mark_wizard.display(),
+        mark_sock.display(),
+        ledger.display(),
+        sock.display()
+    );
+    let py = format!(
+        "cat > /work/check.py << 'END'\nopen('/work/pyran','w').write('ok\\n')\nimport pathlib\nfor p in [{0:?},{1:?},{2:?},{3:?},{4:?}]:\n    try:\n        pathlib.Path(p).open('a').write('x\\n')\n    except OSError:\n        pass\nEND\n",
+        mark_ledger.display().to_string(),
+        mark_wizard.display().to_string(),
+        mark_sock.display().to_string(),
+        ledger.display().to_string(),
+        sock.display().to_string()
+    );
+    policy(
+        &home,
+        &base_policy(
+            &format!(
+                r#"quick = {{ cmd = {{ "/bin/true" }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},
+                writer = {{ cmd = {{ "/bin/sh", "-c", {check:?} }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},
+                py = {{ cmd = {{ "/bin/sh", "-c", {py:?} }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},"#
+            ),
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "hold",
+            "--no-verify",
+            "--tokens",
+            "40",
+            "--seconds",
+            "40",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "sleeper" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let sleeper = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "sleeper")
+        .unwrap();
+    let token = token_of(sleeper["pid"].as_i64().unwrap());
+    let drafted = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "draft",
+            "token": token,
+            "name": "evil",
+            "run": "#!/bin/sh\necho ok\n",
+            "verifier": evil,
+        }),
+    );
+    assert_eq!(drafted["ok"], true, "{drafted} {}", daemon.log());
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "check",
+            "--recipe",
+            "evil",
+            "--verify",
+            "test \"$(./run)\" = ok",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "check" && t["state"] == "done")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "check")
+        .unwrap();
+    assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    let mut ready = false;
+    for author in fs::read_dir(home.join("drafts")).unwrap().flatten() {
+        let path = author.path().join("evil/meta.json");
+        if let Ok(text) = fs::read_to_string(path) {
+            let meta: Value = serde_json::from_str(&text).unwrap();
+            ready = meta["ready"] == true;
+        }
+    }
+    assert!(ready, "draft verifier did not pass {}", daemon.log());
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "writer",
+            "--goal",
+            "script",
+            "--verify",
+            "sh ./check.sh",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "script" && (t["state"] == "done" || t["state"] == "failed"))
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "script")
+        .unwrap();
+    assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    let ran = home
+        .join("work")
+        .join(task["id"].as_str().unwrap())
+        .join("ran");
+    assert_eq!(fs::read_to_string(&ran).unwrap_or_default().trim(), "ran");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "py",
+            "--goal",
+            "py",
+            "--verify",
+            "python3 -B check.py",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "py" && (t["state"] == "done" || t["state"] == "failed"))
+    });
+    let task = tasks(&st).into_iter().find(|t| t["goal"] == "py").unwrap();
+    assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    let pyran = home
+        .join("work")
+        .join(task["id"].as_str().unwrap())
+        .join("pyran");
+    assert_eq!(wait_text(&pyran).trim(), "ok");
+    assert!(!mark_ledger.exists(), "ledger marker");
+    assert!(!mark_wizard.exists(), "wizard marker");
+    assert!(!mark_sock.exists(), "socket marker");
+    let log = fs::read(&ledger).unwrap_or_default();
+    assert!(!log.windows(3).any(|w| w == b"pwn"), "ledger was written");
+    assert!(sock.metadata().unwrap().file_type().is_socket());
+    let _ = daemon;
+}
+
+#[test]
+fn cell_cannot_signal_the_host() {
+    let mut decoy = Command::new("/bin/sleep").arg("120").spawn().unwrap();
+    let decoy_pid = decoy.id();
+    let home = scratch("signal");
+    let script = format!(
+        "kill -0 {decoy_pid}; echo $? > /work/sig; kill -9 -1; echo after > /work/after; sleep 30"
+    );
+    policy(
+        &home,
+        &base_policy(
+            &format!(
+                r#"sig = {{ cmd = {{ "/bin/sh", "-c", {script:?} }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},"#
+            ),
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sig",
+            "--goal",
+            "signal",
+            "--no-verify",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "sig" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "sig")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sig = wait_text(&home.join("work").join(&id).join("sig"));
+    assert_ne!(sig.trim(), "0", "signalled the host decoy: {sig}");
+    assert!(
+        Path::new(&format!("/proc/{decoy_pid}")).exists(),
+        "decoy died"
+    );
+    let st = status(&home);
+    assert!(st.get("cap").is_some(), "{st} {}", daemon.log());
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        Path::new(&format!("/proc/{decoy_pid}")).exists(),
+        "kill -1 reached the decoy"
+    );
+    assert!(pid_of(&home).is_some(), "daemon died");
+    let _ = decoy.kill();
+    let _ = decoy.wait();
+    let _ = daemon;
+}
+
+#[test]
+fn proxy_charges_the_prompt() {
+    let (port, _seen) = spawn_upstream(
+        &[r#"{"prompt_tokens":400,"completion_tokens":8,"total_tokens":408}"#],
+        0,
+    );
+    let home = scratch("prompt");
+    policy(
+        &home,
+        &base_policy(
+            "",
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "prompt",
+            "--no-verify",
+            "--tokens",
+            "800",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let padding = "x".repeat(1600);
+    let body =
+        format!(r#"{{"max_tokens":8,"messages":[{{"role":"user","content":"{padding}"}}]}}"#);
+    let reply = proxy_post_body(&home.join("proxy/proxy.sock"), &token, &body);
+    assert!(reply.contains("200"), "{reply}");
+    assert!(!reply.contains("empty_purse"), "{reply}");
+    assert_eq!(wait_cost(&home, &id, 408), 408, "{}", daemon.log());
+    thread::sleep(Duration::from_millis(200));
+    let st = status(&home);
+    assert_eq!(tasks(&st)[0]["state"], "running", "{st}");
+    let _ = daemon;
+}
+
+#[test]
+fn parallel_calls_share_the_purse() {
+    let (port, _seen) = spawn_upstream(&[r#"{"total_tokens":10}"#], 400);
+    let home = scratch("share");
+    policy(
+        &home,
+        &base_policy(
+            "",
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "share",
+            "--no-verify",
+            "--tokens",
+            "400",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let sock = home.join("proxy/proxy.sock");
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let barrier = barrier.clone();
+        let sock = sock.clone();
+        let token = token.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            proxy_post_body(
+                &sock,
+                &token,
+                r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            )
+        }));
+    }
+    let replies: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for reply in &replies {
+        assert!(reply.contains("200"), "{reply}");
+        assert!(!reply.contains("empty_purse"), "{reply}");
+    }
+    assert_eq!(
+        wait_cost(&home, &id, 20),
+        20,
+        "{replies:?} {}",
+        daemon.log()
+    );
+    thread::sleep(Duration::from_millis(300));
+    let st = status(&home);
+    assert_eq!(tasks(&st)[0]["state"], "running", "{st}");
+    let _ = daemon;
+}
+
+#[test]
+fn proxy_charges_real_usage() {
+    let (port, _seen) = spawn_upstream(&[r#"{"total_tokens":22}"#], 0);
+    let home = scratch("real-usage");
+    policy(
+        &home,
+        &base_policy(
+            "",
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "usage",
+            "--no-verify",
+            "--tokens",
+            "200",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let reply = proxy_post(&home.join("proxy/proxy.sock"), &token, 10);
+    assert!(reply.contains("200"), "{reply}");
+    assert_eq!(wait_cost(&home, &id, 22), 22, "{}", daemon.log());
+    thread::sleep(Duration::from_millis(200));
+    let st = status(&home);
+    assert_eq!(tasks(&st)[0]["state"], "running", "{st} {}", daemon.log());
+    inlet(&home, &["kill", &id]);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == id && t["reason"] == "killed")
+    });
+    assert_eq!(st["available"].as_u64(), Some(978), "{st}");
+    let exit = read_log(&home)
+        .into_iter()
+        .find_map(|decoded| match decoded {
+            Decoded::Rec(rec) => match rec.as_ref() {
+                Record::Exit {
+                    id: eid,
+                    tokens_used,
+                    refund_tokens,
+                    reason,
+                    ..
+                } if eid == &id => Some((*tokens_used, *refund_tokens, reason.clone())),
+                _ => None,
+            },
+            _ => None,
+        });
+    assert_eq!(exit, Some((22, 178, "killed".into())), "{st}");
+    let _ = daemon;
+}
+
+#[test]
+fn overspend_takes_the_rest_of_the_purse() {
+    let (port, _seen) =
+        spawn_upstream(&[r#"{"total_tokens":10}"#, r#"{"total_tokens":100000}"#], 0);
+    let home = scratch("over");
+    policy(
+        &home,
+        &base_policy(
+            "",
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "over",
+            "--no-verify",
+            "--tokens",
+            "50",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let sock = home.join("proxy/proxy.sock");
+    let first = proxy_post(&sock, &token, 10);
+    assert!(first.contains("200"), "{first}");
+    assert_eq!(wait_cost(&home, &id, 10), 10, "{}", daemon.log());
+    let second = proxy_post(&sock, &token, 10);
+    assert!(second.contains("200"), "{second}");
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == id && t["reason"] == "purse")
+    });
+    assert_eq!(wait_cost(&home, &id, 50), 50, "{st} {}", daemon.log());
+    assert_eq!(st["available"].as_u64(), Some(950), "{st}");
+    let exit = read_log(&home)
+        .into_iter()
+        .find_map(|decoded| match decoded {
+            Decoded::Rec(rec) => match rec.as_ref() {
+                Record::Exit {
+                    id: eid,
+                    tokens_used,
+                    refund_tokens,
+                    reason,
+                    ..
+                } if eid == &id => Some((*tokens_used, *refund_tokens, reason.clone())),
+                _ => None,
+            },
+            _ => None,
+        });
+    assert_eq!(exit, Some((50, 0, "purse".into())), "{st}");
+    let _ = daemon;
+}
+
+#[test]
+fn child_slice_shrinks_the_parent_proxy() {
+    let (port, seen) = spawn_upstream(&[r#"{"total_tokens":0}"#], 0);
+    let home = scratch("lend");
+    policy(
+        &home,
+        &base_policy(
+            r#"kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "none", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "parent",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "parent" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let parent = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "parent")
+        .unwrap();
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let token = token_of(parent["pid"].as_i64().unwrap());
+    let spawned = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "spawn",
+            "token": token,
+            "worker": "kid",
+            "goal": "nap",
+            "verify": "/bin/true",
+            "tokens": 40,
+            "seconds": 10
+        }),
+    );
+    assert_eq!(spawned["ok"], true, "{spawned} {}", daemon.log());
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "kid" && t["state"] == "running")
+    });
+    let child_id = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "kid")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sock = home.join("proxy/proxy.sock");
+    let reply = proxy_post(&sock, &token, 1000);
+    assert!(reply.contains("200"), "{reply} {}", daemon.log());
+    let capped = seen.lock().unwrap().clone();
+    assert_eq!(capped.last().copied(), Some(60), "{capped:?}");
+    inlet(&home, &["kill", &child_id]);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == parent_id && t["state"] == "running")
+    });
+    assert_eq!(st["available"].as_u64(), Some(900), "{st}");
+    let reply = proxy_post(&sock, &token, 1000);
+    assert!(reply.contains("200"), "{reply}");
+    let capped = seen.lock().unwrap().clone();
+    assert_eq!(capped.last().copied(), Some(100), "{capped:?}");
+    let _ = daemon;
+}
+
+#[test]
+fn seed_lands_in_the_workdir() {
+    let home = scratch("seed");
+    let seed = home.join("seed-src");
+    fs::create_dir_all(seed.join("sub")).unwrap();
+    fs::write(seed.join("hello.txt"), "hi\n").unwrap();
+    fs::write(seed.join("sub").join("more.txt"), "more\n").unwrap();
+    policy(
+        &home,
+        &base_policy(
+            r#"see = { cmd = { "/bin/sh", "-c", "cat /work/hello.txt /work/sub/more.txt > /work/seen" }, tags = { "code" }, net = "none", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "see",
+            "--goal",
+            "seed",
+            "--no-verify",
+            "--seed",
+            seed.to_str().unwrap(),
+            "--tokens",
+            "40",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "seed" && t["state"] == "done")
+    });
+    let id = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "seed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let seen = fs::read_to_string(home.join("work").join(id).join("seen")).unwrap_or_default();
+    assert_eq!(seen, "hi\nmore\n", "{seen} {}", daemon.log());
+    let _ = daemon;
+}
+
+#[test]
+fn worker_line_posts() {
+    let home = scratch("line");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "line",
+            "--no-verify",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/inlet-line.py");
+    let body =
+        serde_json::json!({"op":"post","token": token, "text":"from the helper"}).to_string();
+    let out = Command::new("python3")
+        .arg(&helper)
+        .arg(home.join("run/worker.sock"))
+        .arg(body)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"ok\":true"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut found = false;
+    while Instant::now() < deadline {
+        found = read_log(&home).iter().any(|decoded| {
+            matches!(decoded, Decoded::Rec(rec) if matches!(rec.as_ref(), Record::Post { text, .. } if text == "from the helper"))
+        });
+        if found {
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert!(found, "{}", daemon.log());
     let _ = daemon;
 }

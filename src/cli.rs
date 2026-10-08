@@ -70,6 +70,7 @@ inlet                    attach the TUI
 inlet init               write policy.lua and pin a signing key
 inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID] [--recipe NAME]
+        [--seed DIR]
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet bind <text>
@@ -289,10 +290,9 @@ fn add(home: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
     let task = parse_add_flags(args)?;
-    let v = proto::rpc(
-        home,
-        json!({"op":"add","worker": task.worker, "goal": task.goal, "verify": task.verifier, "no_verify": task.no_verify, "tokens": task.tokens, "seconds": task.seconds, "memory_mb": task.memory_mb, "pids": task.pids, "value": task.value, "tags": task.tags, "parent": task.parent, "recipe": task.recipe}),
-    )?;
+    let mut body = proto::task_value(&task);
+    body["op"] = json!("add");
+    let v = proto::rpc(home, body)?;
     if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
         return Err(err(v
             .get("error")
@@ -341,6 +341,7 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
     let mut tags = Vec::new();
     let mut parent = None;
     let mut recipe = None;
+    let mut seed = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -398,6 +399,10 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
                 recipe = Some(next()?);
                 i += 2;
             }
+            "--seed" => {
+                seed = Some(next()?);
+                i += 2;
+            }
             other if other.starts_with('-') => return Err(err(format!("unknown flag {other}"))),
             other => {
                 if goal.is_none() {
@@ -430,6 +435,7 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
         tags,
         parent,
         recipe,
+        seed,
     })
 }
 

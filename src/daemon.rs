@@ -79,6 +79,7 @@ struct Check {
     id: String,
     pid: i32,
     started: Instant,
+    stdout: File,
 }
 
 struct GateHit {
@@ -858,8 +859,12 @@ impl Daemon {
             token: token.clone(),
             task_id: id.to_string(),
             cgroup: placement.cgroup,
+            door: true,
         })?;
         self.hub.insert(id, &token, task.budget.tokens);
+        if let Some(parent) = &task.parent {
+            self.hub.lend(parent, task.budget.tokens);
+        }
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -917,7 +922,8 @@ impl Daemon {
             match reason.as_deref() {
                 Some("killed") => self.finish(&id, code, "killed", true)?,
                 Some("timeout") => self.finish(&id, code, "timeout", true)?,
-                Some("purse") => self.finish(&id, code, "purse", false)?,
+                // Crash keeps the slice. A purse kill refunds whatever the proxy did not spend.
+                Some("purse") => self.finish(&id, code, "purse", true)?,
                 Some(other) => self.finish(&id, code, other, other != "crash")?,
                 None if signalled => self.crash(&id)?,
                 None if code == 0 && self.has_verifier(&id) => self.start_check(&id)?,
@@ -941,37 +947,40 @@ impl Daemon {
         if let Some(task) = self.state.tasks.get_mut(id) {
             task.pid = None;
         }
-        let verifier = self
-            .state
-            .tasks
-            .get(id)
-            .and_then(|task| task.verifier.clone())
-            .unwrap_or_default();
+        let task = self.state.tasks.get(id).cloned();
+        let Some(task) = task else {
+            return self.finish(id, 127, "verifier", true);
+        };
+        let verifier = task.verifier.clone().unwrap_or_default();
         let dir = paths::work(&self.home, id);
-        if let Some(recipe) = self
-            .state
-            .tasks
-            .get(id)
-            .and_then(|task| task.recipe.clone())
-        {
-            let _ = registry::stage_run(&self.home, &recipe, &dir);
+        if let Some(recipe) = &task.recipe {
+            let _ = registry::stage_run(&self.home, recipe, &dir);
         }
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(&verifier)
-            .current_dir(&dir)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match cmd.spawn() {
+        let memory = task.budget.memory_mb.max(512);
+        match cell::spawn(&SpawnRequest {
+            cmd: vec!["/bin/sh".into(), "-c".into(), verifier],
+            work: dir,
+            scratch: self.home.join("run/checks").join(id),
+            registry: paths::registry(&self.home),
+            root: paths::cell_root(&self.home, &format!("{id}-check")),
+            proxy_sock: PathBuf::from("/dev/null"),
+            worker_sock: PathBuf::from("/dev/null"),
+            preamble: String::new(),
+            net_none: true,
+            memory_mb: memory,
+            pids: task.budget.pids.max(32),
+            seconds: 20,
+            token: String::new(),
+            task_id: id.to_string(),
+            cgroup: None,
+            door: false,
+        }) {
             Ok(child) => {
                 self.checks.push(Check {
                     id: id.to_string(),
-                    pid: child.id() as i32,
+                    pid: child.pid,
                     started: Instant::now(),
+                    stdout: child.stdout,
                 });
                 Ok(())
             }
@@ -1050,6 +1059,11 @@ impl Daemon {
         refund_unused: bool,
         mut extra: Vec<Record>,
     ) -> Result<()> {
+        let parent = self
+            .state
+            .tasks
+            .get(id)
+            .and_then(|task| task.parent.clone());
         let lent = self
             .state
             .purse
@@ -1072,6 +1086,9 @@ impl Daemon {
             0
         };
         let tokens_used = reserved.saturating_sub(refund);
+        if let Some(parent) = parent {
+            self.hub.reclaim(&parent, reserved, tokens_used);
+        }
         self.workers.retain(|w| w.id != id);
         if reason == "killed" {
             self.commit(
@@ -1157,6 +1174,17 @@ impl Daemon {
                         worker.log_len += take as u64;
                     }
                 } else {
+                    break;
+                }
+            }
+        }
+        for check in &mut self.checks {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = unsafe {
+                    libc::read(check.stdout.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n <= 0 {
                     break;
                 }
             }
@@ -1344,6 +1372,7 @@ impl Daemon {
                 .and_then(|s| s.as_str())
                 .map(str::to_string)
                 .filter(|s| !s.is_empty()),
+            seed: None,
         };
         let ids = self.enqueue(std::slice::from_ref(&task))?;
         let child = ids.first().cloned().unwrap_or_default();
@@ -1448,6 +1477,11 @@ impl Daemon {
                 _ => None,
             })
             .collect();
+        for (task, id) in tasks.iter().zip(ids.iter()) {
+            if let Some(seed) = &task.seed {
+                copy_seed(Path::new(seed), &paths::work(&self.home, id))?;
+            }
+        }
         self.commit(&recs, true)?;
         self.admit()?;
         Ok(ids)
@@ -1844,6 +1878,30 @@ fn header_of(task: &crate::state::TaskView) -> Header {
 
 fn clip(text: &str, n: usize) -> String {
     text.chars().take(n).collect()
+}
+
+fn copy_seed(src: &Path, dst: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(src).map_err(|_| err("seed is missing"))?;
+    if !meta.file_type().is_dir() {
+        return Err(err("seed is not a directory"));
+    }
+    fs::create_dir_all(dst)?;
+    copy_seed_dir(src, dst)
+}
+
+fn copy_seed_dir(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if kind.is_dir() {
+            fs::create_dir_all(&to)?;
+            copy_seed_dir(&entry.path(), &to)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn depth_of(state: &State, start: Option<&str>) -> u32 {

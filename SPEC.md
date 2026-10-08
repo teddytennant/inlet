@@ -57,7 +57,7 @@ No `kind`. The worker's tags say code or math, and an ask is a record, not a tas
 
 `queued` waits on admission. `blocked` is admitted and alive, waiting on an ask reply or a child result. `failed` carries a reason: `verifier`, `purse`, `timeout`, `crash`.
 
-The verifier is a separate command. The worker does not grade itself. For code that is the test suite. For math it is the checker.
+The verifier is a separate command. The worker does not grade itself. The supervisor runs it in a cell with no token, no proxy, and no host secrets. For code that is the test suite. For math it is the checker.
 
 No verifier means the operator put it there: `inlet add --no-verify`. Operator agents on the operator socket may enqueue those tasks without the human passphrase. The task still goes through the gate, at p_success 0.5 with the endpoint off, and it never promotes. A worker cannot request a child without a verifier.
 
@@ -103,15 +103,15 @@ Isolator, picked in config, falling back to rlimit when cgroup writes are refuse
 
 An isolator bounds resources. It hides nothing from a process running as the same uid. That is the cell's job, and every worker runs in one, under any isolator. The cell is built from Rust before exec, no helper binary:
 
-- User and mount namespaces via `unshare`, then `pivot_root` into a tree of the private workdir, a read-only view of the registry, its scratch, the worker socket, the proxy socket, and the worker's read-only system paths.
-- Landlock (kernel 5.13+, unprivileged) over the same paths, with `no_new_privs`.
+- User, mount, and pid namespaces, then `pivot_root` into a tree of the private workdir, a read-only view of the registry, its scratch, the worker socket, the proxy socket, and the worker's read-only system paths.
+- Landlock (kernel 5.13+, unprivileged) over the same paths, with `no_new_privs`. On kernel 6.12+ the ruleset also scopes signals.
 - A dedicated uid when the daemon runs as root.
 
 Either of the first two is a cell. The worker does not get sibling workdirs, the ledger, the key file, the operator socket, or the policy files. A host with neither cannot place a worker, so the gate denies. There is no unfenced mode.
 
 `net` defaults from tags. A worker tagged `code`, or not tagged `math`, defaults to `host`. A worker tagged `math` and not `code` defaults to `none`. An explicit `net` wins. `net = "host"` shares the network. A worker has no keys, but it can reach the internet and send out its workdir and goal. Accepted for code workers that need package registries. `net = "none"` adds a network namespace; the proxy is a unix socket, so model calls still work. Math workers use it.
 
-The proxy is the enforcement that makes the token purse real. Workers never see provider keys. They talk to a unix socket that speaks a small OpenAI-compatible subset (`/v1/chat/completions`, `/v1/responses`) and forwards bytes. Usage comes from the response. If the provider omits usage, the proxy over-counts from bytes and fails closed. Each request's max output tokens is clamped to the slice's remainder, so one response cannot overrun the reservation. An empty purse returns a distinct error (`empty_purse`: stop and post) and the worker is killed, reason `purse`. Top-up is an admission, not a retry loop.
+The proxy is the enforcement that makes the token purse real. Workers never see provider keys. They talk to a unix socket that speaks a small OpenAI-compatible subset (`/v1/chat/completions`, `/v1/responses`) and forwards bytes. Usage comes from the response. If the provider omits usage, the proxy over-counts from bytes and fails closed. Each request's max output tokens is clamped to the slice's remainder. The proxy reserves the prompt plus that output, and two calls with no cap split what is left. The ledger records the provider's usage. Usage above the reservation is taken from the rest of the slice when it fits, and the worker stays up. Usage that does not fit, or an empty purse, returns `empty_purse` (stop and post) and the worker is killed, reason `purse`, charged for what it spent. A crash still keeps the whole slice. Top-up is an admission, not a retry loop.
 
 The proxy holds the upstream URL (`proxy.upstream`) and the provider key (`proxy.key`). It strips the worker's own token, which only identifies the slice, and sets the provider key on the way out. It does not log headers.
 
@@ -231,7 +231,7 @@ inlet up [-f]
 inlet [attach]
 inlet init
 inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--seconds N]
-          [--memory-mb N] [--pids N] [--value N] [-t <tag>]... [--parent <id>]
+          [--memory-mb N] [--pids N] [--value N] [-t <tag>]... [--parent <id>] [--seed <dir>]
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet bind <text>

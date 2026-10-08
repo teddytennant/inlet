@@ -3,9 +3,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -277,33 +274,7 @@ fn scratch_dir(kind: &str) -> PathBuf {
 }
 
 fn run_cmd(cmd: &str, dir: &Path) -> i32 {
-    let mut child = match Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(dir)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return 127,
-    };
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.code().unwrap_or(1),
-            Ok(None) if started.elapsed() >= Duration::from_secs(8) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return 124;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(_) => return 1,
-        }
-    }
+    crate::cell::run_sealed(&["/bin/sh".into(), "-c".into(), cmd.into()], dir)
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {

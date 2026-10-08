@@ -1,11 +1,12 @@
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use crate::error::{err, Result};
 
@@ -26,7 +27,11 @@ const FS_ALL: u64 = FS_READ | FS_WRITE;
 struct RulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
+    scoped: u64,
 }
+
+/// Landlock ABI 6. A sandboxed process cannot signal a process outside its domain.
+const SCOPE_SIGNAL: u64 = 1 << 1;
 
 #[repr(C, packed)]
 struct PathBeneath {
@@ -50,6 +55,8 @@ pub struct SpawnRequest {
     pub token: String,
     pub task_id: String,
     pub cgroup: Option<PathBuf>,
+    /// Worker door: proxy socket, worker socket, and a token. Verifiers leave this off.
+    pub door: bool,
 }
 
 pub struct Spawned {
@@ -88,6 +95,8 @@ struct Raw {
     memory_mb: u64,
     pids: u64,
     seconds: u64,
+    door: bool,
+    in_user_ns: bool,
 }
 
 /// Returns false when neither a mount namespace nor Landlock can be entered.
@@ -126,6 +135,7 @@ pub fn probe(home: &Path) -> bool {
         token: "probe".into(),
         task_id: "probe".into(),
         cgroup: None,
+        door: true,
     };
     match spawn(&req) {
         Ok(child) => {
@@ -189,12 +199,12 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let argv_c = c_strings(&req.cmd)?;
     let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv.push(ptr::null());
-    let env_owned = env_strings(&req.token, &req.task_id);
+    let env_owned = env_strings(&req.token, &req.task_id, req.door);
     let env_c = c_strings(&env_owned)?;
     let mut envp: Vec<*const libc::c_char> = env_c.iter().map(|s| s.as_ptr()).collect();
     envp.push(ptr::null());
 
-    let raw = Raw {
+    let mut raw = Raw {
         parent: unsafe { libc::getpid() },
         ready_w: ready_w.0,
         ack_r: ack_r.0,
@@ -225,15 +235,29 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         memory_mb: req.memory_mb,
         pids: req.pids,
         seconds: req.seconds,
+        door: req.door,
+        in_user_ns: true,
     };
 
-    let pid = unsafe { libc::fork() };
+    let stack = map_stack()?;
+    let mut pid = unsafe {
+        libc::clone(
+            trampoline,
+            stack.top(),
+            libc::SIGCHLD | libc::CLONE_NEWUSER | libc::CLONE_NEWPID,
+            &mut raw as *mut Raw as *mut libc::c_void,
+        )
+    };
+    if pid < 0 {
+        // No new pid namespace. The child still unshares a user namespace itself.
+        raw.in_user_ns = false;
+        pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe { child_entry(&raw) }
+        }
+    }
     if pid < 0 {
         return Err(err("fork"));
-    }
-    if pid == 0 {
-        // SAFETY: child uses only libc until exec or _exit. No allocator.
-        unsafe { child_entry(&raw) }
     }
 
     drop(ready_w);
@@ -309,28 +333,36 @@ fn prepare_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn env_strings(token: &str, id: &str) -> Vec<String> {
-    vec![
-        format!("INLET_TOKEN={token}"),
-        format!("INLET_ID={id}"),
-        "INLET_PROXY_SOCK=/run/proxy.sock".into(),
-        "INLET_SOCK=/run/worker.sock".into(),
-        format!("OPENAI_API_KEY={token}"),
+fn env_strings(token: &str, id: &str, door: bool) -> Vec<String> {
+    let mut env = vec![
         "HOME=/work".into(),
         "PATH=/usr/bin:/bin".into(),
         "TMPDIR=/tmp".into(),
         "LANG=C".into(),
-    ]
+    ];
+    if door {
+        env.push(format!("INLET_TOKEN={token}"));
+        env.push(format!("INLET_ID={id}"));
+        env.push("INLET_PROXY_SOCK=/run/proxy.sock".into());
+        env.push("INLET_SOCK=/run/worker.sock".into());
+        env.push(format!("OPENAI_API_KEY={token}"));
+    }
+    env
+}
+
+extern "C" fn trampoline(arg: *mut libc::c_void) -> libc::c_int {
+    let raw = unsafe { &*(arg as *const Raw) };
+    unsafe { child_entry(raw) }
 }
 
 /// Child side. Never returns to Rust.
 unsafe fn child_entry(a: &Raw) -> ! {
     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-    if libc::getppid() != a.parent {
+    // pid 1 of a new pid namespace sees getppid() == 0. The fallback fork does not.
+    if !a.in_user_ns && libc::getppid() != a.parent {
         libc::raise(libc::SIGKILL);
     }
-    libc::setpgid(0, 0);
-    if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+    if !a.in_user_ns && libc::unshare(libc::CLONE_NEWUSER) != 0 {
         fail(a.err_w, errno());
     }
     let _ = libc::write(a.ready_w, [1u8].as_ptr().cast(), 1);
@@ -338,6 +370,7 @@ unsafe fn child_entry(a: &Raw) -> ! {
     if libc::read(a.ack_r, ack.as_mut_ptr().cast(), 1) != 1 {
         fail(a.err_w, errno());
     }
+    libc::setpgid(0, 0);
     let mut flags = libc::CLONE_NEWNS;
     if a.net_none {
         flags |= libc::CLONE_NEWNET;
@@ -348,7 +381,7 @@ unsafe fn child_entry(a: &Raw) -> ! {
 
     let pivoted = pivot(a) == 0;
     let locked = if pivoted {
-        landlock_pivoted()
+        landlock_pivoted(a.door)
     } else {
         landlock_host(a)
     };
@@ -402,8 +435,10 @@ unsafe fn pivot(a: &Raw) -> i32 {
     let _ = mount_bind(a.devnull, a.nr_null, false);
     let _ = mount_bind(a.devzero, a.nr_zero, false);
     let _ = mount_bind(a.devurandom, a.nr_urandom, false);
-    let _ = mount_bind(a.proxy, a.nr_sock, false);
-    let _ = mount_bind(a.worker, a.nr_worker, false);
+    if a.door {
+        let _ = mount_bind(a.proxy, a.nr_sock, false);
+        let _ = mount_bind(a.worker, a.nr_worker, false);
+    }
     if libc::syscall(libc::SYS_pivot_root, a.newroot, a.nr_old) != 0 {
         return errno();
     }
@@ -456,7 +491,8 @@ unsafe fn mount_bind(src: *const libc::c_char, dst: *const libc::c_char, ro: boo
     0
 }
 
-unsafe fn landlock_pivoted() -> i32 {
+unsafe fn landlock_pivoted(door: bool) -> i32 {
+    let run = if door { FS_ALL } else { FS_READ };
     let rules = [
         (c"/usr".as_ptr(), FS_READ),
         (c"/work".as_ptr(), FS_ALL),
@@ -466,13 +502,13 @@ unsafe fn landlock_pivoted() -> i32 {
         (c"/dev".as_ptr(), FS_ALL),
         (c"/tmp".as_ptr(), FS_ALL),
         (c"/etc".as_ptr(), FS_READ),
-        (c"/run".as_ptr(), FS_ALL),
+        (c"/run".as_ptr(), run),
     ];
     landlock(&rules)
 }
 
 unsafe fn landlock_host(a: &Raw) -> i32 {
-    let rules = [
+    let mut rules = [
         (a.usr, FS_READ),
         (a.work, FS_ALL),
         (a.scratch, FS_ALL),
@@ -481,23 +517,32 @@ unsafe fn landlock_host(a: &Raw) -> i32 {
         (c"/dev".as_ptr(), FS_ALL),
         (c"/etc".as_ptr(), FS_READ),
         (c"/tmp".as_ptr(), FS_ALL),
-        (a.proxy, FS_ALL),
-        (a.worker, FS_ALL),
+        (ptr::null(), 0u64),
+        (ptr::null(), 0u64),
     ];
-    landlock(&rules)
+    let mut n = 8;
+    if a.door {
+        rules[n] = (a.proxy, FS_ALL);
+        n += 1;
+        rules[n] = (a.worker, FS_ALL);
+        n += 1;
+    }
+    landlock(&rules[..n])
 }
 
 unsafe fn landlock(rules: &[(*const libc::c_char, u64)]) -> i32 {
-    let attr = RulesetAttr {
+    let mut attr = RulesetAttr {
         handled_access_fs: FS_ALL,
         handled_access_net: 0,
+        scoped: SCOPE_SIGNAL,
     };
-    let rs = libc::syscall(
-        libc::SYS_landlock_create_ruleset,
-        &attr,
-        size_of::<RulesetAttr>(),
-        0,
-    );
+    let mut size = size_of::<RulesetAttr>();
+    let mut rs = libc::syscall(libc::SYS_landlock_create_ruleset, &attr, size, 0);
+    if rs < 0 {
+        attr.scoped = 0;
+        size = size_of::<u64>() * 2;
+        rs = libc::syscall(libc::SYS_landlock_create_ruleset, &attr, size, 0);
+    }
     if rs < 0 {
         return errno();
     }
@@ -655,6 +700,115 @@ fn set_nonblock(fd: i32) {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+struct Stack {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Stack {
+    fn top(&self) -> *mut libc::c_void {
+        let top = unsafe { self.ptr.add(self.len) };
+        (top as usize & !15) as *mut libc::c_void
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { libc::munmap(self.ptr, self.len) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+fn map_stack() -> Result<Stack> {
+    let len = 256 * 1024;
+    let ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(err("stack"));
+    }
+    Ok(Stack { ptr, len })
+}
+
+/// Run a verifier in a cell with no token and no proxy. Never falls back to the host.
+pub fn run_sealed(cmd: &[String], work: &Path) -> i32 {
+    let stamp = crate::id::now_ms();
+    let scratch = std::env::temp_dir().join(format!("inlet-seal-s-{stamp}"));
+    let root = std::env::temp_dir().join(format!("inlet-seal-r-{stamp}"));
+    let registry = std::env::temp_dir().join(format!("inlet-seal-g-{stamp}"));
+    let req = SpawnRequest {
+        cmd: cmd.to_vec(),
+        work: work.to_path_buf(),
+        scratch: scratch.clone(),
+        registry,
+        root: root.clone(),
+        proxy_sock: PathBuf::from("/dev/null"),
+        worker_sock: PathBuf::from("/dev/null"),
+        preamble: String::new(),
+        net_none: true,
+        memory_mb: 512,
+        pids: 64,
+        seconds: 8,
+        token: String::new(),
+        task_id: String::new(),
+        cgroup: None,
+        door: false,
+    };
+    let spawned = match spawn(&req) {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&scratch);
+            let _ = fs::remove_dir_all(&root);
+            return 127;
+        }
+    };
+    let started = Instant::now();
+    let code = loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(spawned.pid, &mut status, libc::WNOHANG) };
+        if pid == spawned.pid {
+            break if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                1
+            };
+        }
+        drain_fd(spawned.stdout.as_raw_fd());
+        if started.elapsed() >= Duration::from_secs(8) {
+            unsafe {
+                libc::kill(spawned.pid, libc::SIGKILL);
+                libc::waitpid(spawned.pid, ptr::null_mut(), 0);
+            }
+            break 124;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::remove_dir_all(&root);
+    code
+}
+
+fn drain_fd(fd: i32) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
         }
     }
 }

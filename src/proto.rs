@@ -19,6 +19,7 @@ pub struct NewTask {
     pub tags: Vec<String>,
     pub parent: Option<String>,
     pub recipe: Option<String>,
+    pub seed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -135,6 +136,11 @@ pub fn parse_task(v: &Value) -> Result<NewTask> {
             .and_then(|s| s.as_str())
             .map(str::to_string)
             .filter(|s| !s.is_empty()),
+        seed: v
+            .get("seed")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -180,5 +186,6 @@ pub fn task_value(task: &NewTask) -> Value {
         "tags": task.tags,
         "parent": task.parent,
         "recipe": task.recipe,
+        "seed": task.seed,
     })
 }
