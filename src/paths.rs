@@ -6,6 +6,18 @@ pub fn ledger(home: &Path) -> PathBuf {
 pub fn policy(home: &Path) -> PathBuf {
     home.join("policy.lua")
 }
+pub fn policy_sig(home: &Path) -> PathBuf {
+    home.join("policy.sig")
+}
+pub fn policy_draft(home: &Path) -> PathBuf {
+    home.join("policy.draft.lua")
+}
+pub fn key_pub(home: &Path) -> PathBuf {
+    home.join("keys/policy.pub")
+}
+pub fn key_priv(home: &Path) -> PathBuf {
+    home.join("keys/policy.key")
+}
 pub fn operator_sock(home: &Path) -> PathBuf {
     home.join("run/operator.sock")
 }

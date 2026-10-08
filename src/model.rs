@@ -127,6 +127,19 @@ pub enum Record {
         by: String,
         ts: u64,
     },
+    Bind {
+        id: String,
+        text: String,
+        tags: Vec<String>,
+        ts: u64,
+    },
+    Clear {
+        id: String,
+        ts: u64,
+    },
+    Sign {
+        ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -143,7 +156,7 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
-        | "reset" | "result" | "promote" => {
+        | "reset" | "result" | "promote" | "bind" | "clear" | "sign" => {
             Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
         }
         _ => Ok(Decoded::Opaque),

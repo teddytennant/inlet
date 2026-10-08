@@ -32,10 +32,18 @@ pub enum Request {
     Hello { debug: u8 },
     Debug(u8),
     Pin(String),
+    Bind(String),
+    Clear { id: String, sig: String },
+    Sign(String),
+    Draft(String),
+    Diff,
 }
 
 pub fn parse_request(line: &str) -> Result<Request> {
     let v: Value = serde_json::from_str(line)?;
+    if v.get("passphrase").is_some() {
+        return Err(err("passphrase stays on the tty"));
+    }
     let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
     match op {
         "status" => Ok(Request::Status),
@@ -71,6 +79,14 @@ pub fn parse_request(line: &str) -> Result<Request> {
             v.get("level").and_then(|n| n.as_u64()).unwrap_or(1).min(4) as u8,
         )),
         "pin" => Ok(Request::Pin(string(&v, "name")?)),
+        "bind" => Ok(Request::Bind(string(&v, "text")?)),
+        "clear" => Ok(Request::Clear {
+            id: string(&v, "id")?,
+            sig: string(&v, "sig")?,
+        }),
+        "sign" => Ok(Request::Sign(string(&v, "sig")?)),
+        "draft" => Ok(Request::Draft(string(&v, "text")?)),
+        "diff" => Ok(Request::Diff),
         other => Err(err(format!("unknown op {other}"))),
     }
 }

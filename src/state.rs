@@ -247,10 +247,23 @@ impl State {
             Record::Gate { tokens, .. } => {
                 self.decision_spent = self.decision_spent.saturating_add(*tokens);
             }
+            Record::Bind { id, text, tags, .. } => {
+                if !self.constraints.iter().any(|c| c.id == *id) {
+                    self.constraints.push(ConstraintView {
+                        id: id.clone(),
+                        text: text.clone(),
+                        tags: tags.clone(),
+                    });
+                }
+            }
+            Record::Clear { id, .. } => {
+                self.constraints.retain(|c| &c.id != id);
+            }
             Record::Kill { .. }
             | Record::Reset { .. }
             | Record::Result { .. }
-            | Record::Promote { .. } => {}
+            | Record::Promote { .. }
+            | Record::Sign { .. } => {}
         }
         if let Record::Reset { ts, .. } = rec {
             self.purse.apply_reset(*ts);

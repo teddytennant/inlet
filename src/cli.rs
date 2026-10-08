@@ -1,5 +1,6 @@
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -27,8 +28,13 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some("init") => init(&home),
+        Some("init") => init(&home, &args[1..]),
         Some("add") => add(&home, &args[1..]),
+        Some("bind") => bind(&home, &args[1..]),
+        Some("clear") => clear(&home, args.get(1).map(String::as_str)),
+        Some("sign") => sign_policy(&home),
+        Some("diff") => diff_policy(&home),
+        Some("draft") => draft_policy(&home),
         Some("status") => status(&home, args.iter().any(|a| a == "--json")),
         Some("post") => {
             let text = args[1..].join(" ");
@@ -60,22 +66,30 @@ pub fn run() -> Result<()> {
 const HELP: &str = "\
 inlet up [-f]            daemon. -f stays in the foreground
 inlet                    attach the TUI
-inlet init               write policy.lua
+inlet init               write policy.lua and pin a signing key
 inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID] [--recipe NAME]
 inlet add -f tasks.jsonl
 inlet post <text>
+inlet bind <text>
+inlet clear <id>
+inlet sign
+inlet diff
 inlet kill <id>
 inlet pin <name>
 inlet watch [--debug N] [--worker ID]
 inlet status [--json]
 ";
 
-fn init(home: &Path) -> Result<()> {
+fn init(home: &Path, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(err("passphrase is read from /dev/tty"));
+    }
     fs::create_dir_all(home)?;
     fs::create_dir_all(home.join("ledger"))?;
     fs::create_dir_all(home.join("registry"))?;
     fs::create_dir_all(home.join("run"))?;
+    fs::create_dir_all(home.join("keys"))?;
     let policy = paths::policy(home);
     if !policy.exists() {
         fs::write(&policy, DEFAULT_POLICY)?;
@@ -83,8 +97,130 @@ fn init(home: &Path) -> Result<()> {
     } else {
         println!("{} already exists", policy.display());
     }
-    println!("signing key arrives with signed policy");
+    if paths::key_pub(home).exists() {
+        println!("signing key already pinned");
+        return Ok(());
+    }
+    let passphrase = crate::sign::read_passphrase("passphrase: ")?;
+    let (public, wrapped) = crate::sign::generate(&passphrase)?;
+    let body = fs::read(&policy)?;
+    let sig = crate::sign::sign_with(&wrapped, &passphrase, &body)?;
+    write_private(&paths::key_pub(home), &public)?;
+    write_private(&paths::key_priv(home), &wrapped)?;
+    write_private(&paths::policy_sig(home), &sig)?;
+    println!("pinned signing key");
     Ok(())
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn bind(home: &Path, args: &[String]) -> Result<()> {
+    let text = args.join(" ");
+    if text.trim().is_empty() {
+        return Err(err("usage: inlet bind <text>"));
+    }
+    let v = proto::rpc(home, json!({"op":"bind","text": text}))?;
+    print_ok(&v)
+}
+
+fn clear(home: &Path, id: Option<&str>) -> Result<()> {
+    let id = id.ok_or_else(|| err("usage: inlet clear <id>"))?;
+    let passphrase = crate::sign::read_passphrase("passphrase: ")?;
+    let wrapped = fs::read(paths::key_priv(home)).map_err(|_| err("no signing key"))?;
+    let msg = format!("clear\n{id}\n");
+    let bar = ProgressBar::new_spinner();
+    if io::stderr().is_terminal() {
+        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_message("clear");
+        bar.enable_steady_tick(Duration::from_millis(80));
+    }
+    let sig = crate::sign::sign_with(&wrapped, &passphrase, msg.as_bytes())?;
+    bar.finish_and_clear();
+    let v = proto::rpc(
+        home,
+        json!({"op":"clear","id": id, "sig": crate::sign::hex_encode(&sig)}),
+    )?;
+    print_ok(&v)
+}
+
+fn sign_policy(home: &Path) -> Result<()> {
+    let draft = fs::read(paths::policy_draft(home)).map_err(|_| err("no policy.draft.lua"))?;
+    let passphrase = crate::sign::read_passphrase("passphrase: ")?;
+    let wrapped = fs::read(paths::key_priv(home)).map_err(|_| err("no signing key"))?;
+    let bar = ProgressBar::new_spinner();
+    if io::stderr().is_terminal() {
+        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_message("signing");
+        bar.enable_steady_tick(Duration::from_millis(80));
+    }
+    let sig = crate::sign::sign_with(&wrapped, &passphrase, &draft)?;
+    bar.finish_and_clear();
+    let v = proto::rpc(
+        home,
+        json!({"op":"sign","sig": crate::sign::hex_encode(&sig)}),
+    )?;
+    print_ok(&v)
+}
+
+fn diff_policy(home: &Path) -> Result<()> {
+    let v = proto::rpc(home, json!({"op":"diff"}))?;
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        return Err(err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("diff failed")));
+    }
+    let loaded = v.get("loaded").and_then(|s| s.as_str()).unwrap_or("");
+    let draft = v.get("draft").and_then(|s| s.as_str()).unwrap_or("");
+    print_diff(loaded, draft);
+    Ok(())
+}
+
+fn print_diff(loaded: &str, draft: &str) {
+    if draft.is_empty() {
+        println!("no policy.draft.lua");
+        return;
+    }
+    let old: Vec<&str> = loaded.lines().collect();
+    let new: Vec<&str> = draft.lines().collect();
+    let mut changed = false;
+    let n = old.len().max(new.len());
+    for i in 0..n {
+        match (old.get(i), new.get(i)) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => {
+                changed = true;
+                println!("-{a}");
+                println!("+{b}");
+            }
+            (Some(a), None) => {
+                changed = true;
+                println!("-{a}");
+            }
+            (None, Some(b)) => {
+                changed = true;
+                println!("+{b}");
+            }
+            (None, None) => {}
+        }
+    }
+    if !changed {
+        println!("policy.draft.lua matches the loaded snapshot");
+    }
+}
+
+fn draft_policy(home: &Path) -> Result<()> {
+    let mut text = String::new();
+    io::stdin().read_to_string(&mut text)?;
+    let v = proto::rpc(home, json!({"op":"draft","text": text}))?;
+    print_ok(&v)
 }
 
 fn add(home: &Path, args: &[String]) -> Result<()> {

@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -22,6 +22,11 @@ use crate::paths;
 
 const RING: usize = 400;
 
+enum Pending {
+    Sign,
+    Clear(String),
+}
+
 pub struct Ui {
     pub live: u64,
     pub queued: u64,
@@ -31,6 +36,8 @@ pub struct Ui {
     pub follow: Option<String>,
     pub lines: std::collections::VecDeque<String>,
     pub input: String,
+    home: PathBuf,
+    secret: Option<Pending>,
 }
 
 impl Default for Ui {
@@ -44,6 +51,8 @@ impl Default for Ui {
             follow: None,
             lines: std::collections::VecDeque::new(),
             input: String::new(),
+            home: PathBuf::new(),
+            secret: None,
         }
     }
 }
@@ -76,6 +85,15 @@ impl Ui {
                 "deny {} {}",
                 short(value["id"].as_str().unwrap_or("")),
                 value["reason"].as_str().unwrap_or("")
+            )),
+            Some("bind") => self.push(format!(
+                "bind {} {}",
+                short(value["id"].as_str().unwrap_or("")),
+                value["text"].as_str().unwrap_or("")
+            )),
+            Some("clear") => self.push(format!(
+                "clear {}",
+                short(value["id"].as_str().unwrap_or(""))
             )),
             Some("admit") | Some("spawn") | Some("kill") | Some("task") | Some("reset") => {
                 self.push(format!(
@@ -128,7 +146,11 @@ impl Ui {
             }
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.input);
-                self.command(line)
+                if let Some(pending) = self.secret.take() {
+                    self.finish_secret(pending, line)
+                } else {
+                    self.command(line)
+                }
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
@@ -171,6 +193,28 @@ impl Ui {
                     };
                     KeyAction::Send(format!(r#"{{"op":"pin","name":"{name}"}}"#))
                 }
+                "bind" => {
+                    let text = parts.join(" ");
+                    if text.is_empty() {
+                        self.push("bind needs text".into());
+                        return KeyAction::None;
+                    }
+                    KeyAction::Send(serde_json::json!({"op":"bind","text": text}).to_string())
+                }
+                "sign" => {
+                    self.secret = Some(Pending::Sign);
+                    self.push("passphrase".into());
+                    KeyAction::None
+                }
+                "clear" => {
+                    let Some(id) = parts.first().cloned() else {
+                        self.push("clear needs an id".into());
+                        return KeyAction::None;
+                    };
+                    self.secret = Some(Pending::Clear(id));
+                    self.push("passphrase".into());
+                    KeyAction::None
+                }
                 "kill" => {
                     let Some(id) = parts.first() else {
                         self.push("kill needs an id".into());
@@ -212,6 +256,49 @@ impl Ui {
             KeyAction::Send(text.to_string())
         }
     }
+
+    fn finish_secret(&mut self, pending: Pending, passphrase: String) -> KeyAction {
+        let passphrase = passphrase.trim().to_string();
+        if passphrase.is_empty() {
+            self.push("passphrase stays empty".into());
+            return KeyAction::None;
+        }
+        let wrapped = match std::fs::read(paths::key_priv(&self.home)) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.push("no signing key".into());
+                return KeyAction::None;
+            }
+        };
+        let msg = match &pending {
+            Pending::Sign => match std::fs::read(paths::policy_draft(&self.home)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    self.push("no policy.draft.lua".into());
+                    return KeyAction::None;
+                }
+            },
+            Pending::Clear(id) => format!("clear\n{id}\n").into_bytes(),
+        };
+        let sig = match crate::sign::sign_with(&wrapped, &passphrase, &msg) {
+            Ok(sig) => crate::sign::hex_encode(&sig),
+            Err(e) => {
+                self.push(e.to_string());
+                return KeyAction::None;
+            }
+        };
+        if self.lines.iter().any(|line| line.contains(&passphrase)) {
+            self.push("passphrase leaked into the scrollback".into());
+        }
+        match pending {
+            Pending::Sign => {
+                KeyAction::Send(serde_json::json!({"op":"sign","sig": sig}).to_string())
+            }
+            Pending::Clear(id) => {
+                KeyAction::Send(serde_json::json!({"op":"clear","id": id, "sig": sig}).to_string())
+            }
+        }
+    }
 }
 
 pub enum KeyAction {
@@ -242,7 +329,12 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
     );
     let lines: Vec<Line> = ui.visible().into_iter().map(Line::from).collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
-    frame.render_widget(Paragraph::new(format!("> {}", ui.input)), chunks[2]);
+    let prompt = if ui.secret.is_some() {
+        format!("passphrase {}", "*".repeat(ui.input.chars().count()))
+    } else {
+        format!("> {}", ui.input)
+    };
+    frame.render_widget(Paragraph::new(prompt), chunks[2]);
 }
 
 pub fn attach(home: &Path) -> Result<()> {
@@ -253,7 +345,10 @@ pub fn attach(home: &Path) -> Result<()> {
     writer.write_all(b"{\"op\":\"hello\",\"debug\":1}\n")?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || reader_loop(reader, tx));
-    let mut ui = Ui::default();
+    let mut ui = Ui {
+        home: home.to_path_buf(),
+        ..Ui::default()
+    };
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
@@ -324,6 +419,7 @@ fn short(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -373,5 +469,21 @@ mod tests {
             KeyAction::Send(line) => assert!(line.contains("\"level\":3")),
             _ => panic!("debug"),
         }
+        match ui.command("/bind stay out #code".into()) {
+            KeyAction::Send(line) => {
+                assert!(line.contains("\"op\":\"bind\""));
+                assert!(line.contains("#code"));
+                assert!(!line.contains("passphrase"));
+            }
+            _ => panic!("bind"),
+        }
+        assert!(matches!(ui.command("/sign".into()), KeyAction::None));
+        ui.input = "keyboard-cat".into();
+        match ui.key(KeyCode::Enter, KeyModifiers::NONE) {
+            KeyAction::Send(line) => assert!(!line.contains("keyboard-cat"), "{line}"),
+            KeyAction::None => {}
+            KeyAction::Quit => panic!("quit"),
+        }
+        assert!(ui.lines.iter().all(|line| !line.contains("keyboard-cat")));
     }
 }

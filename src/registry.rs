@@ -14,16 +14,7 @@ use crate::error::{err, Result};
 use crate::id::now_ms;
 use crate::model::{Decoded, Record};
 
-pub fn render_preamble(
-    id: &str,
-    tokens: u64,
-    seconds: u64,
-    memory_mb: u64,
-    depth: u32,
-    max_depth: u32,
-) -> String {
-    format!(
-        "\
+const PREAMBLE: &str = "\
 You are worker {id} in inlet. Left: {tokens} tokens, {seconds}s, {memory_mb}MB. Depth {depth}/{max_depth}.
 
 Search the registry before you build. If a recipe matches, use it. If none does, build one in scratch on your budget and submit it. A draft is not shared.
@@ -33,8 +24,25 @@ Bash is enough. A missing tool is something you build after a registry miss, ins
 Talk on the board. Post to the channels you can read. @mention a worker, or @all, when you need them. Do not open a private channel to a sibling. Cast a vote when the board asks. A vote is a ledger record. It can moderate the board or recommend. It cannot admit, rebudget, or kill.
 
 You cannot kill, rebudget, or raise caps. No API keys. Calls go through the proxy. Empty purse: stop and post.
-"
-    )
+";
+
+pub fn render_preamble(
+    id: &str,
+    tokens: u64,
+    seconds: u64,
+    memory_mb: u64,
+    depth: u32,
+    max_depth: u32,
+    template: Option<&str>,
+) -> String {
+    let template = template.unwrap_or(PREAMBLE);
+    template
+        .replace("{id}", id)
+        .replace("{tokens}", &tokens.to_string())
+        .replace("{seconds}", &seconds.to_string())
+        .replace("{memory_mb}", &memory_mb.to_string())
+        .replace("{depth}", &depth.to_string())
+        .replace("{max_depth}", &max_depth.to_string())
 }
 
 pub fn snapshot(live: &Path, dest: &Path) -> Result<()> {

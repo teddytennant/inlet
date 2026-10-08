@@ -131,6 +131,7 @@ pub struct Config {
     pub value: u64,
     pub unattended: bool,
     pub debug: u8,
+    pub preamble: Option<String>,
     pub default_budget: Budget,
     pub decision: DecisionCfg,
     pub proxy: ProxyCfg,
@@ -141,6 +142,7 @@ pub struct Policy {
     pub cfg: Config,
     lua: Lua,
     has_admit: bool,
+    pub source: String,
 }
 
 impl Policy {
@@ -185,6 +187,7 @@ impl Policy {
             cfg,
             lua,
             has_admit,
+            source: src.to_string(),
         })
     }
 
@@ -275,6 +278,11 @@ fn read_config(lua: &Lua) -> Result<Config> {
     }
     if let Some(v) = g.get::<Option<i64>>("debug")? {
         cfg.debug = v.clamp(0, 4) as u8;
+    }
+    if let Some(v) = g.get::<Option<String>>("preamble")? {
+        if !v.is_empty() {
+            cfg.preamble = Some(v);
+        }
     }
     if let Some(table) = g.get::<Option<Table>>("caps")? {
         overlay_caps(&mut cfg.caps, &table)?;
@@ -499,6 +507,7 @@ pub fn preset(setup: &str) -> Config {
         value: 400_000,
         unattended: false,
         debug: 1,
+        preamble: None,
         default_budget: Budget {
             tokens: 200_000,
             seconds: 3600,

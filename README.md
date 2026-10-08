@@ -40,8 +40,10 @@ recipes: a draft is promoted when a second worker's verifier is real,
 or when you `inlet pin` it. The gate can call a decision endpoint
 (`decision.kind` of `openai` or `jev`). `off` stays the local formula.
 Pi and Wizard share one operator skill (`skills/pi`, `skills/wizard`):
-it runs the inlet CLI and does not enter a cell. Signed policy and
-chat bridges are in SPEC.md. They are not in this binary yet.
+it runs the inlet CLI and does not enter a cell. `inlet init` pins a
+passphrase key. `inlet sign` and `inlet clear` read it from the tty.
+A constraint binds until the human clears it. Chat bridges are in
+SPEC.md. They are not in this binary yet.
 
 See SPEC.md for the full design.
 

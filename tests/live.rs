@@ -209,11 +209,14 @@ fn stop(daemon: &mut Daemon) {
 fn spawn_hides_the_host_and_keeps_the_key() {
     let home = scratch("hide");
     fs::write(home.join("key"), "KEYMATERIAL\n").unwrap();
+    fs::write(home.join("policy.draft.lua"), "DRAFTPOLICY\n").unwrap();
     fs::create_dir_all(home.join("work/other")).unwrap();
     fs::write(home.join("work/other/mine"), "SIBLING\n").unwrap();
     let ledger_path = sh_quote(&home.join("ledger/log"));
     let sock = sh_quote(&home.join("run/operator.sock"));
     let key = sh_quote(&home.join("key"));
+    let pubkey = sh_quote(&home.join("keys/policy.pub"));
+    let draft = sh_quote(&home.join("policy.draft.lua"));
     let policy_path = sh_quote(&home.join("policy.lua"));
     let sib = sh_quote(&home.join("work/other/mine"));
     let work = sh_quote(&home.join("work"));
@@ -223,6 +226,8 @@ mark() {{ if [ -e \"$1\" ]; then echo \"$2LEAK\"; else echo \"$2OK\"; fi >> /wor
 mark {ledger_path} LEDGER
 mark {sock} SOCK
 mark {key} KEY
+mark {pubkey} PUB
+mark {draft} DRAFT
 mark {policy_path} POLICY
 mark {sib} SIB
 mark {work} WORK
@@ -241,6 +246,13 @@ sleep 30"
             "",
         ),
     );
+    let (public, wrapped) = inlet::sign::generate("cell-pass").unwrap();
+    let body = fs::read(home.join("policy.lua")).unwrap();
+    let sig = inlet::sign::sign_with(&wrapped, "cell-pass", &body).unwrap();
+    fs::create_dir_all(home.join("keys")).unwrap();
+    fs::write(home.join("keys/policy.pub"), &public).unwrap();
+    fs::write(home.join("keys/policy.key"), &wrapped).unwrap();
+    fs::write(home.join("policy.sig"), &sig).unwrap();
     let daemon = start_env(&home, &[("OPENAI_API_KEY", "sk-hostsecret")]);
     assert!(home.join("run/operator.sock").exists(), "{}", daemon.log());
     inlet(
@@ -306,6 +318,8 @@ sleep 30"
         "LEDGEROK",
         "SOCKOK",
         "KEYOK",
+        "PUBOK",
+        "DRAFTOK",
         "POLICYOK",
         "SIBOK",
         "WORKOK",
@@ -1674,8 +1688,17 @@ fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
     );
     assert_eq!(drafted["ok"], true, "{drafted} {}", daemon.log());
     let preamble_path = home.join("work").join(&author).join("preamble");
+    let hide_path = home.join("work").join(&author).join("hide");
     let deadline = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < deadline && !preamble_path.exists() {
+    while Instant::now() < deadline
+        && (fs::read_to_string(&preamble_path)
+            .unwrap_or_default()
+            .is_empty()
+            || fs::read_to_string(&hide_path)
+                .unwrap_or_default()
+                .trim()
+                .is_empty())
+    {
         thread::sleep(Duration::from_millis(30));
     }
     let preamble = fs::read_to_string(&preamble_path).unwrap_or_default();
@@ -1695,9 +1718,7 @@ fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
         preamble.len()
     );
     assert_eq!(
-        fs::read_to_string(home.join("work").join(&author).join("hide"))
-            .unwrap_or_default()
-            .trim(),
+        fs::read_to_string(&hide_path).unwrap_or_default().trim(),
         "DRAFTHIDDEN"
     );
     fs::write(home.join("work").join(&author).join("go"), "1").unwrap();
@@ -2435,6 +2456,575 @@ fn decision_spend_survives_kill9() {
         fake.hits.lock().unwrap().len(),
         1,
         "down purse called again"
+    );
+}
+
+fn tty_inlet(home: &Path, args: &[&str], passphrase: &str) -> (bool, String) {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    let mut master: i32 = 0;
+    let mut slave: i32 = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty");
+    let slave_fd = slave;
+    let mut cmd = Command::new(bin());
+    cmd.arg("--home").arg(home).args(args);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let slave_in = unsafe { File::from_raw_fd(slave) };
+    let slave_out = slave_in.try_clone().unwrap();
+    let slave_err = slave_in.try_clone().unwrap();
+    cmd.stdin(Stdio::from(slave_in))
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::from(slave_err));
+    let mut child = cmd.spawn().unwrap();
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut master_file = unsafe { File::from_raw_fd(master) };
+    let mut seen = String::new();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !seen.contains("passphrase:") && Instant::now() < deadline {
+        match master_file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    master_file
+        .write_all(format!("{passphrase}\n").as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (false, format!("tty timeout\n{seen}"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut out = seen;
+    loop {
+        match master_file.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+    (status.success(), out)
+}
+
+fn inlet_raw(home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn expect_refuse(home: &Path) {
+    let _ = fs::remove_file(home.join("run/operator.sock"));
+    let _ = fs::remove_file(home.join("run/inlet.pid"));
+    let log_path = home.join("refuse.log");
+    let log = File::create(&log_path).unwrap();
+    let err = log.try_clone().unwrap();
+    let mut child = Command::new(bin())
+        .args(["--home", home.to_str().unwrap(), "up", "-f"])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let text = fs::read_to_string(&log_path).unwrap_or_default();
+            panic!("tampered policy stayed up: {text}");
+        }
+        thread::sleep(Duration::from_millis(30));
+    };
+    let text = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!status.success(), "tampered policy started: {text}");
+    assert!(
+        text.contains("signature") || text.contains("not signed"),
+        "{text}"
+    );
+}
+
+#[test]
+fn signed_policy_ignores_unsigned_edits() {
+    let home = scratch("sign");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let argv = inlet_raw(&home, &["init", "keyboard-cat"]);
+    assert!(!argv.status.success(), "passphrase accepted from argv");
+    assert!(!home.join("keys/policy.key").exists());
+    let (ok, out) = tty_inlet(&home, &["init"], "keyboard-cat");
+    assert!(ok, "init failed: {out}");
+    assert!(out.contains("pinned"), "{out}");
+    let wrapped = fs::read(home.join("keys/policy.key")).unwrap();
+    assert!(!wrapped.windows(8).any(|w| w == b"keyboard"));
+    let daemon = start(&home);
+    assert_eq!(status(&home)["cap"].as_u64(), Some(1000));
+    let mut tampered = fs::read_to_string(home.join("policy.lua")).unwrap();
+    tampered = tampered.replace("max_tokens = 1000", "max_tokens = 9000");
+    fs::write(home.join("policy.lua"), &tampered).unwrap();
+    assert_eq!(
+        status(&home)["cap"].as_u64(),
+        Some(1000),
+        "unsigned edit applied"
+    );
+    let peek = inlet_raw(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "peek",
+            "--goal",
+            "look",
+            "--no-verify",
+            "--tokens",
+            "20",
+        ],
+    );
+    assert!(!peek.status.success(), "unsigned worker was admitted");
+    let draft = r#"
+caps = { max_live = 4, max_depth = 3, max_tokens = 5000, max_memory_mb = 8192, max_pids = 64, token_period = "1d" }
+setup = "box"
+isolator = "rlimit"
+human_weight = 9
+min_ev = 0
+value = 400000
+debug = 1
+preamble = "SIGNED-PREAMBLE {id}\n"
+default_budget = { tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }
+workers = {
+  sleeper = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
+  peek = { cmd = { "/bin/sh", "-c", "cp /etc/preamble /work/seen" }, tags = { "code" }, net = "host", on_crash = "fail" },
+}
+function admit(ctx)
+  if ctx.goal == "lua-no" then return "deny" end
+  return "allow"
+end
+"#;
+    let mut child = Command::new(bin())
+        .arg("--home")
+        .arg(&home)
+        .arg("draft")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(draft.as_bytes())
+        .unwrap();
+    let drafted = child.wait_with_output().unwrap();
+    assert!(drafted.status.success(), "{drafted:?}");
+    let diff = inlet(&home, &["diff"]);
+    let diff_text = String::from_utf8_lossy(&diff.stdout);
+    assert!(
+        diff_text.contains("SIGNED-PREAMBLE") || diff_text.contains("5000"),
+        "{diff_text}"
+    );
+    let (bad, bad_out) = tty_inlet(&home, &["sign"], "wrong-horse");
+    assert!(!bad, "wrong passphrase signed: {bad_out}");
+    assert_eq!(status(&home)["cap"].as_u64(), Some(1000));
+    let (signed, signed_out) = tty_inlet(&home, &["sign"], "keyboard-cat");
+    assert!(signed, "sign failed: {signed_out} {}", daemon.log());
+    let st = status(&home);
+    assert_eq!(st["cap"].as_u64(), Some(5000), "{st}");
+    say(&home, "weight-check");
+    thread::sleep(Duration::from_millis(200));
+    let weight = read_log(&home).into_iter().find_map(|rec| match rec {
+        Decoded::Rec(r) => match r.as_ref() {
+            Record::Post { text, weight, .. } if text.contains("weight-check") => Some(*weight),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(weight, Some(9), "human weight was not in the signed policy");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "peek",
+            "--goal",
+            "lua-no",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "lua-no" && t["state"] == "failed")
+    });
+    let denied = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "lua-no")
+        .unwrap();
+    assert_eq!(denied["reason"], "lua", "{denied}");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "peek",
+            "--goal",
+            "show-preamble",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "show-preamble" && t["state"] == "done")
+    });
+    let id = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "show-preamble")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let seen = fs::read_to_string(home.join("work").join(id).join("seen")).unwrap_or_default();
+    assert!(
+        seen.contains("SIGNED-PREAMBLE"),
+        "preamble {seen} {}",
+        daemon.log()
+    );
+    drop(daemon);
+    let mut bytes = fs::read(home.join("policy.lua")).unwrap();
+    bytes.push(b' ');
+    fs::write(home.join("policy.lua"), bytes).unwrap();
+    expect_refuse(&home);
+}
+
+#[test]
+fn constraints_bind_until_a_signed_clear() {
+    let home = scratch("bind");
+    policy(
+        &home,
+        &base_policy(
+            r#"prover = { cmd = { "/bin/true" }, tags = { "math" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 2000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    let bare = inlet_raw(&home, &["bind", "no tag here"]);
+    assert!(!bare.status.success(), "tagless constraint was kept");
+    assert!(
+        !read_log(&home)
+            .iter()
+            .any(|r| matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Bind { .. }))),
+        "tagless bind was recorded"
+    );
+    let bound = inlet(&home, &["bind", "stay out #code"]);
+    let id = String::from_utf8_lossy(&bound.stdout).trim().to_string();
+    assert!(!id.is_empty(), "bind id missing");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "coded",
+            "--no-verify",
+            "--tokens",
+            "30",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "coded" && t["state"] == "failed")
+    });
+    assert_eq!(
+        tasks(&st).iter().find(|t| t["goal"] == "coded").unwrap()["reason"],
+        "constraint"
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "prover",
+            "--goal",
+            "mathy",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "mathy" && t["state"] == "done")
+    });
+    let sock = UnixStream::connect(home.join("run/operator.sock")).unwrap();
+    let mut sock = BufReader::new(sock);
+    let line = format!("{{\"op\":\"clear\",\"id\":{id:?},\"passphrase\":\"keyboard-cat\"}}\n");
+    sock.get_mut().write_all(line.as_bytes()).unwrap();
+    let mut buf = String::new();
+    sock.read_line(&mut buf).unwrap();
+    assert!(
+        buf.contains("tty"),
+        "passphrase accepted on the socket: {buf}"
+    );
+    assert!(status(&home)["constraints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == id));
+    let (made, made_out) = tty_inlet(&home, &["init"], "keyboard-cat");
+    assert!(made, "init failed: {made_out}");
+    let (cleared, clear_out) = tty_inlet(&home, &["clear", &id], "keyboard-cat");
+    assert!(cleared, "clear failed: {clear_out} {}", daemon.log());
+    assert!(status(&home)["constraints"].as_array().unwrap().is_empty());
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "after-clear",
+            "--no-verify",
+            "--tokens",
+            "30",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "after-clear" && t["state"] == "running")
+    });
+    assert_ne!(
+        tasks(&st)
+            .iter()
+            .find(|t| t["goal"] == "after-clear")
+            .unwrap()["reason"],
+        "constraint"
+    );
+}
+
+#[test]
+fn constraint_and_purse_survive_kill9() {
+    let home = scratch("bind9");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "nap",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| v["live"].as_u64() == Some(1));
+    assert_eq!(st["spent"].as_u64(), Some(100));
+    inlet(&home, &["bind", "stay out #code"]);
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let pid = pid_of(&home).unwrap();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let _ = daemon.child.wait();
+    let daemon = start(&home);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == id && t["state"] == "failed")
+    });
+    assert_eq!(st["spent"].as_u64(), Some(100), "{}", daemon.log());
+    let admits = read_log(&home)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id: i, .. } if i == &id))
+        })
+        .count();
+    assert_eq!(admits, 1, "kill -9 admitted the slice again");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "still-bound",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "still-bound" && t["state"] == "failed")
+    });
+    assert_eq!(
+        tasks(&st)
+            .iter()
+            .find(|t| t["goal"] == "still-bound")
+            .unwrap()["reason"],
+        "constraint"
+    );
+}
+
+#[test]
+fn endpoint_judges_the_constraint() {
+    let fake = fake_decision(Arc::new(|body: &str| {
+        if body.contains("clash-bind") {
+            let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let ids: Vec<&str> = value
+                .get("constraints")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("id").and_then(|s| s.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let conflicts = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
+            return DecisionReply::Body(
+                format!(
+                    r#"{{"p_success":1,"conflicts":{conflicts},"usage":{{"total_tokens":2}}}}"#
+                )
+                .into_bytes(),
+            );
+        }
+        DecisionReply::Body(
+            br#"{"p_success":1,"conflicts":[],"usage":{"total_tokens":2}}"#.to_vec(),
+        )
+    }));
+    let home = scratch("bind-judge");
+    policy(&home, &decision_policy("", fake.port, ""));
+    let daemon = start(&home);
+    let bound = inlet(&home, &["bind", "judge this please"]);
+    let id = String::from_utf8_lossy(&bound.stdout).trim().to_string();
+    assert!(
+        !id.is_empty(),
+        "tagless bind refused while the endpoint is on"
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "ok-bind",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "ok-bind" && t["state"] == "running")
+    });
+    assert_ne!(
+        tasks(&st).iter().find(|t| t["goal"] == "ok-bind").unwrap()["reason"],
+        "constraint"
+    );
+    let bodies = wait_bodies(&fake, |hits| {
+        hits.iter().any(|h| h.body.contains("ok-bind"))
+    });
+    let call = bodies.iter().find(|h| h.body.contains("ok-bind")).unwrap();
+    assert!(call.body.contains("judge this please"), "{}", call.body);
+    assert!(call.body.contains("\"human_weight\":4"), "{}", call.body);
+    assert!(!call.body.contains("SECRET_"), "{}", call.body);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "clash-bind",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "clash-bind" && t["state"] == "failed")
+    });
+    assert_eq!(
+        tasks(&st)
+            .iter()
+            .find(|t| t["goal"] == "clash-bind")
+            .unwrap()["reason"],
+        "constraint",
+        "{st} {}",
+        daemon.log()
     );
 }
 

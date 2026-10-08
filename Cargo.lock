@@ -288,6 +288,7 @@ dependencies = [
  "libc",
  "mlua",
  "ratatui",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

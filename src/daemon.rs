@@ -179,7 +179,7 @@ fn daemonize(home: &Path) -> Result<()> {
 }
 
 fn run(home: &Path) -> Result<()> {
-    let policy = Policy::load(&paths::policy(home))?;
+    let policy = load_signed(home)?;
     let opened = ledger::open(&paths::ledger(home))?;
     opened.ledger.lock()?;
     let mut state = State::new(&policy.cfg);
@@ -650,7 +650,7 @@ impl Daemon {
                     )?;
                     continue;
                 }
-                GatePrep::Off => (None, false),
+                GatePrep::Off => (None, self.tag_blocked(&task)),
                 GatePrep::Ready {
                     p_num,
                     p_den,
@@ -804,6 +804,7 @@ impl Daemon {
             task.budget.memory_mb,
             depth,
             self.policy.cfg.caps.max_depth,
+            self.policy.cfg.preamble.as_deref(),
         );
         let spawned = cell::spawn(&SpawnRequest {
             cmd: worker.cmd,
@@ -1189,6 +1190,23 @@ impl Daemon {
                     .collect::<Vec<_>>());
                 self.reply(id, status);
             }
+            Request::Bind(text) => match self.bind_text(&text) {
+                Ok(cid) => self.reply(id, json!({"ok": true, "id": cid})),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Clear { id: cid, sig } => match self.clear_constraint(&cid, &sig) {
+                Ok(()) => self.reply(id, json!({"ok": true, "id": cid})),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Sign(sig) => match self.install_signed(&sig) {
+                Ok(()) => self.reply(id, json!({"ok": true})),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Draft(text) => match self.write_draft(&text) {
+                Ok(()) => self.reply(id, json!({"ok": true})),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Diff => self.reply(id, self.diff_json()),
             Request::Pin(name) => match self.pin(&name) {
                 Ok(()) => self.reply(id, json!({"ok": true, "name": name})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
@@ -1504,8 +1522,106 @@ impl Daemon {
             "gate": self.policy.cfg.decision.kind.as_str(),
             "gate_spent": self.state.decision_spent,
             "gate_cap": self.policy.cfg.decision.purse_tokens,
+            "constraints": self.state.constraints.iter().map(|c| json!({
+                "id": c.id,
+                "text": c.text,
+                "tags": c.tags,
+            })).collect::<Vec<_>>(),
             "tasks": tasks,
         })
+    }
+
+    fn tag_blocked(&self, task: &crate::state::TaskView) -> bool {
+        self.state.constraints.iter().any(|constraint| {
+            constraint
+                .tags
+                .iter()
+                .any(|tag| task.tags.iter().any(|have| have == tag))
+        })
+    }
+
+    fn bind_text(&mut self, text: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(err("empty constraint"));
+        }
+        let tags = crate::sign::tags_in(text);
+        if tags.is_empty() && self.policy.cfg.decision.kind == DecisionKind::Off {
+            return Err(err("constraint needs a #tag"));
+        }
+        let id = id::ulid();
+        self.commit(
+            &[Record::Bind {
+                id: id.clone(),
+                text: text.to_string(),
+                tags,
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+        Ok(id)
+    }
+
+    fn clear_constraint(&mut self, id: &str, sig_hex: &str) -> Result<()> {
+        let public = fs::read(paths::key_pub(&self.home)).map_err(|_| err("no signing key"))?;
+        let sig = crate::sign::hex_decode(sig_hex)?;
+        let msg = format!("clear\n{id}\n");
+        crate::sign::verify(&public, msg.as_bytes(), &sig)?;
+        if !self.state.constraints.iter().any(|c| c.id == id) {
+            return Err(err("no constraint"));
+        }
+        self.commit(
+            &[Record::Clear {
+                id: id.to_string(),
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn install_signed(&mut self, sig_hex: &str) -> Result<()> {
+        let body = fs::read_to_string(paths::policy_draft(&self.home))
+            .map_err(|_| err("no policy.draft.lua"))?;
+        let public = fs::read(paths::key_pub(&self.home)).map_err(|_| err("no signing key"))?;
+        let sig = crate::sign::hex_decode(sig_hex)?;
+        crate::sign::verify(&public, body.as_bytes(), &sig)?;
+        let parsed = Policy::parse(&body)?;
+        durable_write(&paths::policy_sig(&self.home), &sig)?;
+        durable_write(&paths::policy(&self.home), body.as_bytes())?;
+        self.raise_caps(&parsed.cfg);
+        self.policy = parsed;
+        self.commit(&[Record::Sign { ts: now_ms() }], true)?;
+        Ok(())
+    }
+
+    fn write_draft(&self, text: &str) -> Result<()> {
+        if text.len() > 256 * 1024 {
+            return Err(err("draft is too large"));
+        }
+        durable_write(&paths::policy_draft(&self.home), text.as_bytes())
+    }
+
+    fn diff_json(&self) -> Value {
+        let draft = fs::read_to_string(paths::policy_draft(&self.home)).unwrap_or_default();
+        json!({
+            "ok": true,
+            "loaded": self.policy.source,
+            "draft": draft,
+        })
+    }
+
+    fn raise_caps(&mut self, cfg: &crate::config::Config) {
+        let purse = &mut self.state.purse;
+        if cfg.caps.max_tokens > purse.cap {
+            purse.available = purse
+                .available
+                .saturating_add(cfg.caps.max_tokens - purse.cap);
+        }
+        purse.cap = cfg.caps.max_tokens;
+        purse.memory_cap = cfg.caps.max_memory_mb;
+        purse.pids_cap = cfg.caps.max_pids;
+        purse.period_ms = cfg.caps.token_period_ms;
     }
 
     fn reply(&self, id: u64, value: Value) {
@@ -1568,6 +1684,12 @@ impl Daemon {
             Record::Promote { name, by, ts } => {
                 (1, json!({"ev":"promote","name":name,"by":by,"ts":ts}))
             }
+            Record::Bind { id, text, tags, ts } => (
+                0,
+                json!({"ev":"bind","id":id,"text":text,"tags":tags,"ts":ts}),
+            ),
+            Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
+            Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),
         };
         self.broadcast(level, value);
     }
@@ -1634,6 +1756,33 @@ impl Daemon {
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
     }
+}
+
+fn load_signed(home: &Path) -> Result<Policy> {
+    let path = paths::policy(home);
+    let text = fs::read_to_string(&path)
+        .map_err(|_| err(format!("no policy at {} (inlet init)", path.display())))?;
+    if paths::key_pub(home).exists() {
+        let public = fs::read(paths::key_pub(home))?;
+        let sig = fs::read(paths::policy_sig(home)).map_err(|_| err("policy is not signed"))?;
+        crate::sign::verify(&public, text.as_bytes(), &sig)?;
+    }
+    Policy::parse(&text)
+}
+
+fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn header_of(task: &crate::state::TaskView) -> Header {
