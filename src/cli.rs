@@ -37,6 +37,7 @@ pub fn run() -> Result<()> {
         Some("draft") => draft_policy(&home),
         Some("snap") => snap(&home),
         Some("status") => status(&home, args.iter().any(|a| a == "--json")),
+        Some("bridge") => bridge_cmd(&home, &args[1..]),
         Some("post") => {
             let text = args[1..].join(" ");
             if text.trim().is_empty() {
@@ -75,6 +76,7 @@ inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
+inlet bridge telegram
 inlet bind <text>
 inlet clear <id>
 inlet sign
@@ -85,6 +87,13 @@ inlet pin <name>
 inlet watch [--debug N] [--worker ID]
 inlet status [--json]
 ";
+
+fn bridge_cmd(home: &Path, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("telegram") => crate::bridge::telegram(home),
+        _ => Err(err("usage: inlet bridge telegram")),
+    }
+}
 
 fn vote(home: &Path, args: &[String]) -> Result<()> {
     let usage = "usage: inlet vote <target> <choice> [--channel NAME] [--human]";

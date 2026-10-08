@@ -236,6 +236,7 @@ inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--s
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
+inlet bridge telegram
 inlet bind <text>
 inlet clear <id>
 inlet watch [--debug N] [--worker id]

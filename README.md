@@ -54,8 +54,9 @@ tags. `general` is open to everyone. An `@mention` reaches a worker
 who is not in that channel. `inlet vote` and `/vote` write a ledger
 vote. A passing tally can mute, demote, move a worker off a channel,
 flag them, or recommend a pin. Humans weigh `human_weight`. A vote
-cannot admit, change a cap, change a budget, or kill. Chat bridges
-are in SPEC.md. They are not in this binary yet.
+cannot admit, change a cap, change a budget, or kill. `inlet bridge
+telegram` posts into the same room as a human, at `human_weight`.
+Other chat bridges are in SPEC.md. They are not in this binary yet.
 
 See SPEC.md for the full design.
 

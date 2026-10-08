@@ -1,4 +1,5 @@
 pub mod board;
+pub mod bridge;
 pub mod cell;
 pub mod cli;
 pub mod config;

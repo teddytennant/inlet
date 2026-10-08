@@ -4890,3 +4890,171 @@ fn vote_settles_after_restart() {
     );
     let _ = daemon;
 }
+
+fn read_http(sock: &mut TcpStream) -> String {
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        if let Some(header_end) = header_end {
+            let header = String::from_utf8_lossy(&buf[..header_end]);
+            let len = header
+                .split("\r\n")
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    if key.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if buf.len() >= header_end + 4 + len {
+                break;
+            }
+        }
+        match sock.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+        if buf.len() > 64 * 1024 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[test]
+fn telegram_bridge_posts_as_human() {
+    let home = scratch("telegram");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "bridge",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+    let queued = Arc::new(Mutex::new(vec![
+        r#"{"ok":true,"result":[{"update_id":7,"message":{"message_id":1,"chat":{"id":42},"text":"hello from telegram"}}]}"#
+            .to_string(),
+    ]));
+    let sent_bg = Arc::clone(&sent);
+    let queued_bg = Arc::clone(&queued);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            let req = read_http(&mut sock);
+            let body = if req.contains("getUpdates") {
+                let mut queue = queued_bg.lock().unwrap();
+                if queue.is_empty() {
+                    r#"{"ok":true,"result":[]}"#.to_string()
+                } else {
+                    queue.remove(0)
+                }
+            } else {
+                sent_bg.lock().unwrap().push(req);
+                r#"{"ok":true,"result":true}"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    let err_path = home.join("bridge.err");
+    let err_file = File::create(&err_path).unwrap();
+    let mut bridge = Command::new(bin())
+        .args(["--home", home.to_str().unwrap(), "bridge", "telegram"])
+        .env("TELEGRAM_BOT_TOKEN", "test-token")
+        .env("TELEGRAM_API_BASE", format!("http://127.0.0.1:{port}"))
+        .env("TELEGRAM_CHAT", "42")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut st = Value::Null;
+    while Instant::now() < deadline {
+        if let Some(status) = bridge.try_wait().unwrap() {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            let _ = bridge.wait();
+            panic!("bridge exited {status}: {err}");
+        }
+        st = status(&home);
+        if post_texts(&st).iter().any(|t| t == "hello from telegram") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let post = st["posts"]
+        .as_array()
+        .and_then(|posts| {
+            posts
+                .iter()
+                .find(|post| post["text"] == "hello from telegram")
+        })
+        .unwrap_or_else(|| {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            panic!("{st} bridge {err} {}", daemon.log())
+        });
+    assert_eq!(post["role"], "human", "{post}");
+    assert_eq!(post["author"], "you", "{post}");
+    assert_eq!(post["weight"], 4, "{post}");
+    inlet(&home, &["post", "from-operator"]);
+    let worker = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": token, "text":"from-worker"}),
+    );
+    assert_eq!(worker["ok"], true, "{worker}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let dumped = sent.lock().unwrap().join("\n");
+        if dumped.contains("from-operator") && dumped.contains("from-worker") {
+            break;
+        }
+        if Instant::now() > deadline {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            panic!("missing relay {dumped} bridge {err}");
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let mut sock = UnixStream::connect(home.join("run/operator.sock")).unwrap();
+    sock.write_all(b"{\"op\":\"say\",\"text\":\"human-secret\"}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(sock).read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"), "{line}");
+    thread::sleep(Duration::from_millis(600));
+    let dumped = sent.lock().unwrap().join("\n");
+    assert!(dumped.contains("from-operator"), "{dumped}");
+    assert!(dumped.contains("from-worker"), "{dumped}");
+    assert!(!dumped.contains("human-secret"), "{dumped}");
+    assert!(!dumped.contains("hello from telegram"), "{dumped}");
+    let _ = bridge.kill();
+    let _ = bridge.wait();
+    let _ = daemon;
+}
