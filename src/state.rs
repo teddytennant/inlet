@@ -64,6 +64,17 @@ impl Samples {
     pub fn series(&self, key: &str) -> Vec<u64> {
         self.inner.get(key).cloned().unwrap_or_default()
     }
+
+    pub fn dump(&self) -> BTreeMap<String, Vec<u64>> {
+        self.inner
+            .iter()
+            .map(|(key, values)| (key.clone(), values.clone()))
+            .collect()
+    }
+
+    pub fn load(&mut self, dumped: BTreeMap<String, Vec<u64>>) {
+        self.inner = dumped.into_iter().collect();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +94,8 @@ pub struct State {
     pub retried: HashSet<String>,
     pub constraints: Vec<ConstraintView>,
     pub decision_spent: u64,
+    /// Lease generation. An admit with any other fence does not debit.
+    pub fence: u64,
 }
 
 impl State {
@@ -101,6 +114,7 @@ impl State {
             retried: HashSet::new(),
             constraints: Vec::new(),
             decision_spent: 0,
+            fence: 0,
         }
     }
 
@@ -146,32 +160,43 @@ impl State {
             }
             Record::Admit {
                 id,
+                fence,
                 tokens,
                 seconds,
                 memory_mb,
                 pids,
                 ts,
-                ..
             } => {
-                let parent = self.tasks.get(id).and_then(|t| t.parent.clone());
-                let debited = if let Some(parent) = parent.as_deref() {
-                    self.purse
-                        .debit_parent(parent, id, *tokens, *seconds, *memory_mb, *pids)
-                        .is_ok()
-                } else {
-                    self.purse
-                        .debit_root(id, *tokens, *seconds, *memory_mb, *pids)
-                        .is_ok()
-                };
-                if debited {
+                if *fence != self.fence {
                     if let Some(task) = self.tasks.get_mut(id) {
-                        task.state = TaskState::Running;
-                        task.admit_ms = Some(*ts);
-                        task.reason.clear();
+                        if task.state == TaskState::Queued {
+                            task.state = TaskState::Failed;
+                            task.reason = "fence".into();
+                        }
                     }
                     self.queue.retain(|q| q != id);
+                    self.note_parent(id);
+                } else {
+                    let parent = self.tasks.get(id).and_then(|t| t.parent.clone());
+                    let debited = if let Some(parent) = parent.as_deref() {
+                        self.purse
+                            .debit_parent(parent, id, *tokens, *seconds, *memory_mb, *pids)
+                            .is_ok()
+                    } else {
+                        self.purse
+                            .debit_root(id, *tokens, *seconds, *memory_mb, *pids)
+                            .is_ok()
+                    };
+                    if debited {
+                        if let Some(task) = self.tasks.get_mut(id) {
+                            task.state = TaskState::Running;
+                            task.admit_ms = Some(*ts);
+                            task.reason.clear();
+                        }
+                        self.queue.retain(|q| q != id);
+                    }
+                    self.note_parent(id);
                 }
-                self.note_parent(id);
             }
             Record::Deny { id, reason, .. } => {
                 if let Some(task) = self.tasks.get_mut(id) {
@@ -336,5 +361,62 @@ impl State {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Budget, Record};
+
+    fn task(id: &str) -> Record {
+        Record::Task {
+            id: id.into(),
+            parent: None,
+            worker: "pi".into(),
+            tags: vec!["code".into()],
+            goal: "g".into(),
+            verifier: None,
+            value: 1,
+            budget: Budget {
+                tokens: 50,
+                seconds: 1,
+                memory_mb: 1,
+                pids: 1,
+            },
+            retry_of: None,
+            recipe: None,
+            ts: 1,
+        }
+    }
+
+    fn admit(id: &str, fence: u64) -> Record {
+        Record::Admit {
+            id: id.into(),
+            fence,
+            tokens: 50,
+            seconds: 1,
+            memory_mb: 1,
+            pids: 1,
+            ts: 2,
+        }
+    }
+
+    #[test]
+    fn losing_fence_does_not_debit() {
+        let mut state = State::new(&crate::config::preset("box"));
+        state.apply(&task("a"));
+        state.apply(&admit("a", 99));
+        assert_eq!(state.purse.spent(), 0);
+        assert_eq!(state.tasks["a"].reason, "fence");
+        assert_eq!(state.tasks["a"].state, TaskState::Failed);
+
+        let mut held = State::new(&crate::config::preset("box"));
+        held.apply(&task("a"));
+        held.apply(&admit("a", 0));
+        assert_eq!(held.purse.spent(), 50);
+        held.apply(&admit("a", 99));
+        assert_eq!(held.purse.spent(), 50);
+        assert_eq!(held.tasks["a"].state, TaskState::Running);
     }
 }

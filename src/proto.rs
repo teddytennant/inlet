@@ -37,6 +37,7 @@ pub enum Request {
     Sign(String),
     Draft(String),
     Diff,
+    Snap,
 }
 
 pub fn parse_request(line: &str) -> Result<Request> {
@@ -87,6 +88,7 @@ pub fn parse_request(line: &str) -> Result<Request> {
         "sign" => Ok(Request::Sign(string(&v, "sig")?)),
         "draft" => Ok(Request::Draft(string(&v, "text")?)),
         "diff" => Ok(Request::Diff),
+        "snap" => Ok(Request::Snap),
         other => Err(err(format!("unknown op {other}"))),
     }
 }

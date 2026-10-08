@@ -48,3 +48,15 @@ pub fn transcript(home: &Path, id: &str) -> PathBuf {
 pub fn daemon_log(home: &Path) -> PathBuf {
     home.join("run/daemon.log")
 }
+pub fn node(home: &Path) -> PathBuf {
+    home.join("run/node")
+}
+pub fn lease(home: &Path) -> PathBuf {
+    home.join("run/lease")
+}
+pub fn snap_index(home: &Path) -> PathBuf {
+    home.join("snap/index.json")
+}
+pub fn snap_git(home: &Path) -> PathBuf {
+    home.join("snap.git")
+}

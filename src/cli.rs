@@ -35,6 +35,7 @@ pub fn run() -> Result<()> {
         Some("sign") => sign_policy(&home),
         Some("diff") => diff_policy(&home),
         Some("draft") => draft_policy(&home),
+        Some("snap") => snap(&home),
         Some("status") => status(&home, args.iter().any(|a| a == "--json")),
         Some("post") => {
             let text = args[1..].join(" ");
@@ -75,6 +76,7 @@ inlet bind <text>
 inlet clear <id>
 inlet sign
 inlet diff
+inlet snap
 inlet kill <id>
 inlet pin <name>
 inlet watch [--debug N] [--worker ID]
@@ -167,6 +169,39 @@ fn sign_policy(home: &Path) -> Result<()> {
         json!({"op":"sign","sig": crate::sign::hex_encode(&sig)}),
     )?;
     print_ok(&v)
+}
+
+fn snap(home: &Path) -> Result<()> {
+    let bar = ProgressBar::new_spinner();
+    if io::stderr().is_terminal() {
+        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_message("snapshot");
+        bar.enable_steady_tick(Duration::from_millis(80));
+    }
+    let done = match proto::rpc(home, json!({"op":"snap"})) {
+        Ok(v) => v,
+        Err(e) if e.to_string() == "daemon is not up" => {
+            let (offset, sha) = crate::snap::offline(home)?;
+            bar.finish_and_clear();
+            println!("snap {offset} {sha}");
+            return Ok(());
+        }
+        Err(e) => {
+            bar.finish_and_clear();
+            return Err(e);
+        }
+    };
+    bar.finish_and_clear();
+    if done.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        return Err(err(done
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("snap failed")));
+    }
+    let offset = done.get("offset").and_then(|n| n.as_u64()).unwrap_or(0);
+    let sha = done.get("commit").and_then(|s| s.as_str()).unwrap_or("");
+    println!("snap {offset} {sha}");
+    Ok(())
 }
 
 fn diff_policy(home: &Path) -> Result<()> {

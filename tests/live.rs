@@ -3132,3 +3132,502 @@ fn rss_kb(pid: i32) -> u64 {
     }
     panic!("no VmRSS");
 }
+
+fn parse_snap(out: &std::process::Output) -> (u64, String) {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.split_whitespace();
+    assert_eq!(parts.next(), Some("snap"), "{text}");
+    let offset = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or_else(|_| panic!("offset in {text}"));
+    let sha = parts.next().unwrap_or("").to_string();
+    assert_eq!(sha.len(), 40, "{text}");
+    (offset, sha)
+}
+
+fn git_out(home: &Path, args: &[&str]) -> String {
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir").arg(home.join("snap.git")).args(args);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn folded(home: &Path) -> (u64, u64, u64, u64) {
+    let policy = inlet::config::Policy::load(&home.join("policy.lua")).unwrap();
+    let opened = ledger::open(&home.join("ledger/log")).unwrap();
+    let mut state = inlet::state::State::new(&policy.cfg);
+    for decoded in &opened.records {
+        if let Decoded::Rec(rec) = decoded {
+            state.apply(rec);
+        }
+    }
+    (
+        state.purse.spent(),
+        state.purse.available,
+        state.purse.held(),
+        state.purse.resets,
+    )
+}
+
+#[test]
+fn snap_replays_from_the_offset() {
+    let fake = fake_decision(Arc::new(scripted_reply));
+    let home = scratch("snap");
+    fs::create_dir_all(home.join("keys")).unwrap();
+    fs::write(home.join("keys/policy.key"), "SECRETKEY\n").unwrap();
+    fs::create_dir_all(home.join("registry/recipes/keep")).unwrap();
+    fs::write(home.join("registry/recipes/keep/run"), "echo ok\n").unwrap();
+    policy(
+        &home,
+        &decision_policy(
+            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            fake.port,
+            "",
+        ),
+    );
+    let mut daemon = start(&home);
+    inlet(&home, &["post", "board-hello-snap"]);
+    inlet(&home, &["bind", "leave this #frozen"]);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "before-snap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "before-snap" && t["state"] == "done")
+    });
+    let (offset, sha) = parse_snap(&inlet(&home, &["snap"]));
+    assert!(offset > 64, "{offset}");
+    let st = status(&home);
+    assert_eq!(st["snap_offset"].as_u64(), Some(offset));
+    assert_eq!(st["lease"].as_bool(), Some(true));
+    assert_eq!(st["fence"].as_u64(), Some(0));
+    assert!(st["constraints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["text"] == "leave this #frozen"));
+    let names = git_out(&home, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    for want in [
+        "policy.lua",
+        "snap/index.json",
+        "lease.json",
+        "registry/recipes/keep/run",
+    ] {
+        assert!(names.contains(want), "{names}");
+    }
+    assert!(!names.contains("policy.key"), "{names}");
+    assert!(!names.contains("ledger"), "{names}");
+    assert_eq!(
+        git_out(&home, &["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "the live log is not a commit per event"
+    );
+    assert_eq!(git_out(&home, &["rev-parse", "HEAD"]).trim(), sha);
+    assert!(
+        git_out(&home, &["tag", "-l"]).contains(&format!("offset-{offset}")),
+        "missing offset tag"
+    );
+    let index = fs::read_to_string(home.join("snap/index.json")).unwrap();
+    assert!(index.contains("board-hello-snap"), "{index}");
+    let spent = st["spent"].clone();
+    let available = st["available"].clone();
+    let held = st["held"].clone();
+    let resets = st["resets"].clone();
+    stop(&mut daemon);
+    let mut buf = fs::read(home.join("ledger/log")).unwrap();
+    assert!(buf.len() as u64 >= offset);
+    buf[12] ^= 0xff;
+    fs::write(home.join("ledger/log"), &buf).unwrap();
+    assert!(
+        ledger::open(&home.join("ledger/log")).is_err(),
+        "a full scan of the damaged prefix must refuse"
+    );
+    let daemon = start(&home);
+    let st = status(&home);
+    assert_eq!(st["snap_offset"].as_u64(), Some(offset), "{}", daemon.log());
+    assert_eq!(st["spent"], spent);
+    assert_eq!(st["available"], available);
+    assert_eq!(st["held"], held);
+    assert_eq!(st["resets"], resets);
+    assert!(tasks(&st)
+        .iter()
+        .any(|t| t["goal"] == "before-snap" && t["state"] == "done"));
+    assert!(st["constraints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["text"] == "leave this #frozen"));
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "after-snap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "after-snap" && t["state"] == "done")
+    });
+    let hits = wait_bodies(&fake, |hits| {
+        hits.iter().any(|hit| hit.body.contains("after-snap"))
+    });
+    let body = hits
+        .iter()
+        .find(|hit| hit.body.contains("after-snap"))
+        .unwrap();
+    assert!(
+        body.body.contains("board-hello-snap"),
+        "post window did not survive the snapshot: {}",
+        body.body
+    );
+    drop(daemon);
+    let daemon = start(&home);
+    let st = status(&home);
+    assert!(tasks(&st)
+        .iter()
+        .any(|t| t["goal"] == "before-snap" && t["state"] == "done"));
+    assert!(tasks(&st)
+        .iter()
+        .any(|t| t["goal"] == "after-snap" && t["state"] == "done"));
+    assert_eq!(st["snap_offset"].as_u64(), Some(offset));
+    let _ = daemon;
+}
+
+#[test]
+fn snap_kill9_purse_matches_the_ledger() {
+    let home = scratch("snapkill");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "nap",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| v["live"].as_u64() == Some(1));
+    assert_eq!(st["held"].as_u64(), Some(100));
+    let (offset, _) = parse_snap(&inlet(&home, &["snap"]));
+    assert!(offset > 0);
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    unsafe {
+        libc::kill(pid_of(&home).unwrap(), libc::SIGKILL);
+    }
+    let _ = daemon.child.wait();
+    let daemon = start(&home);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == id && t["state"] == "failed")
+    });
+    assert_eq!(st["spent"].as_u64(), Some(100), "{}", daemon.log());
+    assert_eq!(st["held"].as_u64(), Some(0));
+    assert_eq!(st["available"].as_u64(), Some(900));
+    assert_eq!(task_reason(&st, &id), "crash");
+    let purse = folded(&home);
+    assert_eq!(
+        (
+            st["spent"].as_u64().unwrap(),
+            st["available"].as_u64().unwrap(),
+            st["held"].as_u64().unwrap(),
+            st["resets"].as_u64().unwrap(),
+        ),
+        purse,
+        "purse diverged from a full scan"
+    );
+    let admits = read_log(&home)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id: i, .. } if i == &id))
+        })
+        .count();
+    assert_eq!(admits, 1);
+    drop(daemon);
+    let daemon = start(&home);
+    let st = status(&home);
+    assert_eq!(
+        st["spent"].as_u64(),
+        Some(100),
+        "second restart double-spent"
+    );
+    assert_eq!(st["available"].as_u64(), Some(900));
+    assert_eq!(st["held"].as_u64(), Some(0));
+    let purse = folded(&home);
+    assert_eq!(
+        (
+            st["spent"].as_u64().unwrap(),
+            st["available"].as_u64().unwrap(),
+            st["held"].as_u64().unwrap(),
+            st["resets"].as_u64().unwrap(),
+        ),
+        purse
+    );
+    let _ = daemon;
+}
+
+fn task_reason<'a>(st: &'a Value, id: &str) -> &'a str {
+    tasks(st)
+        .into_iter()
+        .find(|t| t["id"] == id)
+        .and_then(|t| t["reason"].as_str())
+        .unwrap_or("")
+}
+
+#[test]
+fn losing_fence_does_not_spend() {
+    let home = scratch("fence");
+    policy(
+        &home,
+        &base_policy(
+            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let mut daemon = start(&home);
+    let before = status(&home);
+    assert_eq!(before["lease"].as_bool(), Some(true));
+    assert_eq!(before["fence"].as_u64(), Some(0));
+    stop(&mut daemon);
+    let _ = parse_snap(&inlet(&home, &["snap"]));
+    {
+        let mut opened = ledger::open(&home.join("ledger/log")).unwrap();
+        let id = "stolen-fence".to_string();
+        opened
+            .ledger
+            .append(
+                &Record::Task {
+                    id: id.clone(),
+                    parent: None,
+                    worker: "sleeper".into(),
+                    tags: vec!["code".into()],
+                    goal: "stolen".into(),
+                    verifier: None,
+                    value: 1,
+                    budget: inlet::model::Budget {
+                        tokens: 400,
+                        seconds: 30,
+                        memory_mb: 64,
+                        pids: 8,
+                    },
+                    retry_of: None,
+                    recipe: None,
+                    ts: 1,
+                },
+                true,
+            )
+            .unwrap();
+        opened
+            .ledger
+            .append(
+                &Record::Admit {
+                    id,
+                    fence: 99,
+                    tokens: 400,
+                    seconds: 30,
+                    memory_mb: 64,
+                    pids: 8,
+                    ts: 2,
+                },
+                true,
+            )
+            .unwrap();
+    }
+    let daemon = start(&home);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "stolen" && t["state"] == "failed")
+    });
+    assert_eq!(
+        task_reason(&st, "stolen-fence"),
+        "fence",
+        "{}",
+        daemon.log()
+    );
+    assert_eq!(st["spent"].as_u64(), Some(0));
+    assert_eq!(st["available"].as_u64(), Some(1000));
+    assert_eq!(st["held"].as_u64(), Some(0));
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "honest",
+            "--no-verify",
+            "--tokens",
+            "40",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "honest" && t["state"] == "done")
+    });
+    let st = status(&home);
+    assert_eq!(st["spent"].as_u64(), Some(0), "stolen fence stuck a debit");
+    assert_eq!(task_reason(&st, "stolen-fence"), "fence");
+    let _ = daemon;
+}
+
+#[test]
+fn follower_pulls_the_snapshot_and_does_not_admit() {
+    let home = scratch("leader");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "nap",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| v["live"].as_u64() == Some(1));
+    let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    unsafe {
+        libc::kill(pid_of(&home).unwrap(), libc::SIGKILL);
+    }
+    let _ = daemon.child.wait();
+    let mut daemon = start(&home);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == id && t["state"] == "failed")
+    });
+    assert_eq!(st["spent"].as_u64(), Some(100));
+    assert_eq!(folded(&home), (100, 900, 0, st["resets"].as_u64().unwrap()));
+    inlet(&home, &["snap"]);
+    assert_eq!(status(&home)["lease"].as_bool(), Some(true));
+    stop(&mut daemon);
+    let home_b = scratch("follower");
+    fs::remove_dir_all(&home_b).unwrap();
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            home.join("snap.git").to_str().unwrap(),
+            home_b.to_str().unwrap(),
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert!(!home_b.join("ledger/log").exists());
+    assert!(!home_b.join("keys/policy.key").exists());
+    fs::create_dir_all(home_b.join("run")).unwrap();
+    fs::copy(home_b.join("lease.json"), home_b.join("run/lease")).unwrap();
+    let daemon = start(&home_b);
+    let st = status(&home_b);
+    assert_eq!(st["lease"].as_bool(), Some(false), "{}", daemon.log());
+    assert_eq!(st["spent"].as_u64(), Some(100));
+    assert_eq!(st["available"].as_u64(), Some(900));
+    assert_eq!(st["held"].as_u64(), Some(0));
+    assert!(tasks(&st)
+        .iter()
+        .any(|t| t["id"] == id && t["reason"] == "crash"));
+    inlet(
+        &home_b,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "nope",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "30",
+        ],
+    );
+    thread::sleep(Duration::from_millis(600));
+    let st = status(&home_b);
+    assert!(
+        tasks(&st)
+            .iter()
+            .any(|t| t["goal"] == "nope" && t["state"] == "queued"),
+        "{st}"
+    );
+    assert_eq!(st["spent"].as_u64(), Some(100));
+    assert_eq!(st["live"].as_u64(), Some(0));
+    let admits = read_log(&home_b)
+        .into_iter()
+        .filter(|r| matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { .. })))
+        .count();
+    assert_eq!(admits, 0);
+    drop(daemon);
+    let daemon = start(&home_b);
+    let st = status(&home_b);
+    assert_eq!(
+        st["spent"].as_u64(),
+        Some(100),
+        "follower restart spent the slice"
+    );
+    assert_eq!(st["available"].as_u64(), Some(900));
+    assert!(tasks(&st)
+        .iter()
+        .any(|t| t["goal"] == "nope" && t["state"] == "queued"));
+    assert_eq!(st["lease"].as_bool(), Some(false));
+    let _ = daemon;
+}

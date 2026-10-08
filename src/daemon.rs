@@ -26,6 +26,7 @@ use crate::paths;
 use crate::proto::{self, NewTask, Request};
 use crate::proxy::{self, Hub, Note};
 use crate::registry;
+use crate::snap;
 use crate::state::State;
 use crate::text::mentions;
 
@@ -124,6 +125,9 @@ struct Daemon {
     soft: Vec<Record>,
     last_flush: Instant,
     shutting_down: bool,
+    holder: bool,
+    fence: u64,
+    snap_offset: u64,
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -180,14 +184,40 @@ fn daemonize(home: &Path) -> Result<()> {
 
 fn run(home: &Path) -> Result<()> {
     let policy = load_signed(home)?;
-    let opened = ledger::open(&paths::ledger(home))?;
+    let node = snap::node_id(home)?;
+    let lease = snap::ensure_lease(home, &node)?;
+    let mut index = snap::load(home)?;
+    let log_path = paths::ledger(home);
+    let log_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    if let Some(saved) = &index {
+        if log_len == 0 && saved.offset > 0 {
+            let mut adopted = saved.clone();
+            adopted.offset = 0;
+            snap::store(home, &adopted)?;
+            index = Some(adopted);
+        } else if log_len < saved.offset {
+            return Err(err("snapshot is ahead of the log"));
+        }
+    }
+    let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
+    let opened = if snap_offset > 0 {
+        ledger::open_from(&log_path, snap_offset)?
+    } else {
+        ledger::open(&log_path)?
+    };
     opened.ledger.lock()?;
     let mut state = State::new(&policy.cfg);
+    state.fence = lease.gen;
+    if let Some(saved) = &index {
+        snap::restore(&mut state, saved);
+        state.fence = lease.gen;
+    }
     for decoded in &opened.records {
         if let Decoded::Rec(rec) = decoded {
             state.apply(rec);
         }
     }
+    snap::align_caps(&mut state.purse, &policy.cfg);
     registry::replay(home, &opened.records)?;
     let hub = Hub::new(
         policy.cfg.proxy.upstream.clone(),
@@ -225,6 +255,9 @@ fn run(home: &Path) -> Result<()> {
         soft: Vec::new(),
         last_flush: Instant::now(),
         shutting_down: false,
+        holder: lease.node == node,
+        fence: lease.gen,
+        snap_offset,
     };
     daemon.recover_and_arm()?;
     fs::write(paths::pid_file(home), format!("{}\n", std::process::id()))?;
@@ -620,6 +653,9 @@ impl Daemon {
     }
 
     fn admit(&mut self) -> Result<()> {
+        if !self.holder {
+            return Ok(());
+        }
         let queued: Vec<String> = self.state.queue.iter().cloned().collect();
         let mut batch: Vec<Record> = Vec::new();
         let mut chosen: Vec<String> = Vec::new();
@@ -743,7 +779,7 @@ impl Daemon {
                     }
                     batch.push(Record::Admit {
                         id: id.clone(),
-                        fence: 0,
+                        fence: self.fence,
                         tokens: task.budget.tokens,
                         seconds: task.budget.seconds,
                         memory_mb: task.budget.memory_mb,
@@ -1207,6 +1243,10 @@ impl Daemon {
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
             },
             Request::Diff => self.reply(id, self.diff_json()),
+            Request::Snap => match self.take_snap() {
+                Ok(v) => self.reply(id, v),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
             Request::Pin(name) => match self.pin(&name) {
                 Ok(()) => self.reply(id, json!({"ok": true, "name": name})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
@@ -1527,6 +1567,9 @@ impl Daemon {
                 "text": c.text,
                 "tags": c.tags,
             })).collect::<Vec<_>>(),
+            "lease": self.holder,
+            "fence": self.fence,
+            "snap_offset": self.snap_offset,
             "tasks": tasks,
         })
     }
@@ -1612,16 +1655,16 @@ impl Daemon {
     }
 
     fn raise_caps(&mut self, cfg: &crate::config::Config) {
-        let purse = &mut self.state.purse;
-        if cfg.caps.max_tokens > purse.cap {
-            purse.available = purse
-                .available
-                .saturating_add(cfg.caps.max_tokens - purse.cap);
-        }
-        purse.cap = cfg.caps.max_tokens;
-        purse.memory_cap = cfg.caps.max_memory_mb;
-        purse.pids_cap = cfg.caps.max_pids;
-        purse.period_ms = cfg.caps.token_period_ms;
+        snap::align_caps(&mut self.state.purse, cfg);
+    }
+
+    fn take_snap(&mut self) -> Result<Value> {
+        self.flush_soft()?;
+        let offset = self.ledger.len();
+        snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;
+        let sha = snap::commit(&self.home, offset)?;
+        self.snap_offset = offset;
+        Ok(json!({"ok": true, "offset": offset, "commit": sha}))
     }
 
     fn reply(&self, id: u64, value: Value) {

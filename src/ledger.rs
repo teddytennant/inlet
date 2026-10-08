@@ -20,6 +20,11 @@ pub struct Opened {
 }
 
 pub fn open(path: &Path) -> Result<Opened> {
+    open_from(path, 0)
+}
+
+/// Scan from `offset`. Bytes before it belong to a snapshot and are not applied.
+pub fn open_from(path: &Path, offset: u64) -> Result<Opened> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -29,16 +34,19 @@ pub fn open(path: &Path) -> Result<Opened> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    let meta = file.metadata()?;
-    let mut buf = Vec::with_capacity(meta.len() as usize);
+    let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
-    let (records, keep) = scan(&buf)?;
-    if keep < buf.len() as u64 {
-        file.set_len(keep)?;
+    if (buf.len() as u64) < offset {
+        return Err(err("snapshot is ahead of the log"));
     }
-    file.seek(SeekFrom::Start(keep))?;
+    let (records, keep) = scan(&buf[offset as usize..])?;
+    let end = offset + keep;
+    if end < buf.len() as u64 {
+        file.set_len(end)?;
+    }
+    file.seek(SeekFrom::Start(end))?;
     Ok(Opened {
-        ledger: Ledger { file, len: keep },
+        ledger: Ledger { file, len: end },
         records,
     })
 }
@@ -89,6 +97,14 @@ fn frame_at(buf: &[u8], offset: usize) -> bool {
 }
 
 impl Ledger {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn lock(&self) -> Result<()> {
         let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -203,6 +219,25 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
         let msg = open(&path).err().expect("damage").to_string();
         assert!(msg.contains("damage"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_from_skips_the_prefix() {
+        let dir = std::env::temp_dir().join(format!("inlet-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log");
+        let mid = {
+            let mut led = open(&path).unwrap().ledger;
+            led.append(&task("a"), true).unwrap();
+            let mid = led.len();
+            led.append(&task("b"), true).unwrap();
+            mid
+        };
+        let opened = open_from(&path, mid).unwrap();
+        assert_eq!(opened.records.len(), 1);
+        assert!(opened.ledger.len() > mid);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

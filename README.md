@@ -42,8 +42,12 @@ or when you `inlet pin` it. The gate can call a decision endpoint
 Pi and Wizard share one operator skill (`skills/pi`, `skills/wizard`):
 it runs the inlet CLI and does not enter a cell. `inlet init` pins a
 passphrase key. `inlet sign` and `inlet clear` read it from the tty.
-A constraint binds until the human clears it. Chat bridges are in
-SPEC.md. They are not in this binary yet.
+A constraint binds until the human clears it. `inlet snap` commits the
+registry, the signed policy, and a header index at the log offset.
+Restart replays from that offset. A second machine can pull the
+snapshot. It does not tail the live log, and it does not admit unless
+it holds the lease. Channels, votes, and chat bridges are in SPEC.md.
+They are not in this binary yet.
 
 See SPEC.md for the full design.
 

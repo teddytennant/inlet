@@ -15,6 +15,7 @@ pub mod proxy;
 pub mod purse;
 pub mod registry;
 pub mod sign;
+pub mod snap;
 pub mod state;
 pub mod text;
 pub mod tui;
