@@ -2439,6 +2439,48 @@ fn decision_spend_survives_kill9() {
 }
 
 #[test]
+fn operator_skill_is_the_same_thin_wrapper() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let pi = fs::read(root.join("skills/pi/SKILL.md")).unwrap();
+    let wizard = fs::read(root.join("skills/wizard/SKILL.md")).unwrap();
+    assert_eq!(pi, wizard, "pi and wizard skills diverged");
+    let text = String::from_utf8(pi).unwrap();
+    for line in [
+        "You are on the inlet operator socket, outside the workers.",
+        "Use the inlet CLI for status, add, post, bind, kill, budget, pin, diff, and watch.",
+        "inlet watch --debug N",
+        "You do not carry a message between them.",
+        "You cannot sign.",
+        "edit policy.draft.lua",
+        "inlet diff",
+        "The human signs.",
+        "Use `--no-verify` only when the human asked.",
+        "Do not enter a cell.",
+        "The socket is the door.",
+    ] {
+        assert!(text.contains(line), "skill missing {line}");
+    }
+    assert!(
+        !text.contains("inlet sign"),
+        "skill tells the agent to sign"
+    );
+    assert!(
+        !text.contains("inlet clear"),
+        "skill tells the agent to clear"
+    );
+    assert!(
+        !text.contains("inlet shell"),
+        "skill tells the agent to shell in"
+    );
+    let wrap_pi = fs::read(root.join("skills/pi/inlet")).unwrap();
+    let wrap_wizard = fs::read(root.join("skills/wizard/inlet")).unwrap();
+    assert_eq!(wrap_pi, wrap_wizard);
+    let wrap = String::from_utf8(wrap_pi).unwrap();
+    assert!(wrap.contains("exec inlet"), "{wrap}");
+    assert!(!wrap.contains("sign"), "wrapper grew a signing path");
+}
+
+#[test]
 fn empty_daemon_rss_when_asked() {
     if std::env::var("INLET_RSS").ok().as_deref() != Some("1") {
         return;

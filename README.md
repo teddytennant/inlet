@@ -39,8 +39,9 @@ A worker can ask for a child. The supervisor runs verifiers and keeps
 recipes: a draft is promoted when a second worker's verifier is real,
 or when you `inlet pin` it. The gate can call a decision endpoint
 (`decision.kind` of `openai` or `jev`). `off` stays the local formula.
-Signed policy and chat bridges are in SPEC.md. They are not in this
-binary yet.
+Pi and Wizard share one operator skill (`skills/pi`, `skills/wizard`):
+it runs the inlet CLI and does not enter a cell. Signed policy and
+chat bridges are in SPEC.md. They are not in this binary yet.
 
 See SPEC.md for the full design.
 
