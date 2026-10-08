@@ -11,6 +11,8 @@ pub struct OpenSlice {
     pub pids: u64,
     pub pids_lent: u64,
     pub seconds: u64,
+    /// Root admits hold pool tokens. A child is a slice of its parent.
+    pub root: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +45,13 @@ impl Purse {
         }
     }
 
+    /// Tokens the pool still has out: root admits only. A child is inside its parent.
     pub fn held(&self) -> u64 {
-        self.open.values().map(|s| s.tokens).sum()
+        self.open
+            .values()
+            .filter(|s| s.root)
+            .map(|s| s.tokens)
+            .sum()
     }
 
     /// Tokens that are not free: live reservations plus finished spend.
@@ -101,6 +108,7 @@ impl Purse {
                 pids,
                 pids_lent: 0,
                 seconds,
+                root: true,
             },
         );
         Ok(())
@@ -144,6 +152,7 @@ impl Purse {
                 pids,
                 pids_lent: 0,
                 seconds,
+                root: false,
             },
         );
         Ok(())
@@ -160,6 +169,9 @@ impl Purse {
                 p.used = p.used.saturating_sub(refund);
                 p.memory_lent = p.memory_lent.saturating_sub(slice.memory_mb);
                 p.pids_lent = p.pids_lent.saturating_sub(slice.pids);
+            } else {
+                // Parent already settled. Unused child tokens go back to the pool.
+                self.available = self.available.saturating_add(refund);
             }
         } else {
             self.available = self.available.saturating_add(refund);
@@ -205,6 +217,28 @@ mod tests {
         assert_eq!(p.available, 600);
         p.apply_reset(1000);
         assert_eq!(p.available, 1000);
+    }
+
+    #[test]
+    fn child_slice_does_not_mint_from_the_pool() {
+        let mut p = Purse::new(1000, 100, 10, 1000);
+        p.apply_reset(0);
+        p.debit_root("a", 80, 10, 8, 2).unwrap();
+        p.debit_parent("a", "b", 30, 5, 2, 1).unwrap();
+        assert_eq!(p.available, 920);
+        assert_eq!(p.held(), 80);
+        p.credit_exit("b", 30, Some("a"));
+        assert_eq!(p.available, 920);
+        assert_eq!(p.open.get("a").unwrap().used, 0);
+        p.credit_exit("a", 80, None);
+        assert_eq!(p.available, 1000);
+        // A crashed child stays spent inside the parent, then the parent settles it.
+        p.debit_root("a", 80, 10, 8, 2).unwrap();
+        p.debit_parent("a", "b", 30, 5, 2, 1).unwrap();
+        p.credit_exit("b", 0, Some("a"));
+        assert_eq!(p.available, 920);
+        p.credit_exit("a", 50, None);
+        assert_eq!(p.available, 970);
     }
 
     #[test]

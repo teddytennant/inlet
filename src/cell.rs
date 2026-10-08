@@ -41,6 +41,7 @@ pub struct SpawnRequest {
     pub registry: PathBuf,
     pub root: PathBuf,
     pub proxy_sock: PathBuf,
+    pub worker_sock: PathBuf,
     pub net_none: bool,
     pub memory_mb: u64,
     pub pids: u64,
@@ -67,6 +68,7 @@ struct Raw {
     scratch: *const libc::c_char,
     registry: *const libc::c_char,
     proxy: *const libc::c_char,
+    worker: *const libc::c_char,
     usr: *const libc::c_char,
     devnull: *const libc::c_char,
     devzero: *const libc::c_char,
@@ -79,6 +81,7 @@ struct Raw {
     nr_zero: *const libc::c_char,
     nr_urandom: *const libc::c_char,
     nr_sock: *const libc::c_char,
+    nr_worker: *const libc::c_char,
     nr_old: *const libc::c_char,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
@@ -114,6 +117,7 @@ pub fn probe(home: &Path) -> bool {
         registry,
         root,
         proxy_sock: proxy,
+        worker_sock: home.join("run/worker.sock"),
         net_none: true,
         memory_mb: 64,
         pids: 32,
@@ -163,6 +167,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let scratch = c(&req.scratch)?;
     let registry = c(&req.registry)?;
     let proxy = c(&req.proxy_sock)?;
+    let worker = c(&req.worker_sock)?;
     let usr = c_path(Path::new("/usr"))?;
     let devnull = c_path(Path::new("/dev/null"))?;
     let devzero = c_path(Path::new("/dev/zero"))?;
@@ -176,6 +181,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let nr_zero = join("dev/zero")?;
     let nr_urandom = join("dev/urandom")?;
     let nr_sock = join("run/proxy.sock")?;
+    let nr_worker = join("run/worker.sock")?;
     let nr_old = join("old")?;
 
     let argv_c = c_strings(&req.cmd)?;
@@ -198,6 +204,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         scratch: scratch.as_ptr(),
         registry: registry.as_ptr(),
         proxy: proxy.as_ptr(),
+        worker: worker.as_ptr(),
         usr: usr.as_ptr(),
         devnull: devnull.as_ptr(),
         devzero: devzero.as_ptr(),
@@ -210,6 +217,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         nr_zero: nr_zero.as_ptr(),
         nr_urandom: nr_urandom.as_ptr(),
         nr_sock: nr_sock.as_ptr(),
+        nr_worker: nr_worker.as_ptr(),
         nr_old: nr_old.as_ptr(),
         argv: argv.as_ptr(),
         envp: envp.as_ptr(),
@@ -270,7 +278,13 @@ fn prepare_root(root: &Path) -> Result<()> {
     ] {
         fs::create_dir_all(root.join(rel))?;
     }
-    for rel in ["dev/null", "dev/zero", "dev/urandom", "run/proxy.sock"] {
+    for rel in [
+        "dev/null",
+        "dev/zero",
+        "dev/urandom",
+        "run/proxy.sock",
+        "run/worker.sock",
+    ] {
         File::create(root.join(rel))?;
     }
     for (link, target) in [
@@ -299,6 +313,7 @@ fn env_strings(token: &str, id: &str) -> Vec<String> {
         format!("INLET_TOKEN={token}"),
         format!("INLET_ID={id}"),
         "INLET_PROXY_SOCK=/run/proxy.sock".into(),
+        "INLET_SOCK=/run/worker.sock".into(),
         format!("OPENAI_API_KEY={token}"),
         "HOME=/work".into(),
         "PATH=/usr/bin:/bin".into(),
@@ -386,6 +401,7 @@ unsafe fn pivot(a: &Raw) -> i32 {
     let _ = mount_bind(a.devzero, a.nr_zero, false);
     let _ = mount_bind(a.devurandom, a.nr_urandom, false);
     let _ = mount_bind(a.proxy, a.nr_sock, false);
+    let _ = mount_bind(a.worker, a.nr_worker, false);
     if libc::syscall(libc::SYS_pivot_root, a.newroot, a.nr_old) != 0 {
         return errno();
     }
@@ -464,6 +480,7 @@ unsafe fn landlock_host(a: &Raw) -> i32 {
         (c"/etc".as_ptr(), FS_READ),
         (c"/tmp".as_ptr(), FS_ALL),
         (a.proxy, FS_ALL),
+        (a.worker, FS_ALL),
     ];
     landlock(&rules)
 }

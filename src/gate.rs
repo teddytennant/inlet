@@ -85,6 +85,7 @@ fn fits(task: &TaskView, purse: &Purse) -> bool {
         slice.tokens.saturating_sub(slice.used) >= tokens
             && slice.memory_mb.saturating_sub(slice.memory_lent) >= memory
             && slice.pids.saturating_sub(slice.pids_lent) >= pids
+            && slice.seconds >= task.budget.seconds
     } else {
         purse.available >= tokens
             && purse.memory_held.saturating_add(memory) <= purse.memory_cap

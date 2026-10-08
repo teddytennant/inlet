@@ -124,6 +124,7 @@ impl State {
                     },
                 );
                 self.queue.push_back(id.clone());
+                self.note_parent(id);
             }
             Record::Admit {
                 id,
@@ -152,6 +153,7 @@ impl State {
                     }
                     self.queue.retain(|q| q != id);
                 }
+                self.note_parent(id);
             }
             Record::Deny { id, reason, .. } => {
                 if let Some(task) = self.tasks.get_mut(id) {
@@ -159,6 +161,7 @@ impl State {
                     task.reason = reason.clone();
                 }
                 self.queue.retain(|q| q != id);
+                self.note_parent(id);
             }
             Record::Spawn { id, pid, .. } => {
                 if let Some(task) = self.tasks.get_mut(id) {
@@ -194,6 +197,7 @@ impl State {
                         TaskState::Failed
                     };
                 }
+                self.note_parent(id);
             }
             Record::Post {
                 id,
@@ -226,6 +230,29 @@ impl State {
         }
         if let Record::Reset { ts, .. } = rec {
             self.purse.apply_reset(*ts);
+        }
+    }
+
+    /// A live parent with a queued or live child is blocked. A settled child releases it.
+    fn note_parent(&mut self, id: &str) {
+        let Some(parent) = self.tasks.get(id).and_then(|t| t.parent.clone()) else {
+            return;
+        };
+        let waiting = self.tasks.values().any(|t| {
+            t.parent.as_deref() == Some(parent.as_str())
+                && matches!(
+                    t.state,
+                    TaskState::Queued | TaskState::Running | TaskState::Blocked
+                )
+        });
+        if let Some(task) = self.tasks.get_mut(&parent) {
+            if task.state.is_live() {
+                task.state = if waiting {
+                    TaskState::Blocked
+                } else {
+                    TaskState::Running
+                };
+            }
         }
     }
 

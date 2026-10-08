@@ -895,6 +895,260 @@ fn watch_prints_a_post() {
     );
 }
 
+fn token_of(pid: i64) -> String {
+    let env = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    let env = String::from_utf8_lossy(&env);
+    env.split('\0')
+        .find_map(|e| e.strip_prefix("INLET_TOKEN="))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn worker_rpc(home: &Path, body: Value) -> Value {
+    let stream = UnixStream::connect(home.join("run/worker.sock")).unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut line = serde_json::to_string(&body).unwrap();
+    line.push('\n');
+    stream.get_mut().write_all(line.as_bytes()).unwrap();
+    let mut buf = String::new();
+    stream.read_line(&mut buf).unwrap();
+    serde_json::from_str(&buf).unwrap_or_else(|_| panic!("worker reply {buf}"))
+}
+
+#[test]
+fn child_slice_or_deny() {
+    let home = scratch("child");
+    policy(
+        &home,
+        &base_policy(
+            r#"holder = { cmd = { "/bin/sh", "-c", "if [ -S /run/worker.sock ]; then echo DOOROK > /work/door; fi; sleep 40" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "holder",
+            "--goal",
+            "hold",
+            "--no-verify",
+            "--tokens",
+            "80",
+            "--seconds",
+            "30",
+            "--memory-mb",
+            "64",
+            "--pids",
+            "8",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "holder" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let parent = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "holder")
+        .unwrap();
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let pid = parent["pid"].as_i64().unwrap();
+    let door = home.join("work").join(&parent_id).join("door");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && fs::read_to_string(&door).ok().as_deref() != Some("DOOROK\n")
+    {
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(
+        fs::read_to_string(&door).unwrap_or_default().trim(),
+        "DOOROK",
+        "{}",
+        daemon.log()
+    );
+    let token = token_of(pid);
+    assert!(!token.is_empty());
+    let spawned = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "spawn",
+            "token": token,
+            "worker": "kid",
+            "goal": "nap",
+            "verify": "/bin/true",
+            "tokens": 30,
+            "seconds": 10,
+            "memory_mb": 16,
+            "pids": 2
+        }),
+    );
+    assert_eq!(spawned["ok"], true, "{spawned} {}", daemon.log());
+    assert!(spawned["denied"].is_null(), "{spawned}");
+    let st = wait_status(&home, |v| {
+        let ts = tasks(v);
+        ts.iter()
+            .any(|t| t["id"] == parent_id && t["state"] == "blocked")
+            && ts
+                .iter()
+                .any(|t| t["worker"] == "kid" && t["state"] == "running")
+    });
+    assert_eq!(
+        st["available"].as_u64(),
+        Some(920),
+        "child minted from the pool: {st}"
+    );
+    assert_eq!(st["held"].as_u64(), Some(80), "{st}");
+    let child = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "kid")
+        .unwrap();
+    assert_eq!(child["parent"].as_str(), Some(parent_id.as_str()));
+    let child_id = child["id"].as_str().unwrap().to_string();
+    let admits = read_log(&home)
+        .into_iter()
+        .filter(|r| matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id, .. } if id == &child_id)))
+        .count();
+    assert_eq!(admits, 1, "child admit was not durable");
+    let refused = worker_rpc(
+        &home,
+        serde_json::json!({"op":"spawn","token": token, "worker":"kid","goal":"nope"}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap_or("").contains("verifier"),
+        "{refused}"
+    );
+    inlet(&home, &["kill", &child_id]);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == parent_id && t["state"] == "running")
+    });
+    assert_eq!(st["available"].as_u64(), Some(920), "{st}");
+    inlet(&home, &["kill", &parent_id]);
+    let st = wait_status(&home, |v| {
+        v["live"].as_u64() == Some(0) && v["held"].as_u64() == Some(0)
+    });
+    assert_eq!(st["available"].as_u64(), Some(1000), "{st}");
+    drop(daemon);
+
+    let home = scratch("child-fat");
+    policy(
+        &home,
+        &base_policy(
+            r#"holder = { cmd = { "/bin/sleep", "40" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "holder",
+            "--goal",
+            "hold",
+            "--no-verify",
+            "--tokens",
+            "80",
+            "--seconds",
+            "30",
+            "--memory-mb",
+            "64",
+            "--pids",
+            "8",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let pid = tasks(&st)[0]["pid"].as_i64().unwrap();
+    let token = token_of(pid);
+    let spawned = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op":"spawn","token": token, "worker":"kid","goal":"too big","verify":"/bin/true",
+            "tokens": 200, "seconds": 10, "memory_mb": 16, "pids": 2
+        }),
+    );
+    assert_eq!(spawned["denied"], "purse", "{spawned} {}", daemon.log());
+    let st = status(&home);
+    assert_eq!(st["available"].as_u64(), Some(920), "{st}");
+    assert_eq!(st["live"].as_u64(), Some(1), "{st}");
+    let rows = tasks(&st);
+    let kid = rows.iter().find(|t| t["worker"] == "kid").unwrap();
+    assert_eq!(kid["state"], "failed");
+    assert_eq!(kid["reason"], "purse");
+    let kid_id = kid["id"].as_str().unwrap().to_string();
+    let parent_id = rows.iter().find(|t| t["worker"] == "holder").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Spawn { id, .. } if id == &kid_id))
+    }));
+    let posted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": token, "text":"from the child door @all"}),
+    );
+    assert_eq!(posted["ok"], true, "{posted}");
+    thread::sleep(Duration::from_millis(200));
+    let decoded = read_log(&home);
+    assert!(decoded.iter().any(|d| matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Post { role, author, mentions, .. } if role == "worker" && author == &parent_id && mentions.iter().any(|m| m == "all")))));
+    drop(daemon);
+
+    let home = scratch("child-depth");
+    policy(
+        &home,
+        &base_policy(
+            r#"holder = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            kid = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_depth = 1,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "holder",
+            "--goal",
+            "hold",
+            "--no-verify",
+            "--tokens",
+            "50",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let pid = tasks(&st)[0]["pid"].as_i64().unwrap();
+    let token = token_of(pid);
+    let spawned = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op":"spawn","token": token, "worker":"kid","goal":"too deep","verify":"/bin/true",
+            "tokens": 10, "seconds": 5, "memory_mb": 16, "pids": 2
+        }),
+    );
+    assert_eq!(spawned["denied"], "depth", "{spawned} {}", daemon.log());
+    assert_eq!(status(&home)["live"].as_u64(), Some(1));
+}
+
 fn say(home: &Path, text: &str) {
     let stream = UnixStream::connect(home.join("run/operator.sock")).unwrap();
     let mut stream = BufReader::new(stream);

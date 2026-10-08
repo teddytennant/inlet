@@ -9,6 +9,9 @@ pub fn policy(home: &Path) -> PathBuf {
 pub fn operator_sock(home: &Path) -> PathBuf {
     home.join("run/operator.sock")
 }
+pub fn worker_sock(home: &Path) -> PathBuf {
+    home.join("run/worker.sock")
+}
 pub fn proxy_sock(home: &Path) -> PathBuf {
     home.join("proxy/proxy.sock")
 }

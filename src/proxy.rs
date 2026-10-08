@@ -63,6 +63,11 @@ impl Hub {
         self.debug.store(level, Ordering::Relaxed);
     }
 
+    pub fn id_of(&self, token: &str) -> Option<String> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.tokens.get(token).cloned()
+    }
+
     pub fn insert(&self, id: &str, token: &str, reserved: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.tokens.insert(token.to_string(), id.to_string());

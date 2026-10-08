@@ -43,8 +43,15 @@ extern "C" fn on_signal(sig: i32) {
 }
 
 enum Incoming {
-    Conn { id: u64, tx: SyncSender<String> },
-    Line { id: u64, line: String },
+    Conn {
+        id: u64,
+        tx: SyncSender<String>,
+        worker: bool,
+    },
+    Line {
+        id: u64,
+        line: String,
+    },
     Gone(u64),
     Signal,
 }
@@ -54,6 +61,7 @@ struct Client {
     debug: u8,
     follow: Option<String>,
     watch: bool,
+    worker: bool,
 }
 
 struct Worker {
@@ -143,7 +151,6 @@ fn run(home: &Path) -> Result<()> {
             state.apply(rec);
         }
     }
-    let cell_ok = cell::probe(home);
     let hub = Hub::new(
         policy.cfg.proxy.upstream.clone(),
         policy.cfg.proxy.key.clone(),
@@ -155,7 +162,9 @@ fn run(home: &Path) -> Result<()> {
 
     let (cmd_tx, cmds) = mpsc::channel();
     install_signals(cmd_tx.clone())?;
-    listen_operator(&paths::operator_sock(home), cmd_tx, policy.cfg.debug)?;
+    listen_socket(&paths::worker_sock(home), cmd_tx.clone(), true)?;
+    listen_socket(&paths::operator_sock(home), cmd_tx, false)?;
+    let cell_ok = cell::probe(home);
 
     let mut daemon = Daemon {
         home: home.to_path_buf(),
@@ -177,7 +186,7 @@ fn run(home: &Path) -> Result<()> {
     fs::write(paths::pid_file(home), format!("{}\n", std::process::id()))?;
     loop {
         match daemon.cmds.recv_timeout(Duration::from_millis(20)) {
-            Ok(Incoming::Conn { id, tx }) => {
+            Ok(Incoming::Conn { id, tx, worker }) => {
                 daemon.clients.insert(
                     id,
                     Client {
@@ -185,6 +194,7 @@ fn run(home: &Path) -> Result<()> {
                         debug: daemon.policy.cfg.debug,
                         follow: None,
                         watch: false,
+                        worker,
                     },
                 );
             }
@@ -244,16 +254,19 @@ fn install_signals(tx: Sender<Incoming>) -> Result<()> {
     Ok(())
 }
 
-fn listen_operator(path: &Path, tx: Sender<Incoming>, debug: u8) -> Result<()> {
+fn listen_socket(path: &Path, tx: Sender<Incoming>, worker: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(if worker {
+        1 << 32
+    } else {
+        1
+    }));
     thread::spawn(move || {
-        let _ = debug;
         for conn in listener.incoming().flatten() {
             if !same_user(&conn) {
                 continue;
@@ -271,7 +284,11 @@ fn listen_operator(path: &Path, tx: Sender<Incoming>, debug: u8) -> Result<()> {
                     }
                 }
             });
-            let _ = tx.send(Incoming::Conn { id, tx: reply_tx });
+            let _ = tx.send(Incoming::Conn {
+                id,
+                tx: reply_tx,
+                worker,
+            });
             let tx = tx.clone();
             thread::spawn(move || {
                 let mut reader = std::io::BufReader::new(conn);
@@ -409,6 +426,7 @@ impl Daemon {
         let mut hold_tokens = 0u64;
         let mut hold_mem = 0u64;
         let mut hold_pids = 0u64;
+        let mut child_hold: HashMap<String, (u64, u64, u64)> = HashMap::new();
         for id in queued {
             if self.state.live() + chosen.len() >= self.policy.cfg.caps.max_live {
                 break;
@@ -435,11 +453,26 @@ impl Daemon {
                 self.state.purse.memory_held,
                 self.state.purse.pids_held,
             );
+            let saved_slice = task.parent.as_ref().and_then(|parent| {
+                self.state
+                    .purse
+                    .open
+                    .get(parent)
+                    .map(|slice| (slice.used, slice.memory_lent, slice.pids_lent))
+            });
             if task.parent.is_none() {
                 self.state.purse.available = self.state.purse.available.saturating_sub(hold_tokens);
                 self.state.purse.memory_held =
                     self.state.purse.memory_held.saturating_add(hold_mem);
                 self.state.purse.pids_held = self.state.purse.pids_held.saturating_add(hold_pids);
+            } else if let Some(parent) = task.parent.clone() {
+                if let Some((tokens, memory, pids)) = child_hold.get(&parent).copied() {
+                    if let Some(slice) = self.state.purse.open.get_mut(&parent) {
+                        slice.used = slice.used.saturating_add(tokens);
+                        slice.memory_lent = slice.memory_lent.saturating_add(memory);
+                        slice.pids_lent = slice.pids_lent.saturating_add(pids);
+                    }
+                }
             }
             let verdict = gate::decide(
                 &task,
@@ -456,6 +489,13 @@ impl Daemon {
             self.state.purse.available = saved.0;
             self.state.purse.memory_held = saved.1;
             self.state.purse.pids_held = saved.2;
+            if let (Some(parent), Some((used, memory, pids))) = (&task.parent, saved_slice) {
+                if let Some(slice) = self.state.purse.open.get_mut(parent) {
+                    slice.used = used;
+                    slice.memory_lent = memory;
+                    slice.pids_lent = pids;
+                }
+            }
             match verdict {
                 Verdict::Queue => break,
                 Verdict::Deny(reason) => {
@@ -473,6 +513,11 @@ impl Daemon {
                         hold_tokens += task.budget.tokens;
                         hold_mem += task.budget.memory_mb;
                         hold_pids += task.budget.pids;
+                    } else if let Some(parent) = task.parent.clone() {
+                        let slot = child_hold.entry(parent).or_insert((0, 0, 0));
+                        slot.0 += task.budget.tokens;
+                        slot.1 += task.budget.memory_mb;
+                        slot.2 += task.budget.pids;
                     }
                     batch.push(Record::Admit {
                         id: id.clone(),
@@ -533,6 +578,7 @@ impl Daemon {
             registry: paths::registry(&self.home),
             root: paths::cell_root(&self.home, id),
             proxy_sock: paths::proxy_sock(&self.home),
+            worker_sock: paths::worker_sock(&self.home),
             net_none,
             memory_mb: task.budget.memory_mb,
             pids: task.budget.pids,
@@ -631,15 +677,24 @@ impl Daemon {
     }
 
     fn finish(&mut self, id: &str, code: i32, reason: &str, refund_unused: bool) -> Result<()> {
-        let used = self.hub.remove(id);
+        let lent = self
+            .state
+            .purse
+            .open
+            .get(id)
+            .map(|slice| slice.used)
+            .unwrap_or(0);
+        let metered = self.hub.remove(id);
         let reserved = self
             .state
             .tasks
             .get(id)
             .map(|t| t.budget.tokens)
             .unwrap_or(0);
+        // `used` is proxy spend plus tokens still lent to children.
+        let used = lent.max(metered).min(reserved);
         let refund = if refund_unused {
-            reserved.saturating_sub(used.min(reserved))
+            reserved.saturating_sub(used)
         } else {
             0
         };
@@ -727,6 +782,9 @@ impl Daemon {
     }
 
     fn handle(&mut self, id: u64, line: &str) -> Result<()> {
+        if self.clients.get(&id).is_some_and(|client| client.worker) {
+            return self.handle_worker(id, line);
+        }
         let req = match proto::parse_request(line) {
             Ok(req) => req,
             Err(e) => {
@@ -795,6 +853,121 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    fn handle_worker(&mut self, id: u64, line: &str) -> Result<()> {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                self.reply(id, json!({"ok": false, "error": e.to_string()}));
+                return Ok(());
+            }
+        };
+        let reply = match value.get("op").and_then(|op| op.as_str()).unwrap_or("") {
+            "spawn" => self.worker_spawn(&value),
+            "post" => self.worker_post(&value),
+            other => Err(err(format!("unknown op {other}"))),
+        };
+        match reply {
+            Ok(body) => self.reply(id, body),
+            Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+        }
+        Ok(())
+    }
+
+    fn worker_id(&self, value: &Value) -> Result<String> {
+        let token = value
+            .get("token")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| err("token"))?;
+        self.hub.id_of(token).ok_or_else(|| err("token"))
+    }
+
+    fn worker_spawn(&mut self, value: &Value) -> Result<Value> {
+        let parent = self.worker_id(value)?;
+        let verify = value
+            .get("verify")
+            .or_else(|| value.get("verifier"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        let Some(verify) = verify else {
+            return Err(err("verifier required"));
+        };
+        let parent_task = self
+            .state
+            .tasks
+            .get(&parent)
+            .ok_or_else(|| err("parent is not a task"))?;
+        if !parent_task.state.is_live() {
+            return Err(err("parent is not running"));
+        }
+        let tags = value
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let task = NewTask {
+            worker: value
+                .get("worker")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| err("missing worker"))?
+                .to_string(),
+            goal: value
+                .get("goal")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| err("missing goal"))?
+                .to_string(),
+            verifier: Some(verify),
+            no_verify: false,
+            tokens: value.get("tokens").and_then(|n| n.as_u64()),
+            seconds: value.get("seconds").and_then(|n| n.as_u64()),
+            memory_mb: value.get("memory_mb").and_then(|n| n.as_u64()),
+            pids: value.get("pids").and_then(|n| n.as_u64()),
+            value: value.get("value").and_then(|n| n.as_u64()),
+            tags,
+            parent: Some(parent),
+        };
+        let ids = self.enqueue(std::slice::from_ref(&task))?;
+        let child = ids.first().cloned().unwrap_or_default();
+        let denied = self
+            .state
+            .tasks
+            .get(&child)
+            .filter(|task| task.state == TaskState::Failed)
+            .map(|task| task.reason.clone());
+        Ok(json!({"ok": true, "ids": ids, "denied": denied}))
+    }
+
+    fn worker_post(&mut self, value: &Value) -> Result<Value> {
+        let author = self.worker_id(value)?;
+        let text = value
+            .get("text")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            return Err(err("empty post"));
+        }
+        let id = id::ulid();
+        self.commit(
+            &[Record::Post {
+                id: id.clone(),
+                author: author.clone(),
+                role: "worker".into(),
+                text: text.into(),
+                weight: 1,
+                channel: "general".into(),
+                mentions: mentions(text),
+                ts: now_ms(),
+            }],
+            false,
+        )?;
+        Ok(json!({"ok": true, "id": id}))
     }
 
     fn enqueue(&mut self, tasks: &[NewTask]) -> Result<Vec<String>> {
