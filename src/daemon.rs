@@ -24,6 +24,7 @@ use crate::model::{Budget, Decoded, Record, TaskState};
 use crate::paths;
 use crate::proto::{self, NewTask, Request};
 use crate::proxy::{self, Hub, Note};
+use crate::registry;
 use crate::state::State;
 use crate::text::mentions;
 
@@ -158,6 +159,7 @@ fn run(home: &Path) -> Result<()> {
             state.apply(rec);
         }
     }
+    registry::replay(home, &opened.records)?;
     let hub = Hub::new(
         policy.cfg.proxy.upstream.clone(),
         policy.cfg.proxy.key.clone(),
@@ -579,6 +581,18 @@ impl Daemon {
         }
         let token = id::token();
         let net_none = matches!(worker.net, crate::config::Net::None);
+        if let Some(recipe) = &task.recipe {
+            let _ = registry::stage_run(&self.home, recipe, &paths::work(&self.home, id));
+        }
+        let depth = depth_of(&self.state, task.parent.as_deref());
+        let preamble = registry::render_preamble(
+            id,
+            task.budget.tokens,
+            task.budget.seconds,
+            task.budget.memory_mb,
+            depth,
+            self.policy.cfg.caps.max_depth,
+        );
         let spawned = cell::spawn(&SpawnRequest {
             cmd: worker.cmd,
             work: paths::work(&self.home, id),
@@ -587,6 +601,7 @@ impl Daemon {
             root: paths::cell_root(&self.home, id),
             proxy_sock: paths::proxy_sock(&self.home),
             worker_sock: paths::worker_sock(&self.home),
+            preamble,
             net_none,
             memory_mb: task.budget.memory_mb,
             pids: task.budget.pids,
@@ -684,6 +699,14 @@ impl Daemon {
             .and_then(|task| task.verifier.clone())
             .unwrap_or_default();
         let dir = paths::work(&self.home, id);
+        if let Some(recipe) = self
+            .state
+            .tasks
+            .get(id)
+            .and_then(|task| task.recipe.clone())
+        {
+            let _ = registry::stage_run(&self.home, &recipe, &dir);
+        }
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(&verifier)
@@ -710,18 +733,26 @@ impl Daemon {
     fn complete_check(&mut self, id: &str, code: i32) -> Result<()> {
         let ok = code == 0;
         let reason = if ok { "ok" } else { "verifier" };
-        self.finish_with(
-            id,
+        let mut extra = vec![Record::Result {
+            id: id.to_string(),
+            ok,
             code,
-            reason,
-            true,
-            vec![Record::Result {
-                id: id.to_string(),
-                ok,
-                code,
-                ts: now_ms(),
-            }],
-        )
+            ts: now_ms(),
+        }];
+        let mut published = None;
+        if ok {
+            if let Some(rec) = self.maybe_promote(id)? {
+                if let Record::Promote { name, .. } = &rec {
+                    published = Some(name.clone());
+                }
+                extra.push(rec);
+            }
+        }
+        self.finish_with(id, code, reason, true, extra)?;
+        if let Some(name) = published {
+            registry::materialize(&self.home, &name)?;
+        }
+        Ok(())
     }
 
     fn crash(&mut self, id: &str) -> Result<()> {
@@ -749,6 +780,7 @@ impl Daemon {
                     value: task.value,
                     budget: task.budget.clone(),
                     retry_of: Some(id.to_string()),
+                    recipe: task.recipe.clone(),
                     ts: now_ms(),
                 }],
                 true,
@@ -895,7 +927,7 @@ impl Daemon {
         };
         match req {
             Request::Status => self.reply(id, self.status_json()),
-            Request::Add(task) => match self.enqueue(std::slice::from_ref(&task)) {
+            Request::Add(task) => match self.enqueue(std::slice::from_ref(task.as_ref())) {
                 Ok(ids) => self.reply(id, json!({"ok": true, "ids": ids})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
             },
@@ -945,6 +977,10 @@ impl Daemon {
                     .collect::<Vec<_>>());
                 self.reply(id, status);
             }
+            Request::Pin(name) => match self.pin(&name) {
+                Ok(()) => self.reply(id, json!({"ok": true, "name": name})),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
             Request::Debug(level) => {
                 if let Some(client) = self.clients.get_mut(&id) {
                     client.debug = level;
@@ -967,6 +1003,7 @@ impl Daemon {
         let reply = match value.get("op").and_then(|op| op.as_str()).unwrap_or("") {
             "spawn" => self.worker_spawn(&value),
             "post" => self.worker_post(&value),
+            "draft" => self.worker_draft(&value),
             other => Err(err(format!("unknown op {other}"))),
         };
         match reply {
@@ -1032,6 +1069,11 @@ impl Daemon {
             value: value.get("value").and_then(|n| n.as_u64()),
             tags,
             parent: Some(parent),
+            recipe: value
+                .get("recipe")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty()),
         };
         let ids = self.enqueue(std::slice::from_ref(&task))?;
         let child = ids.first().cloned().unwrap_or_default();
@@ -1069,6 +1111,59 @@ impl Daemon {
             false,
         )?;
         Ok(json!({"ok": true, "id": id}))
+    }
+
+    fn worker_draft(&mut self, value: &Value) -> Result<Value> {
+        let author = self.worker_id(value)?;
+        let name = value
+            .get("name")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| err("missing name"))?;
+        let run = value
+            .get("run")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| err("missing run"))?;
+        let verifier = value
+            .get("verifier")
+            .or_else(|| value.get("verify"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| err("missing verifier"))?;
+        let tags = value
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        registry::submit(&self.home, &author, name, run, verifier, tags)?;
+        Ok(json!({"ok": true, "name": name}))
+    }
+
+    fn pin(&mut self, name: &str) -> Result<()> {
+        let rec = registry::promote_record(name, "operator");
+        // The draft has to exist before the record is durable.
+        if registry::stage_run(&self.home, name, &self.home.join("run/pin-stage")).is_err() {
+            return Err(err(format!("no draft {name}")));
+        }
+        let _ = fs::remove_dir_all(self.home.join("run/pin-stage"));
+        self.commit(&[rec], true)?;
+        registry::materialize(&self.home, name)?;
+        Ok(())
+    }
+
+    fn maybe_promote(&mut self, id: &str) -> Result<Option<Record>> {
+        let Some(task) = self.state.tasks.get(id).cloned() else {
+            return Ok(None);
+        };
+        let Some(recipe) = task.recipe else {
+            return Ok(None);
+        };
+        if task.verifier.is_none() {
+            return Ok(None);
+        }
+        registry::consider(&self.home, self.policy.cfg.unattended, id, &recipe)
     }
 
     fn enqueue(&mut self, tasks: &[NewTask]) -> Result<Vec<String>> {
@@ -1128,6 +1223,7 @@ impl Daemon {
             value: task.value.unwrap_or(self.policy.cfg.value),
             budget,
             retry_of: None,
+            recipe: task.recipe.clone(),
             ts: now_ms(),
         })
     }
@@ -1253,6 +1349,9 @@ impl Daemon {
                 0,
                 json!({"ev":"result","id":id,"ok":ok,"code":code,"ts":ts}),
             ),
+            Record::Promote { name, by, ts } => {
+                (1, json!({"ev":"promote","name":name,"by":by,"ts":ts}))
+            }
         };
         self.broadcast(level, value);
     }

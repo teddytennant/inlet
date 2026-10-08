@@ -18,18 +18,20 @@ pub struct NewTask {
     pub value: Option<u64>,
     pub tags: Vec<String>,
     pub parent: Option<String>,
+    pub recipe: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum Request {
     Status,
-    Add(NewTask),
+    Add(Box<NewTask>),
     AddBatch(Vec<NewTask>),
     Post { text: String, human: bool },
     Kill(String),
     Watch { debug: u8, worker: Option<String> },
     Hello { debug: u8 },
     Debug(u8),
+    Pin(String),
 }
 
 pub fn parse_request(line: &str) -> Result<Request> {
@@ -37,7 +39,7 @@ pub fn parse_request(line: &str) -> Result<Request> {
     let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
     match op {
         "status" => Ok(Request::Status),
-        "add" => Ok(Request::Add(parse_task(&v)?)),
+        "add" => Ok(Request::Add(Box::new(parse_task(&v)?))),
         "add_batch" => {
             let tasks = v
                 .get("tasks")
@@ -68,6 +70,7 @@ pub fn parse_request(line: &str) -> Result<Request> {
         "debug" => Ok(Request::Debug(
             v.get("level").and_then(|n| n.as_u64()).unwrap_or(1).min(4) as u8,
         )),
+        "pin" => Ok(Request::Pin(string(&v, "name")?)),
         other => Err(err(format!("unknown op {other}"))),
     }
 }
@@ -109,6 +112,11 @@ pub fn parse_task(v: &Value) -> Result<NewTask> {
         value: num(v, "value"),
         tags,
         parent: v.get("parent").and_then(|s| s.as_str()).map(str::to_string),
+        recipe: v
+            .get("recipe")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -153,5 +161,6 @@ pub fn task_value(task: &NewTask) -> Value {
         "value": task.value,
         "tags": task.tags,
         "parent": task.parent,
+        "recipe": task.recipe,
     })
 }

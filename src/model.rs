@@ -55,6 +55,8 @@ pub enum Record {
         budget: Budget,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_of: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recipe: Option<String>,
         ts: u64,
     },
     Admit {
@@ -115,6 +117,11 @@ pub enum Record {
         code: i32,
         ts: u64,
     },
+    Promote {
+        name: String,
+        by: String,
+        ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -131,7 +138,7 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "kill" | "reset"
-        | "result" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
+        | "result" | "promote" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
         _ => Ok(Decoded::Opaque),
     }
 }

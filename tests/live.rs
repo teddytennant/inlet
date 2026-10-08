@@ -1327,6 +1327,460 @@ fn serve_upstream(mut sock: std::net::TcpStream) {
     let _ = sock.write_all(resp.as_bytes());
 }
 
+fn recipe_run() -> &'static str {
+    "#!/bin/sh\necho ok\n"
+}
+
+fn recipe_verifier() -> &'static str {
+    "test \"$(./run)\" = ok"
+}
+
+#[test]
+fn second_run_readies_then_pin_promotes() {
+    let home = scratch("pin");
+    policy(
+        &home,
+        &base_policy(
+            r#"nap = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            checker = { cmd = { "/bin/sh", "-c", "./run" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "nap",
+            "--goal",
+            "author",
+            "--no-verify",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let author = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let drafted = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "draft",
+            "token": token,
+            "name": "add",
+            "run": recipe_run(),
+            "verifier": recipe_verifier(),
+        }),
+    );
+    assert_eq!(drafted["ok"], true, "{drafted} {}", daemon.log());
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "checker",
+            "--goal",
+            "second",
+            "--verify",
+            recipe_verifier(),
+            "--recipe",
+            "add",
+            "--tokens",
+            "40",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "second" && t["state"] == "done")
+    });
+    assert_eq!(
+        tasks(&st).iter().find(|t| t["goal"] == "second").unwrap()["reason"],
+        "ok",
+        "{st} {}",
+        daemon.log()
+    );
+    assert!(
+        !home.join("registry/recipes/add/run").exists(),
+        "unattended is off, pin should be required"
+    );
+    let meta: Value = serde_json::from_slice(
+        &fs::read(home.join("drafts").join(&author).join("add/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["ready"], true, "{meta}");
+    assert_eq!(meta["stub"], false, "{meta}");
+    inlet(&home, &["pin", "add"]);
+    let run = fs::read_to_string(home.join("registry/recipes/add/run")).unwrap();
+    assert!(run.contains("echo ok"), "{run}");
+    assert!(read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Promote { name, by, .. } if name == "add" && by == "operator"))
+    }));
+    fs::remove_file(home.join("registry/recipes/add/run")).unwrap();
+    drop(daemon);
+    let _daemon = start(&home);
+    assert!(
+        home.join("registry/recipes/add/run").is_file(),
+        "restart did not rebuild a promoted recipe"
+    );
+}
+
+#[test]
+fn unattended_promotes_and_a_stub_does_not() {
+    let home = scratch("auto");
+    let mut body = base_policy(
+        r#"nap = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+        checker = { cmd = { "/bin/sh", "-c", "./run" }, tags = { "code" }, net = "host", on_crash = "fail" },
+        plain = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+        r#"return "allow""#,
+        "max_tokens = 1000,",
+        "",
+    );
+    body.push_str("\nunattended = true\n");
+    policy(&home, &body);
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "nap",
+            "--goal",
+            "author",
+            "--no-verify",
+            "--tokens",
+            "30",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let drafted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"draft","token": token, "name":"add","run": recipe_run(), "verifier": recipe_verifier()}),
+    );
+    assert_eq!(drafted["ok"], true, "{drafted}");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "plain",
+            "--goal",
+            "bare",
+            "--no-verify",
+            "--recipe",
+            "add",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "bare" && t["state"] == "done")
+    });
+    assert!(
+        !home.join("registry/recipes/add/run").exists(),
+        "a task with no verifier promoted"
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "checker",
+            "--goal",
+            "second",
+            "--verify",
+            recipe_verifier(),
+            "--recipe",
+            "add",
+            "--tokens",
+            "30",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "second" && t["state"] == "done")
+    });
+    let second = tasks(&st).iter().find(|t| t["goal"] == "second").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        home.join("registry/recipes/add/run").is_file(),
+        "{st} {}",
+        daemon.log()
+    );
+    assert!(read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Promote { name, by, .. } if name == "add" && by == &second))
+    }));
+    drop(daemon);
+
+    let home = scratch("stub");
+    let mut body = base_policy(
+        r#"nap = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+        plain = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+        r#"return "allow""#,
+        "",
+        "",
+    );
+    body.push_str("\nunattended = true\n");
+    policy(&home, &body);
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "nap",
+            "--goal",
+            "author",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let author = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    worker_rpc(
+        &home,
+        serde_json::json!({"op":"draft","token": token, "name":"noop","run": recipe_run(), "verifier": "/bin/true"}),
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "plain",
+            "--goal",
+            "second",
+            "--verify",
+            "/bin/true",
+            "--recipe",
+            "noop",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "second" && t["state"] == "done")
+    });
+    assert!(
+        !home.join("registry/recipes/noop/run").exists(),
+        "{}",
+        daemon.log()
+    );
+    let meta: Value = serde_json::from_slice(
+        &fs::read(home.join("drafts").join(&author).join("noop/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["stub"], true, "{meta}");
+    assert_eq!(meta["ready"], false, "{meta}");
+    inlet(&home, &["pin", "noop"]);
+    assert!(home.join("registry/recipes/noop/run").is_file());
+}
+
+#[test]
+fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
+    let home = scratch("author");
+    let draft_path = home.join("drafts/will-exist");
+    fs::create_dir_all(&draft_path).unwrap();
+    fs::write(draft_path.join("secret"), "nope").unwrap();
+    let secret = draft_path.join("secret");
+    let script = format!(
+        "cp /etc/preamble /work/preamble; if [ -e '{}' ]; then echo LEAK; else echo DRAFTHIDDEN; fi > /work/hide; while [ ! -f go ]; do sleep 0.05; done; exit 0",
+        secret.display()
+    );
+    policy(
+        &home,
+        &base_policy(
+            &format!(
+                r#"hold = {{ cmd = {{ "/bin/sh", "-c", {script:?} }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+                plain = {{ cmd = {{ "/bin/true" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+                look = {{ cmd = {{ "/bin/sh", "-c", "if [ -f /registry/recipes/add/run ]; then echo SEEN > /work/seen; else echo MISSING > /work/seen; fi" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+                watch = {{ cmd = {{ "/bin/sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do if [ -f /registry/recipes/add/run ]; then echo SEEN > /work/seen; exit 0; fi; sleep 0.2; done; echo HIDDEN > /work/seen; sleep 15" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},"#
+            ),
+            r#"return "allow""#,
+            "max_tokens = 2000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "hold",
+            "--goal",
+            "mine",
+            "--verify",
+            recipe_verifier(),
+            "--recipe",
+            "add",
+            "--tokens",
+            "40",
+            "--seconds",
+            "20",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "hold" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let author = tasks(&st).iter().find(|t| t["worker"] == "hold").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = token_of(
+        tasks(&st).iter().find(|t| t["worker"] == "hold").unwrap()["pid"]
+            .as_i64()
+            .unwrap(),
+    );
+    let drafted = worker_rpc(
+        &home,
+        serde_json::json!({"op":"draft","token": token, "name":"add","run": recipe_run(), "verifier": recipe_verifier()}),
+    );
+    assert_eq!(drafted["ok"], true, "{drafted} {}", daemon.log());
+    let preamble_path = home.join("work").join(&author).join("preamble");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && !preamble_path.exists() {
+        thread::sleep(Duration::from_millis(30));
+    }
+    let preamble = fs::read_to_string(&preamble_path).unwrap_or_default();
+    assert!(preamble.contains(&author), "{preamble}");
+    assert!(
+        preamble.contains("Do not open a private channel to a sibling"),
+        "{preamble}"
+    );
+    assert!(preamble.contains("Talk on the board"), "{preamble}");
+    assert!(
+        preamble.contains("Empty purse: stop and post"),
+        "{preamble}"
+    );
+    assert!(
+        preamble.len() < 1500,
+        "preamble is {} bytes",
+        preamble.len()
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("work").join(&author).join("hide"))
+            .unwrap_or_default()
+            .trim(),
+        "DRAFTHIDDEN"
+    );
+    fs::write(home.join("work").join(&author).join("go"), "1").unwrap();
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["id"] == author && t["state"] == "done")
+    });
+    let meta: Value = serde_json::from_slice(
+        &fs::read(home.join("drafts").join(&author).join("add/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["ready"], false, "author promoted itself: {meta}");
+    assert!(!home.join("registry/recipes/add/run").exists());
+
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "watch",
+            "--goal",
+            "snap",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "15",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "watch" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let watch_id = tasks(&st).iter().find(|t| t["worker"] == "watch").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    inlet(&home, &["pin", "add"]);
+    let seen = home.join("work").join(&watch_id).join("seen");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut body = String::new();
+    while Instant::now() < deadline {
+        if let Ok(text) = fs::read_to_string(&seen) {
+            if !text.trim().is_empty() {
+                body = text;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(
+        body.trim(),
+        "HIDDEN",
+        "running worker saw a new recipe: {body} {}",
+        daemon.log()
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "look",
+            "--goal",
+            "next",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "look" && t["state"] == "done")
+    });
+    let look_id = tasks(&st).iter().find(|t| t["worker"] == "look").unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let seen = fs::read_to_string(home.join("work").join(look_id).join("seen")).unwrap_or_default();
+    assert_eq!(seen.trim(), "SEEN", "{seen}");
+}
+
 #[test]
 fn empty_daemon_rss_when_asked() {
     if std::env::var("INLET_RSS").ok().as_deref() != Some("1") {
@@ -1367,6 +1821,7 @@ fn empty_daemon_rss_when_asked() {
                     pids: 1,
                 },
                 retry_of: None,
+                recipe: None,
                 ts: 1,
             });
         }

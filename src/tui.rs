@@ -164,6 +164,13 @@ impl Ui {
                     self.follow = parts.first().cloned();
                     KeyAction::None
                 }
+                "pin" => {
+                    let Some(name) = parts.first() else {
+                        self.push("pin needs a name".into());
+                        return KeyAction::None;
+                    };
+                    KeyAction::Send(format!(r#"{{"op":"pin","name":"{name}"}}"#))
+                }
                 "kill" => {
                     let Some(id) = parts.first() else {
                         self.push("kill needs an id".into());
@@ -186,6 +193,7 @@ impl Ui {
                             "value": task.value,
                             "tags": task.tags,
                             "parent": task.parent,
+                            "recipe": task.recipe,
                         })
                         .to_string(),
                     ),

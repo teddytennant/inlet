@@ -154,6 +154,7 @@ mod tests {
                 pids: 4,
             },
             retry_of: None,
+            recipe: None,
             ts: 1,
         }
     }

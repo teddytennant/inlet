@@ -42,6 +42,7 @@ pub struct SpawnRequest {
     pub root: PathBuf,
     pub proxy_sock: PathBuf,
     pub worker_sock: PathBuf,
+    pub preamble: String,
     pub net_none: bool,
     pub memory_mb: u64,
     pub pids: u64,
@@ -76,7 +77,6 @@ struct Raw {
     nr_usr: *const libc::c_char,
     nr_work: *const libc::c_char,
     nr_scratch: *const libc::c_char,
-    nr_registry: *const libc::c_char,
     nr_null: *const libc::c_char,
     nr_zero: *const libc::c_char,
     nr_urandom: *const libc::c_char,
@@ -118,6 +118,7 @@ pub fn probe(home: &Path) -> bool {
         root,
         proxy_sock: proxy,
         worker_sock: home.join("run/worker.sock"),
+        preamble: "probe\n".into(),
         net_none: true,
         memory_mb: 64,
         pids: 32,
@@ -151,6 +152,8 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     fs::create_dir_all(&req.scratch)?;
     fs::create_dir_all(&req.registry)?;
     prepare_root(&req.root)?;
+    crate::registry::snapshot(&req.registry, &req.root.join("registry"))?;
+    fs::write(req.root.join("etc/preamble"), &req.preamble)?;
     if unsafe { libc::geteuid() } == 0 {
         let _ = chown(&req.work, Some(65534), Some(65534));
         let _ = chown(&req.scratch, Some(65534), Some(65534));
@@ -165,7 +168,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let newroot = c(&req.root)?;
     let work = c(&req.work)?;
     let scratch = c(&req.scratch)?;
-    let registry = c(&req.registry)?;
+    let registry = c(&req.root.join("registry"))?;
     let proxy = c(&req.proxy_sock)?;
     let worker = c(&req.worker_sock)?;
     let usr = c_path(Path::new("/usr"))?;
@@ -176,7 +179,6 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let nr_usr = join("usr")?;
     let nr_work = join("work")?;
     let nr_scratch = join("scratch")?;
-    let nr_registry = join("registry")?;
     let nr_null = join("dev/null")?;
     let nr_zero = join("dev/zero")?;
     let nr_urandom = join("dev/urandom")?;
@@ -212,7 +214,6 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         nr_usr: nr_usr.as_ptr(),
         nr_work: nr_work.as_ptr(),
         nr_scratch: nr_scratch.as_ptr(),
-        nr_registry: nr_registry.as_ptr(),
         nr_null: nr_null.as_ptr(),
         nr_zero: nr_zero.as_ptr(),
         nr_urandom: nr_urandom.as_ptr(),
@@ -396,7 +397,8 @@ unsafe fn pivot(a: &Raw) -> i32 {
     {
         return errno();
     }
-    let _ = mount_bind(a.registry, a.nr_registry, true);
+    // Registry is a copy taken at spawn, not a live bind, so a promotion
+    // during this turn stays invisible until the next task.
     let _ = mount_bind(a.devnull, a.nr_null, false);
     let _ = mount_bind(a.devzero, a.nr_zero, false);
     let _ = mount_bind(a.devurandom, a.nr_urandom, false);

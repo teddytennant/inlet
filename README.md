@@ -35,8 +35,10 @@ leaves.
 No chain. No agent parliament. No vector store. No web dashboard.
 No pane per agent. It's a process supervisor that took its meds.
 
-Verifiers, the registry, signed policy, and chat bridges are in SPEC.md.
-They are not in this binary yet.
+A worker can ask for a child. The supervisor runs verifiers and keeps
+recipes: a draft is promoted when a second worker's verifier is real,
+or when you `inlet pin` it. Signed policy and chat bridges are in
+SPEC.md. They are not in this binary yet.
 
 See SPEC.md for the full design.
 

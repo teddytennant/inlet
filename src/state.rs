@@ -20,6 +20,7 @@ pub struct TaskView {
     pub state: TaskState,
     pub reason: String,
     pub retry_of: Option<String>,
+    pub recipe: Option<String>,
     pub pid: Option<i32>,
     pub admit_ms: Option<u64>,
 }
@@ -100,6 +101,7 @@ impl State {
                 value,
                 budget,
                 retry_of,
+                recipe,
                 ts: _,
             } => {
                 if let Some(prev) = retry_of {
@@ -119,6 +121,7 @@ impl State {
                         state: TaskState::Queued,
                         reason: String::new(),
                         retry_of: retry_of.clone(),
+                        recipe: recipe.clone(),
                         pid: None,
                         admit_ms: None,
                     },
@@ -226,7 +229,10 @@ impl State {
             Record::Cost { id, tokens, .. } => {
                 self.purse.note_used(id, *tokens);
             }
-            Record::Kill { .. } | Record::Reset { .. } | Record::Result { .. } => {}
+            Record::Kill { .. }
+            | Record::Reset { .. }
+            | Record::Result { .. }
+            | Record::Promote { .. } => {}
         }
         if let Record::Reset { ts, .. } = rec {
             self.purse.apply_reset(*ts);
@@ -293,6 +299,7 @@ impl State {
                     value: task.value,
                     budget: task.budget.clone(),
                     retry_of: Some(task.id.clone()),
+                    recipe: task.recipe.clone(),
                     ts,
                 });
             }

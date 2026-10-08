@@ -117,6 +117,7 @@ mod tests {
                 memory_mb: 32,
                 pids: 4,
             },
+            recipe: None,
             state: TaskState::Queued,
             reason: String::new(),
             retry_of: None,

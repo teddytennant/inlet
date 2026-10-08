@@ -38,6 +38,11 @@ pub fn run() -> Result<()> {
             let v = proto::rpc(&home, json!({"op":"post","text": text}))?;
             print_ok(&v)
         }
+        Some("pin") => {
+            let name = args.get(1).ok_or_else(|| err("usage: inlet pin <name>"))?;
+            let v = proto::rpc(&home, json!({"op":"pin","name": name}))?;
+            print_ok(&v)
+        }
         Some("kill") => {
             let id = args.get(1).ok_or_else(|| err("usage: inlet kill <id>"))?;
             let v = proto::rpc(&home, json!({"op":"kill","id": id}))?;
@@ -57,10 +62,11 @@ inlet up [-f]            daemon. -f stays in the foreground
 inlet                    attach the TUI
 inlet init               write policy.lua
 inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
-        [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID]
+        [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID] [--recipe NAME]
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet kill <id>
+inlet pin <name>
 inlet watch [--debug N] [--worker ID]
 inlet status [--json]
 ";
@@ -114,7 +120,7 @@ fn add(home: &Path, args: &[String]) -> Result<()> {
     let task = parse_add_flags(args)?;
     let v = proto::rpc(
         home,
-        json!({"op":"add","worker": task.worker, "goal": task.goal, "verify": task.verifier, "no_verify": task.no_verify, "tokens": task.tokens, "seconds": task.seconds, "memory_mb": task.memory_mb, "pids": task.pids, "value": task.value, "tags": task.tags, "parent": task.parent}),
+        json!({"op":"add","worker": task.worker, "goal": task.goal, "verify": task.verifier, "no_verify": task.no_verify, "tokens": task.tokens, "seconds": task.seconds, "memory_mb": task.memory_mb, "pids": task.pids, "value": task.value, "tags": task.tags, "parent": task.parent, "recipe": task.recipe}),
     )?;
     if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
         return Err(err(v
@@ -163,6 +169,7 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
     let mut value = None;
     let mut tags = Vec::new();
     let mut parent = None;
+    let mut recipe = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -216,6 +223,10 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
                 parent = Some(next()?);
                 i += 2;
             }
+            "--recipe" => {
+                recipe = Some(next()?);
+                i += 2;
+            }
             other if other.starts_with('-') => return Err(err(format!("unknown flag {other}"))),
             other => {
                 if goal.is_none() {
@@ -247,6 +258,7 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
         value,
         tags,
         parent,
+        recipe,
     })
 }
 
