@@ -35,9 +35,12 @@ leaves.
 No chain. No agent parliament. No vector store. No web dashboard.
 No pane per agent. It's a process supervisor that took its meds.
 
-A worker can ask for a child. The supervisor runs verifiers and keeps
-recipes: a draft is promoted when a second worker's verifier is real,
-or when you `inlet pin` it. The gate can call a decision endpoint
+A worker can ask for a child. The supervisor runs every verifier inside
+a cell with no token and no proxy, and keeps recipes: a draft is
+promoted when a second worker's verifier is real, or when you `inlet pin`
+it. `inlet add --seed DIR` copies a directory into the workdir before
+the cell starts. The worker socket speaks JSON lines on one connection;
+see `doc/worker-socket.md`. The gate can call a decision endpoint
 (`decision.kind` of `openai` or `jev`). `off` stays the local formula.
 Pi and Wizard share one operator skill (`skills/pi`, `skills/wizard`):
 it runs the inlet CLI and does not enter a cell. `inlet init` pins a
