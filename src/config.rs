@@ -89,6 +89,32 @@ pub struct WorkerCfg {
     pub on_crash: OnCrash,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionKind {
+    Off,
+    OpenAi,
+    Jev,
+}
+
+impl DecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionKind::Off => "off",
+            DecisionKind::OpenAi => "openai",
+            DecisionKind::Jev => "jev",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecisionCfg {
+    pub kind: DecisionKind,
+    pub endpoint: Option<String>,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub purse_tokens: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyCfg {
     pub upstream: Option<String>,
@@ -106,6 +132,7 @@ pub struct Config {
     pub unattended: bool,
     pub debug: u8,
     pub default_budget: Budget,
+    pub decision: DecisionCfg,
     pub proxy: ProxyCfg,
     pub workers: BTreeMap<String, WorkerCfg>,
 }
@@ -255,6 +282,25 @@ fn read_config(lua: &Lua) -> Result<Config> {
     if let Some(table) = g.get::<Option<Table>>("default_budget")? {
         overlay_budget(&mut cfg.default_budget, &table)?;
     }
+    if let Some(table) = g.get::<Option<Table>>("decision")? {
+        if let Some(v) = table.get::<Option<String>>("kind")? {
+            cfg.decision.kind = parse_decision_kind(&v)?;
+        }
+        if let Some(v) = table.get::<Option<String>>("endpoint")? {
+            cfg.decision.endpoint = resolve_env(v);
+        }
+        if let Some(v) = table.get::<Option<String>>("model")? {
+            if !v.is_empty() {
+                cfg.decision.model = v;
+            }
+        }
+        if let Some(v) = table.get::<Option<i64>>("timeout_ms")? {
+            cfg.decision.timeout_ms = v.max(1) as u64;
+        }
+        if let Some(v) = table.get::<Option<i64>>("purse_tokens")? {
+            cfg.decision.purse_tokens = v.max(0) as u64;
+        }
+    }
     if let Some(table) = g.get::<Option<Table>>("proxy")? {
         if let Some(v) = table.get::<Option<String>>("upstream")? {
             cfg.proxy.upstream = resolve_env(v);
@@ -324,6 +370,15 @@ fn parse_crash(v: &str) -> Result<OnCrash> {
         "fail" => Ok(OnCrash::Fail),
         "requeue" => Ok(OnCrash::Requeue),
         other => Err(err(format!("unknown on_crash {other}"))),
+    }
+}
+
+fn parse_decision_kind(v: &str) -> Result<DecisionKind> {
+    match v {
+        "off" => Ok(DecisionKind::Off),
+        "openai" => Ok(DecisionKind::OpenAi),
+        "jev" => Ok(DecisionKind::Jev),
+        other => Err(err(format!("unknown decision.kind {other}"))),
     }
 }
 
@@ -450,6 +505,13 @@ pub fn preset(setup: &str) -> Config {
             memory_mb: 1024,
             pids: 8,
         },
+        decision: DecisionCfg {
+            kind: DecisionKind::Off,
+            endpoint: None,
+            model: "gpt-6-luna".into(),
+            timeout_ms: 800,
+            purse_tokens: 50_000,
+        },
         proxy: ProxyCfg {
             upstream: None,
             key: None,
@@ -497,6 +559,38 @@ mod tests {
         assert_eq!(policy.cfg.workers["prover"].on_crash, OnCrash::Requeue);
         assert_eq!(policy.cfg.workers["pi"].net, Net::None);
         assert_eq!(policy.cfg.workers["pi"].on_crash, OnCrash::Requeue);
+    }
+
+    #[test]
+    fn decision_table_is_read() {
+        let policy = Policy::parse(
+            r#"
+            decision = {
+              kind = "jev",
+              endpoint = "http://127.0.0.1:9/decide",
+              model = "m",
+              timeout_ms = 50,
+              purse_tokens = 3,
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.cfg.decision.kind, DecisionKind::Jev);
+        assert_eq!(
+            policy.cfg.decision.endpoint.as_deref(),
+            Some("http://127.0.0.1:9/decide")
+        );
+        assert_eq!(policy.cfg.decision.timeout_ms, 50);
+        assert_eq!(policy.cfg.decision.purse_tokens, 3);
+        assert_eq!(
+            Policy::parse("decision = { kind = \"off\" }")
+                .unwrap()
+                .cfg
+                .decision
+                .kind,
+            DecisionKind::Off
+        );
+        assert!(Policy::parse("decision = { kind = \"guess\" }").is_err());
     }
 
     #[test]

@@ -60,6 +60,17 @@ impl Samples {
             slot.remove(0);
         }
     }
+
+    pub fn series(&self, key: &str) -> Vec<u64> {
+        self.inner.get(key).cloned().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintView {
+    pub id: String,
+    pub text: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -70,6 +81,8 @@ pub struct State {
     pub samples: Samples,
     pub purse: Purse,
     pub retried: HashSet<String>,
+    pub constraints: Vec<ConstraintView>,
+    pub decision_spent: u64,
 }
 
 impl State {
@@ -86,6 +99,8 @@ impl State {
                 cfg.caps.token_period_ms,
             ),
             retried: HashSet::new(),
+            constraints: Vec::new(),
+            decision_spent: 0,
         }
     }
 
@@ -228,6 +243,9 @@ impl State {
             }
             Record::Cost { id, tokens, .. } => {
                 self.purse.note_used(id, *tokens);
+            }
+            Record::Gate { tokens, .. } => {
+                self.decision_spent = self.decision_spent.saturating_add(*tokens);
             }
             Record::Kill { .. }
             | Record::Reset { .. }

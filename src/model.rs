@@ -102,6 +102,11 @@ pub enum Record {
         tokens: u64,
         ts: u64,
     },
+    /// Tokens spent calling the decision endpoint. Not a worker slice.
+    Gate {
+        tokens: u64,
+        ts: u64,
+    },
     Kill {
         id: String,
         ts: u64,
@@ -137,8 +142,10 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .and_then(|k| k.as_str())
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
-        "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "kill" | "reset"
-        | "result" | "promote" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
+        "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
+        | "reset" | "result" | "promote" => {
+            Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
+        }
         _ => Ok(Decoded::Opaque),
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::cell::{self, SpawnRequest};
-use crate::config::{AdmitCtx, OnCrash, Policy};
+use crate::config::{AdmitCtx, DecisionKind, OnCrash, Policy};
+use crate::decision::{self, Answer, Call, ConstraintIn, Header, PostIn};
 use crate::error::{err, Result};
 use crate::gate::{self, Verdict};
 use crate::id::{self, now_ms};
@@ -79,6 +80,30 @@ struct Check {
     started: Instant,
 }
 
+struct GateHit {
+    at: Instant,
+    failed: bool,
+    p_num: u64,
+    p_den: u64,
+    conflicts: Vec<String>,
+}
+
+enum GateMsg {
+    Ok { key: u64, answer: Answer },
+    Err { key: u64 },
+}
+
+enum GatePrep {
+    Off,
+    Wait,
+    Down,
+    Ready {
+        p_num: u64,
+        p_den: u64,
+        conflicts: Vec<String>,
+    },
+}
+
 struct Daemon {
     home: PathBuf,
     policy: Policy,
@@ -87,6 +112,10 @@ struct Daemon {
     cell_ok: bool,
     hub: Arc<Hub>,
     notes: Receiver<Note>,
+    gate_tx: Sender<GateMsg>,
+    gate_rx: Receiver<GateMsg>,
+    gate_cache: HashMap<u64, GateHit>,
+    gate_inflight: HashSet<u64>,
     cmds: Receiver<Incoming>,
     clients: HashMap<u64, Client>,
     workers: Vec<Worker>,
@@ -170,6 +199,7 @@ fn run(home: &Path) -> Result<()> {
     proxy::listen(&paths::proxy_sock(home), hub.clone())?;
 
     let (cmd_tx, cmds) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
     install_signals(cmd_tx.clone())?;
     listen_socket(&paths::worker_sock(home), cmd_tx.clone(), true)?;
     listen_socket(&paths::operator_sock(home), cmd_tx, false)?;
@@ -183,6 +213,10 @@ fn run(home: &Path) -> Result<()> {
         cell_ok,
         hub,
         notes,
+        gate_tx,
+        gate_rx,
+        gate_cache: HashMap::new(),
+        gate_inflight: HashSet::new(),
         cmds,
         clients: HashMap::new(),
         workers: Vec::new(),
@@ -387,6 +421,9 @@ impl Daemon {
         while let Ok(note) = self.notes.try_recv() {
             self.on_note(note)?;
         }
+        while let Ok(msg) = self.gate_rx.try_recv() {
+            self.on_gate(msg)?;
+        }
         self.drain_logs();
         self.reap()?;
         self.timeouts()?;
@@ -429,6 +466,159 @@ impl Daemon {
         Ok(())
     }
 
+    fn on_gate(&mut self, msg: GateMsg) -> Result<()> {
+        let (key, failed, answer) = match msg {
+            GateMsg::Ok { key, answer } => (key, false, Some(answer)),
+            GateMsg::Err { key } => (key, true, None),
+        };
+        self.gate_inflight.remove(&key);
+        if failed {
+            self.gate_cache.insert(
+                key,
+                GateHit {
+                    at: Instant::now(),
+                    failed: true,
+                    p_num: 0,
+                    p_den: 1,
+                    conflicts: Vec::new(),
+                },
+            );
+            return Ok(());
+        }
+        let answer = answer.unwrap_or(Answer {
+            p_num: 0,
+            p_den: 1,
+            conflicts: Vec::new(),
+            tokens: 1,
+        });
+        let extra = answer.tokens.saturating_sub(1);
+        if extra > 0 {
+            self.commit(
+                &[Record::Gate {
+                    tokens: extra,
+                    ts: now_ms(),
+                }],
+                true,
+            )?;
+        }
+        self.gate_cache.insert(
+            key,
+            GateHit {
+                at: Instant::now(),
+                failed: false,
+                p_num: answer.p_num,
+                p_den: answer.p_den.max(1),
+                conflicts: answer.conflicts,
+            },
+        );
+        Ok(())
+    }
+
+    /// `Wait` leaves the task queued. A cache hit does not start a second call.
+    fn gate_for(&mut self, task: &crate::state::TaskView) -> Result<GatePrep> {
+        let kind = self.policy.cfg.decision.kind;
+        let endpoint = self.policy.cfg.decision.endpoint.clone();
+        let timeout_ms = self.policy.cfg.decision.timeout_ms;
+        let purse = self.policy.cfg.decision.purse_tokens;
+        if kind == DecisionKind::Off {
+            return Ok(GatePrep::Off);
+        }
+        let call = self.decision_call(task);
+        let key = call.key();
+        if let Some(hit) = self.gate_cache.get(&key) {
+            if hit.at.elapsed() < decision::CACHE_TTL {
+                if hit.failed {
+                    return Ok(GatePrep::Down);
+                }
+                return Ok(GatePrep::Ready {
+                    p_num: hit.p_num,
+                    p_den: hit.p_den,
+                    conflicts: hit.conflicts.clone(),
+                });
+            }
+        }
+        if self.gate_inflight.contains(&key) {
+            return Ok(GatePrep::Wait);
+        }
+        let Some(endpoint) = endpoint else {
+            return Ok(GatePrep::Down);
+        };
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        let remaining = purse.saturating_sub(self.state.decision_spent);
+        if remaining == 0 {
+            return Ok(GatePrep::Down);
+        }
+        // One token is durable before the call leaves. The rest settles on the reply.
+        self.commit(
+            &[Record::Gate {
+                tokens: 1,
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+        self.gate_inflight.insert(key);
+        let tx = self.gate_tx.clone();
+        thread::spawn(move || {
+            let msg = match decision::ask(&endpoint, &call, timeout) {
+                Ok(answer) => GateMsg::Ok { key, answer },
+                Err(_) => GateMsg::Err { key },
+            };
+            let _ = tx.send(msg);
+        });
+        Ok(GatePrep::Wait)
+    }
+
+    fn decision_call(&self, task: &crate::state::TaskView) -> Call {
+        let mut parents = Vec::new();
+        let mut cursor = task.parent.clone();
+        while let Some(id) = cursor {
+            let Some(parent) = self.state.tasks.get(&id) else {
+                break;
+            };
+            parents.push(header_of(parent));
+            if parents.len() >= 8 {
+                break;
+            }
+            cursor = parent.parent.clone();
+        }
+        let key = gate::samples_key(&task.worker, &task.tags);
+        let posts = self
+            .state
+            .posts
+            .iter()
+            .rev()
+            .take(decision::POST_WINDOW)
+            .map(|post| PostIn {
+                author: post.author.clone(),
+                role: post.role.clone(),
+                weight: post.weight,
+                channel: post.channel.clone(),
+                text: clip(&crate::text::redact(&post.text), 160),
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Call {
+            model: self.policy.cfg.decision.model.clone(),
+            header: header_of(task),
+            parents,
+            samples: self.state.samples.series(&key),
+            constraints: self
+                .state
+                .constraints
+                .iter()
+                .map(|c| ConstraintIn {
+                    id: c.id.clone(),
+                    text: clip(&c.text, 240),
+                    tags: c.tags.clone(),
+                })
+                .collect(),
+            posts,
+            human_weight: self.policy.cfg.human_weight,
+        }
+    }
+
     fn admit(&mut self) -> Result<()> {
         let queued: Vec<String> = self.state.queue.iter().cloned().collect();
         let mut batch: Vec<Record> = Vec::new();
@@ -447,6 +637,26 @@ impl Daemon {
             if task.state != TaskState::Queued {
                 continue;
             }
+            let (p, blocked) = match self.gate_for(&task)? {
+                GatePrep::Wait => continue,
+                GatePrep::Down => {
+                    self.commit(
+                        &[Record::Deny {
+                            id: id.clone(),
+                            reason: "gate".into(),
+                            ts: now_ms(),
+                        }],
+                        true,
+                    )?;
+                    continue;
+                }
+                GatePrep::Off => (None, false),
+                GatePrep::Ready {
+                    p_num,
+                    p_den,
+                    conflicts,
+                } => (Some((p_num, p_den)), !conflicts.is_empty()),
+            };
             let depth = depth_of(&self.state, task.parent.as_deref());
             let lua = self.policy.admit(&AdmitCtx {
                 depth,
@@ -494,6 +704,8 @@ impl Daemon {
                     depth,
                     cell_ok: self.cell_ok,
                     lua_says: lua,
+                    p,
+                    blocked,
                 },
             );
             self.state.purse.available = saved.0;
@@ -1289,6 +1501,9 @@ impl Daemon {
             "debug": self.policy.cfg.debug,
             "resets": purse.resets,
             "cell": self.cell_ok,
+            "gate": self.policy.cfg.decision.kind.as_str(),
+            "gate_spent": self.state.decision_spent,
+            "gate_cap": self.policy.cfg.decision.purse_tokens,
             "tasks": tasks,
         })
     }
@@ -1338,6 +1553,7 @@ impl Daemon {
             Record::Cost { id, tokens, ts } => {
                 (1, json!({"ev":"cost","id":id,"tokens":tokens,"ts":ts}))
             }
+            Record::Gate { tokens, ts } => (2, json!({"ev":"gate","tokens":tokens,"ts":ts})),
             Record::Reset { grant, ts } => (
                 1,
                 json!({"ev":"reset","grant":grant,"ts":ts,"available":self.state.purse.available,"held":self.state.purse.held()}),
@@ -1418,6 +1634,24 @@ impl Daemon {
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
     }
+}
+
+fn header_of(task: &crate::state::TaskView) -> Header {
+    Header {
+        worker: task.worker.clone(),
+        tags: task.tags.clone(),
+        goal: clip(&crate::text::redact(&task.goal), 400),
+        value: task.value,
+        tokens: task.budget.tokens,
+        seconds: task.budget.seconds,
+        memory_mb: task.budget.memory_mb,
+        pids: task.budget.pids,
+        verifier: task.verifier.as_ref().is_some_and(|v| !v.is_empty()),
+    }
+}
+
+fn clip(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
 }
 
 fn depth_of(state: &State, start: Option<&str>) -> u32 {

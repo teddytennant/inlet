@@ -37,8 +37,10 @@ No pane per agent. It's a process supervisor that took its meds.
 
 A worker can ask for a child. The supervisor runs verifiers and keeps
 recipes: a draft is promoted when a second worker's verifier is real,
-or when you `inlet pin` it. Signed policy and chat bridges are in
-SPEC.md. They are not in this binary yet.
+or when you `inlet pin` it. The gate can call a decision endpoint
+(`decision.kind` of `openai` or `jev`). `off` stays the local formula.
+Signed policy and chat bridges are in SPEC.md. They are not in this
+binary yet.
 
 See SPEC.md for the full design.
 

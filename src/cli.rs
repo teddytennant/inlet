@@ -289,6 +289,21 @@ fn status(home: &Path, json_out: bool) -> Result<()> {
         v["available"].as_u64().unwrap_or(0),
     ));
     bar.abandon();
+    if v.get("gate").and_then(|k| k.as_str()).unwrap_or("off") != "off" {
+        let cap = v.get("gate_cap").and_then(|n| n.as_u64()).unwrap_or(0);
+        if cap > 0 {
+            let spent = v.get("gate_spent").and_then(|n| n.as_u64()).unwrap_or(0);
+            let gate = ProgressBar::new(cap);
+            gate.set_style(
+                ProgressStyle::with_template("{prefix} {bar:28.cyan/blue} {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+            gate.set_prefix("gate");
+            gate.set_position(spent.min(cap));
+            gate.abandon();
+        }
+    }
     if let Some(tasks) = v.get("tasks").and_then(|t| t.as_array()) {
         for task in tasks {
             println!(

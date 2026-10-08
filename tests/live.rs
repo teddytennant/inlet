@@ -2,10 +2,12 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1779,6 +1781,661 @@ fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
         .unwrap();
     let seen = fs::read_to_string(home.join("work").join(look_id).join("seen")).unwrap_or_default();
     assert_eq!(seen.trim(), "SEEN", "{seen}");
+}
+
+#[derive(Clone, Debug)]
+struct DecisionHit {
+    path: String,
+    body: String,
+}
+
+enum DecisionReply {
+    Body(Vec<u8>),
+    Hang,
+    Drop,
+}
+
+struct FakeDecision {
+    port: u16,
+    hits: Arc<Mutex<Vec<DecisionHit>>>,
+}
+
+fn fake_decision(reply: Arc<dyn Fn(&str) -> DecisionReply + Send + Sync>) -> FakeDecision {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let saved = hits.clone();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let raw = read_http_req(&mut conn);
+            let (path, body) = split_http(&raw);
+            if path.is_empty() && body.is_empty() {
+                continue;
+            }
+            saved.lock().unwrap().push(DecisionHit {
+                path,
+                body: body.clone(),
+            });
+            match reply(&body) {
+                DecisionReply::Body(buf) => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        buf.len()
+                    );
+                    let _ = conn.write_all(header.as_bytes());
+                    let _ = conn.write_all(&buf);
+                }
+                DecisionReply::Hang => thread::sleep(Duration::from_secs(3)),
+                DecisionReply::Drop => drop(conn),
+            }
+        }
+    });
+    FakeDecision { port, hits }
+}
+
+fn read_http_req(conn: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let header_end;
+    loop {
+        match conn.read(&mut tmp) {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = i + 4;
+                    break;
+                }
+                if buf.len() > 64 * 1024 {
+                    return buf;
+                }
+            }
+        }
+    }
+    let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let len = header
+        .lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + len {
+        match conn.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    buf
+}
+
+fn split_http(raw: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(raw);
+    let mut lines = text.split("\r\n");
+    let request = lines.next().unwrap_or("");
+    let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (path, body)
+}
+
+fn decision_policy(workers: &str, port: u16, extra: &str) -> String {
+    format!(
+        "{}\ndecision = {{\n  kind = \"openai\",\n  endpoint = \"http://127.0.0.1:{port}/decide\",\n  model = \"gpt-6-luna\",\n  timeout_ms = 800,\n  purse_tokens = 50000,\n{extra}}}\n",
+        base_policy(
+            workers,
+            r#"return "allow""#,
+            "max_tokens = 2000000,",
+            "",
+        )
+    )
+}
+
+fn scripted_reply(body: &str) -> DecisionReply {
+    let raw: &[u8] = if body.contains("clash-goal") {
+        br#"{"p_success":1,"conflicts":["c1"],"usage":{"total_tokens":2}}"#
+    } else if body.contains("zero-p") {
+        br#"{"score":0,"usage":{"total_tokens":2}}"#
+    } else if body.contains("via-predicate") {
+        br#"{"predicate":true,"usage":{"total_tokens":2}}"#
+    } else if body.contains("via-noul") {
+        br#"{"noul":1,"usage":{"total_tokens":2}}"#
+    } else {
+        br#"{"p_success":1,"conflicts":[],"usage":{"total_tokens":2}}"#
+    };
+    DecisionReply::Body(raw.to_vec())
+}
+
+fn wait_bodies(fake: &FakeDecision, pred: impl Fn(&[DecisionHit]) -> bool) -> Vec<DecisionHit> {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let got = fake.hits.lock().unwrap().clone();
+        if pred(&got) || Instant::now() > deadline {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn decision_sends_headers_and_caches() {
+    let fake = fake_decision(Arc::new(scripted_reply));
+    let home = scratch("decide");
+    fs::create_dir_all(home.join("registry/recipes/leak")).unwrap();
+    fs::write(home.join("registry/recipes/leak/run"), "SECRET_RECIPE_BODY").unwrap();
+    fs::create_dir_all(home.join("runs")).unwrap();
+    fs::write(home.join("runs/nope.log"), "SECRET_TRANSCRIPT").unwrap();
+    fs::create_dir_all(home.join("scratch/other")).unwrap();
+    fs::write(home.join("scratch/other/note"), "SECRET_SCRATCH").unwrap();
+    policy(
+        &home,
+        &decision_policy(
+            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            fake.port,
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(&home, &["post", "board-hello-9"]);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "seed-sample",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "seed-sample" && t["state"] == "done")
+    });
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "with-samples",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let bodies = wait_bodies(&fake, |hits| {
+        hits.iter().any(|h| h.body.contains("with-samples"))
+    });
+    let seed = bodies
+        .iter()
+        .find(|h| h.body.contains("seed-sample"))
+        .unwrap_or_else(|| panic!("no seed call: {bodies:?} {}", daemon.log()));
+    assert_eq!(seed.path, "/decide");
+    assert!(seed.body.contains("\"human_weight\":4"), "{}", seed.body);
+    assert!(seed.body.contains("\"constraints\":[]"), "{}", seed.body);
+    assert!(seed.body.contains("board-hello-9"), "{}", seed.body);
+    assert!(seed.body.contains("\"worker\":\"quick\""), "{}", seed.body);
+    assert!(!seed.body.contains("SECRET_"), "{}", seed.body);
+    assert!(!seed.body.contains("transcript"), "{}", seed.body);
+    let sampled = bodies
+        .iter()
+        .find(|h| h.body.contains("with-samples"))
+        .unwrap();
+    assert!(
+        sampled.body.contains("\"samples\":[0]"),
+        "samples missing: {}",
+        sampled.body
+    );
+    let before = fake.hits.lock().unwrap().len();
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "same-nap",
+            "--no-verify",
+            "--tokens",
+            "30",
+            "--seconds",
+            "20",
+        ],
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "same-nap",
+            "--no-verify",
+            "--tokens",
+            "30",
+            "--seconds",
+            "20",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .filter(|t| t["goal"] == "same-nap" && t["state"] == "running")
+            .count()
+            == 2
+    });
+    let naps = fake
+        .hits
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|h| h.body.contains("same-nap"))
+        .count();
+    assert_eq!(naps, 1, "cached call ran twice, before {before}");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "parent-header",
+            "--verify",
+            "true",
+            "--tokens",
+            "400",
+            "--seconds",
+            "30",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "parent-header" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let parent = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "parent-header")
+        .unwrap();
+    let token = token_of(parent["pid"].as_i64().unwrap());
+    let spawned = worker_rpc(
+        &home,
+        serde_json::json!({
+            "op": "spawn",
+            "token": token,
+            "worker": "quick",
+            "goal": "child-header",
+            "verify": "true",
+            "tokens": 30,
+            "seconds": 10,
+            "memory_mb": 32,
+            "pids": 2,
+        }),
+    );
+    assert_eq!(spawned["ok"], true, "{spawned}");
+    let bodies = wait_bodies(&fake, |hits| {
+        hits.iter().any(|h| h.body.contains("child-header"))
+    });
+    let child = bodies
+        .iter()
+        .find(|h| h.body.contains("child-header"))
+        .unwrap();
+    assert!(
+        child.body.contains("parent-header"),
+        "parent header missing: {}",
+        child.body
+    );
+    assert!(child.body.contains("\"parents\":[{"), "{}", child.body);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "clash-goal",
+            "--verify",
+            "true",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "clash-goal" && t["state"] == "failed")
+    });
+    let clash = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "clash-goal")
+        .unwrap();
+    assert_eq!(clash["reason"], "constraint", "{clash}");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "zero-p",
+            "--verify",
+            "true",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "zero-p" && t["state"] == "failed")
+    });
+    let zero = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "zero-p")
+        .unwrap();
+    assert_eq!(zero["reason"], "ev", "{zero}");
+    for goal in ["via-predicate", "via-noul"] {
+        inlet(
+            &home,
+            &[
+                "add",
+                "--worker",
+                "quick",
+                "--goal",
+                goal,
+                "--no-verify",
+                "--tokens",
+                "250000",
+                "--seconds",
+                "10",
+            ],
+        );
+        let st = wait_status(&home, |v| {
+            tasks(v).iter().any(|t| {
+                t["goal"] == goal && matches!(t["state"].as_str(), Some("done" | "failed"))
+            })
+        });
+        let task = tasks(&st).into_iter().find(|t| t["goal"] == goal).unwrap();
+        assert_eq!(
+            task["state"],
+            "done",
+            "p was not applied: {task} {}",
+            daemon.log()
+        );
+    }
+}
+
+#[test]
+fn decision_down_lets_the_verifier_finish() {
+    let open = Arc::new(AtomicBool::new(true));
+    let flag = open.clone();
+    let fake = fake_decision(Arc::new(move |_| {
+        if !flag.load(Ordering::SeqCst) {
+            return DecisionReply::Drop;
+        }
+        DecisionReply::Body(br#"{"p_success":1,"usage":{"total_tokens":2}}"#.to_vec())
+    }));
+    let home = scratch("decide-down");
+    policy(
+        &home,
+        &decision_policy(
+            r#"paced = { cmd = { "/bin/sleep", "1" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            fake.port,
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "paced",
+            "--goal",
+            "finish-me",
+            "--verify",
+            "true",
+            "--tokens",
+            "40",
+            "--seconds",
+            "8",
+        ],
+    );
+    wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "finish-me" && t["state"] == "running")
+    });
+    open.store(false, Ordering::SeqCst);
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "finish-me" && t["state"] == "done")
+    });
+    let done = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "finish-me")
+        .unwrap();
+    assert_eq!(done["reason"], "ok", "{done} {}", daemon.log());
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "after-down",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "after-down" && t["state"] == "failed")
+    });
+    let denied = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "after-down")
+        .unwrap();
+    assert_eq!(denied["reason"], "gate", "{denied}");
+}
+
+#[test]
+fn empty_decision_purse_does_not_call() {
+    let fake = fake_decision(Arc::new(|_| {
+        DecisionReply::Body(br#"{"p_success":1}"#.to_vec())
+    }));
+    let home = scratch("decide-empty");
+    policy(
+        &home,
+        &decision_policy("", fake.port, "  purse_tokens = 0,\n"),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "no-purse",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "no-purse" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "no-purse")
+        .unwrap();
+    assert_eq!(task["reason"], "gate", "{task} {}", daemon.log());
+    assert!(
+        fake.hits.lock().unwrap().is_empty(),
+        "empty purse still called"
+    );
+    assert_eq!(st["gate_spent"].as_u64(), Some(0));
+}
+
+#[test]
+fn decision_timeout_denies() {
+    let fake = fake_decision(Arc::new(|_| DecisionReply::Hang));
+    let home = scratch("decide-slow");
+    policy(
+        &home,
+        &decision_policy("", fake.port, "  timeout_ms = 300,\n"),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "too-slow",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "too-slow" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "too-slow")
+        .unwrap();
+    assert_eq!(task["reason"], "gate", "{task} {}", daemon.log());
+    assert!(task["pid"].is_null(), "timeout still spawned {task}");
+}
+
+#[test]
+fn decision_spend_survives_kill9() {
+    let fake = fake_decision(Arc::new(|_| {
+        DecisionReply::Body(br#"{"p_success":1,"usage":{"total_tokens":40}}"#.to_vec())
+    }));
+    let home = scratch("decide-spend");
+    policy(
+        &home,
+        &decision_policy(
+            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            fake.port,
+            "  purse_tokens = 40,\n",
+        ),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "once",
+            "--no-verify",
+            "--tokens",
+            "15",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "once" && t["state"] == "done")
+    });
+    assert_eq!(st["gate_spent"].as_u64(), Some(40), "{st}");
+    let id = tasks(&st).iter().find(|t| t["goal"] == "once").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let admits = read_log(&home)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id: i, .. } if i == &id))
+        })
+        .count();
+    assert_eq!(admits, 1);
+    let pid = pid_of(&home).unwrap();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let _ = daemon.child.wait();
+    let daemon = start(&home);
+    let st = status(&home);
+    assert_eq!(st["gate_spent"].as_u64(), Some(40), "{st} {}", daemon.log());
+    assert_eq!(fake.hits.lock().unwrap().len(), 1);
+    let admits = read_log(&home)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id: i, .. } if i == &id))
+        })
+        .count();
+    assert_eq!(admits, 1, "kill -9 admitted the slice again");
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "quick",
+            "--goal",
+            "twice",
+            "--no-verify",
+            "--tokens",
+            "15",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "twice" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "twice")
+        .unwrap();
+    assert_eq!(task["reason"], "gate", "{task}");
+    assert_eq!(st["gate_spent"].as_u64(), Some(40), "{st}");
+    assert_eq!(
+        fake.hits.lock().unwrap().len(),
+        1,
+        "down purse called again"
+    );
 }
 
 #[test]

@@ -20,6 +20,10 @@ pub struct Ctx<'a> {
     pub depth: u32,
     pub cell_ok: bool,
     pub lua_says: Option<bool>,
+    /// Endpoint probability as numerator/denominator. `None` is the off formula.
+    pub p: Option<(u64, u64)>,
+    /// A constraint the endpoint said this task conflicts with.
+    pub blocked: bool,
 }
 
 pub fn decide(task: &TaskView, ctx: &Ctx<'_>) -> Verdict {
@@ -41,11 +45,17 @@ pub fn decide(task: &TaskView, ctx: &Ctx<'_>) -> Verdict {
     if !fits(task, ctx.purse) {
         return Verdict::Deny("purse");
     }
+    if ctx.blocked {
+        return Verdict::Deny("constraint");
+    }
     let expected = ctx
         .samples
         .median(&samples_key(&task.worker, &task.tags))
         .unwrap_or(task.budget.tokens);
-    let ev = expected_value(task.verifier.is_some(), task.value, expected);
+    let ev = match ctx.p {
+        Some((num, den)) => expected_value_p(num, den, task.value, expected),
+        None => expected_value(task.verifier.is_some(), task.value, expected),
+    };
     if ev < i128::from(ctx.cfg.min_ev) {
         return Verdict::Deny("ev");
     }
@@ -59,11 +69,16 @@ pub fn decide(task: &TaskView, ctx: &Ctx<'_>) -> Verdict {
 pub fn expected_value(verified: bool, value: u64, cost: u64) -> i128 {
     // p = 1 with a verifier, 0.5 without. Integer half, so cold unverified
     // passes only when budget <= value/2.
-    let weighted = if verified {
-        i128::from(value)
+    if verified {
+        expected_value_p(1, 1, value, cost)
     } else {
-        i128::from(value) / 2
-    };
+        expected_value_p(1, 2, value, cost)
+    }
+}
+
+pub fn expected_value_p(p_num: u64, p_den: u64, value: u64, cost: u64) -> i128 {
+    let den = i128::from(p_den.max(1));
+    let weighted = i128::from(value).saturating_mul(i128::from(p_num)) / den;
     weighted - i128::from(cost)
 }
 
@@ -152,9 +167,41 @@ mod tests {
             depth: 0,
             cell_ok: true,
             lua_says: None,
+            p: None,
+            blocked: false,
         };
         assert_eq!(decide(&task(200_000, true), &allow), Verdict::Allow);
         assert_eq!(decide(&task(200_001, false), &allow), Verdict::Deny("ev"));
+        assert_eq!(
+            decide(
+                &task(1, true),
+                &Ctx {
+                    p: Some((0, 1)),
+                    ..allow
+                }
+            ),
+            Verdict::Deny("ev")
+        );
+        assert_eq!(
+            decide(
+                &task(250_000, false),
+                &Ctx {
+                    p: Some((1, 1)),
+                    ..allow
+                }
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            decide(
+                &task(1, true),
+                &Ctx {
+                    blocked: true,
+                    ..allow
+                }
+            ),
+            Verdict::Deny("constraint")
+        );
         assert_eq!(
             decide(
                 &task(200_000, true),
@@ -197,6 +244,8 @@ mod tests {
                     depth: 0,
                     cell_ok: true,
                     lua_says: None,
+                    p: None,
+                    blocked: false,
                 },
             );
             times.push(t.elapsed());

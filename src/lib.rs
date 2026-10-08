@@ -2,6 +2,7 @@ pub mod cell;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod decision;
 pub mod error;
 pub mod gate;
 pub mod id;
