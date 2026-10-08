@@ -17,6 +17,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          sudo sysctl -w user.max_user_namespaces=15000
+          unshare --user --map-root-user --mount true
       - run: cargo test
       - name: static musl binary
         run: |

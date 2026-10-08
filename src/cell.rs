@@ -126,9 +126,16 @@ pub fn probe(home: &Path) -> bool {
         Ok(child) => {
             let mut status = 0;
             let pid = unsafe { libc::waitpid(child.pid, &mut status, 0) };
-            pid == child.pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            let ok = pid == child.pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+            if !ok {
+                eprintln!("inlet: cell probe exited {status}");
+            }
+            ok
         }
-        Err(_) => false,
+        Err(e) => {
+            eprintln!("inlet: cell probe failed: {e}");
+            false
+        }
     }
 }
 

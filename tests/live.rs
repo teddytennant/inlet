@@ -182,7 +182,8 @@ fn wait_status(home: &Path, mut pred: impl FnMut(&Value) -> bool) -> Value {
         }
         thread::sleep(Duration::from_millis(40));
     }
-    panic!("timed out waiting for status: {last}");
+    let log = fs::read_to_string(home.join("test-daemon.log")).unwrap_or_default();
+    panic!("timed out waiting for status: {last}\n{log}");
 }
 
 fn read_log(home: &Path) -> Vec<Decoded> {
