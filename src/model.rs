@@ -108,6 +108,13 @@ pub enum Record {
         grant: u64,
         ts: u64,
     },
+    /// Supervisor ran the verifier. `ok` is exit 0.
+    Result {
+        id: String,
+        ok: bool,
+        code: i32,
+        ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -123,9 +130,8 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .and_then(|k| k.as_str())
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
-        "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "kill" | "reset" => {
-            Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
-        }
+        "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "kill" | "reset"
+        | "result" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
         _ => Ok(Decoded::Opaque),
     }
 }

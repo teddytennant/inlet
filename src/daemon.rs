@@ -72,6 +72,12 @@ struct Worker {
     log_len: u64,
 }
 
+struct Check {
+    id: String,
+    pid: i32,
+    started: Instant,
+}
+
 struct Daemon {
     home: PathBuf,
     policy: Policy,
@@ -83,6 +89,7 @@ struct Daemon {
     cmds: Receiver<Incoming>,
     clients: HashMap<u64, Client>,
     workers: Vec<Worker>,
+    checks: Vec<Check>,
     pending: HashMap<String, String>,
     soft: Vec<Record>,
     last_flush: Instant,
@@ -177,6 +184,7 @@ fn run(home: &Path) -> Result<()> {
         cmds,
         clients: HashMap::new(),
         workers: Vec::new(),
+        checks: Vec::new(),
         pending: HashMap::new(),
         soft: Vec::new(),
         last_flush: Instant::now(),
@@ -617,6 +625,18 @@ impl Daemon {
             if pid <= 0 {
                 break;
             }
+            if let Some(pos) = self.checks.iter().position(|check| check.pid == pid) {
+                let id = self.checks.remove(pos).id;
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status) as i32
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    -1
+                };
+                self.complete_check(&id, code)?;
+                continue;
+            }
             let Some(pos) = self.workers.iter().position(|w| w.pid == pid) else {
                 continue;
             };
@@ -636,11 +656,72 @@ impl Daemon {
                 Some("purse") => self.finish(&id, code, "purse", false)?,
                 Some(other) => self.finish(&id, code, other, other != "crash")?,
                 None if signalled => self.crash(&id)?,
+                None if code == 0 && self.has_verifier(&id) => self.start_check(&id)?,
                 None if code == 0 => self.finish(&id, 0, "ok", true)?,
                 None => self.finish(&id, code, "exit", true)?,
             }
         }
         Ok(())
+    }
+
+    fn has_verifier(&self, id: &str) -> bool {
+        self.state
+            .tasks
+            .get(id)
+            .and_then(|task| task.verifier.as_ref())
+            .is_some_and(|cmd| !cmd.is_empty())
+    }
+
+    fn start_check(&mut self, id: &str) -> Result<()> {
+        self.workers.retain(|worker| worker.id != id);
+        if let Some(task) = self.state.tasks.get_mut(id) {
+            task.pid = None;
+        }
+        let verifier = self
+            .state
+            .tasks
+            .get(id)
+            .and_then(|task| task.verifier.clone())
+            .unwrap_or_default();
+        let dir = paths::work(&self.home, id);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(&verifier)
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                self.checks.push(Check {
+                    id: id.to_string(),
+                    pid: child.id() as i32,
+                    started: Instant::now(),
+                });
+                Ok(())
+            }
+            Err(_) => self.finish(id, 127, "verifier", true),
+        }
+    }
+
+    fn complete_check(&mut self, id: &str, code: i32) -> Result<()> {
+        let ok = code == 0;
+        let reason = if ok { "ok" } else { "verifier" };
+        self.finish_with(
+            id,
+            code,
+            reason,
+            true,
+            vec![Record::Result {
+                id: id.to_string(),
+                ok,
+                code,
+                ts: now_ms(),
+            }],
+        )
     }
 
     fn crash(&mut self, id: &str) -> Result<()> {
@@ -677,6 +758,17 @@ impl Daemon {
     }
 
     fn finish(&mut self, id: &str, code: i32, reason: &str, refund_unused: bool) -> Result<()> {
+        self.finish_with(id, code, reason, refund_unused, Vec::new())
+    }
+
+    fn finish_with(
+        &mut self,
+        id: &str,
+        code: i32,
+        reason: &str,
+        refund_unused: bool,
+        mut extra: Vec<Record>,
+    ) -> Result<()> {
         let lent = self
             .state
             .purse
@@ -709,17 +801,15 @@ impl Daemon {
                 false,
             )?;
         }
-        self.commit(
-            &[Record::Exit {
-                id: id.to_string(),
-                code,
-                reason: reason.into(),
-                tokens_used,
-                refund_tokens: refund,
-                ts: now_ms(),
-            }],
-            true,
-        )?;
+        extra.push(Record::Exit {
+            id: id.to_string(),
+            code,
+            reason: reason.into(),
+            tokens_used,
+            refund_tokens: refund,
+            ts: now_ms(),
+        });
+        self.commit(&extra, true)?;
         Ok(())
     }
 
@@ -742,6 +832,17 @@ impl Daemon {
         for id in due {
             self.pending.insert(id.clone(), "timeout".into());
             self.signal(&id, libc::SIGKILL);
+        }
+        let slow: Vec<i32> = self
+            .checks
+            .iter()
+            .filter(|check| check.started.elapsed() >= Duration::from_secs(20))
+            .map(|check| check.pid)
+            .collect();
+        for pid in slow {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
         Ok(())
     }
@@ -1148,6 +1249,10 @@ impl Daemon {
             Record::Task { id, worker, ts, .. } => {
                 (1, json!({"ev":"task","id":id,"worker":worker,"ts":ts}))
             }
+            Record::Result { id, ok, code, ts } => (
+                0,
+                json!({"ev":"result","id":id,"ok":ok,"code":code,"ts":ts}),
+            ),
         };
         self.broadcast(level, value);
     }
@@ -1189,6 +1294,11 @@ impl Daemon {
 
     fn shutdown(&mut self) -> Result<()> {
         self.shutting_down = true;
+        for check in &self.checks {
+            unsafe {
+                libc::kill(check.pid, libc::SIGKILL);
+            }
+        }
         let ids: Vec<String> = self.workers.iter().map(|w| w.id.clone()).collect();
         for id in &ids {
             self.pending.insert(id.clone(), "killed".into());

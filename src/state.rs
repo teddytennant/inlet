@@ -226,7 +226,7 @@ impl State {
             Record::Cost { id, tokens, .. } => {
                 self.purse.note_used(id, *tokens);
             }
-            Record::Kill { .. } | Record::Reset { .. } => {}
+            Record::Kill { .. } | Record::Reset { .. } | Record::Result { .. } => {}
         }
         if let Record::Reset { ts, .. } = rec {
             self.purse.apply_reset(*ts);

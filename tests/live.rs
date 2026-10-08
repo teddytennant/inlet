@@ -916,6 +916,114 @@ fn worker_rpc(home: &Path, body: Value) -> Value {
 }
 
 #[test]
+fn verifier_lands_on_the_ledger() {
+    let home = scratch("verify");
+    policy(
+        &home,
+        &base_policy(
+            r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            bad = { cmd = { "/bin/false" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "job",
+            "--goal",
+            "pass",
+            "--verify",
+            "grep -q hi out",
+            "--tokens",
+            "40",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "pass" && t["state"] == "done")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "pass")
+        .unwrap();
+    assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    assert_eq!(st["available"].as_u64(), Some(1000), "{st}");
+    assert!(read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Result { id, ok: true, .. } if id == task["id"].as_str().unwrap()))
+    }));
+
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "job",
+            "--goal",
+            "fail",
+            "--verify",
+            "/bin/false",
+            "--tokens",
+            "40",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "fail" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "fail")
+        .unwrap();
+    assert_eq!(task["reason"], "verifier", "{st} {}", daemon.log());
+    assert_eq!(st["available"].as_u64(), Some(1000), "{st}");
+    assert!(read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Result { id, ok: false, .. } if id == task["id"].as_str().unwrap()))
+    }));
+
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "bad",
+            "--goal",
+            "exit",
+            "--verify",
+            "/bin/true",
+            "--tokens",
+            "40",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "exit" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "exit")
+        .unwrap();
+    assert_eq!(task["reason"], "exit", "{st} {}", daemon.log());
+    let id = task["id"].as_str().unwrap();
+    assert!(!read_log(&home).iter().any(|d| {
+        matches!(d, Decoded::Rec(r) if matches!(r.as_ref(), Record::Result { id: got, .. } if got == id))
+    }));
+}
+
+#[test]
 fn child_slice_or_deny() {
     let home = scratch("child");
     policy(
