@@ -335,6 +335,7 @@ fn watch(home: &Path, args: &[String]) -> Result<()> {
             bar.println(rendered);
         } else {
             println!("{rendered}");
+            let _ = io::stdout().flush();
         }
         if value.get("ev").and_then(|e| e.as_str()) == Some("reset") && tty {
             bar.set_message(format!(

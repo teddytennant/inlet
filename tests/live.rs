@@ -91,17 +91,23 @@ end
 }
 
 fn start(home: &Path) -> Daemon {
+    start_env(home, &[])
+}
+
+fn start_env(home: &Path, env: &[(&str, &str)]) -> Daemon {
     let _ = fs::remove_file(home.join("run/operator.sock"));
     let _ = fs::remove_file(home.join("run/inlet.pid"));
     let log_path = home.join("test-daemon.log");
     let log = File::create(&log_path).unwrap();
     let err = log.try_clone().unwrap();
-    let mut child = Command::new(bin())
-        .args(["--home", home.to_str().unwrap(), "up", "-f"])
+    let mut cmd = Command::new(bin());
+    cmd.args(["--home", home.to_str().unwrap(), "up", "-f"])
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::from(err));
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().unwrap();
     let sock = home.join("run/operator.sock");
     let deadline = Instant::now() + Duration::from_secs(8);
     let want = child.id() as i32;
@@ -123,6 +129,10 @@ fn start(home: &Path) -> Daemon {
     let _ = child.kill();
     let _ = child.wait();
     panic!("daemon did not come up: {text}");
+}
+
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 fn pid_of(home: &Path) -> Option<i32> {
@@ -195,12 +205,27 @@ fn stop(daemon: &mut Daemon) {
 #[test]
 fn spawn_hides_the_host_and_keeps_the_key() {
     let home = scratch("hide");
-    let ledger_path = home.join("ledger/log");
-    let sock = home.join("run/operator.sock");
+    fs::write(home.join("key"), "KEYMATERIAL\n").unwrap();
+    fs::create_dir_all(home.join("work/other")).unwrap();
+    fs::write(home.join("work/other/mine"), "SIBLING\n").unwrap();
+    let ledger_path = sh_quote(&home.join("ledger/log"));
+    let sock = sh_quote(&home.join("run/operator.sock"));
+    let key = sh_quote(&home.join("key"));
+    let policy_path = sh_quote(&home.join("policy.lua"));
+    let sib = sh_quote(&home.join("work/other/mine"));
+    let work = sh_quote(&home.join("work"));
     let script = format!(
-        "echo OK > /work/result; if [ -e '{}' ]; then echo LEAK; else echo HIDDEN; fi >> /work/result; if [ -S '{}' ]; then echo SOCKLEAK; else echo SOCKOK; fi >> /work/result; if [ -r /proc/1/root/etc/passwd ]; then echo PROCLEAK; else echo PROCOK; fi >> /work/result; sleep 30",
-        ledger_path.display(),
-        sock.display()
+        "echo OK > /work/result
+mark() {{ if [ -e \"$1\" ]; then echo \"$2LEAK\"; else echo \"$2OK\"; fi >> /work/result; }}
+mark {ledger_path} LEDGER
+mark {sock} SOCK
+mark {key} KEY
+mark {policy_path} POLICY
+mark {sib} SIB
+mark {work} WORK
+if [ -e /work/../other/mine ]; then echo SIBWALK >> /work/result; else echo SIBWALKOK >> /work/result; fi
+if [ -r /proc/1/root/etc/passwd ]; then echo PROCLEAK >> /work/result; else echo PROCOK >> /work/result; fi
+sleep 30"
     );
     policy(
         &home,
@@ -213,26 +238,7 @@ fn spawn_hides_the_host_and_keeps_the_key() {
             "",
         ),
     );
-    let log_path = home.join("test-daemon.log");
-    let err = File::create(&log_path).unwrap();
-    let child = Command::new(bin())
-        .args(["--home", home.to_str().unwrap(), "up", "-f"])
-        .env("OPENAI_API_KEY", "sk-hostsecret")
-        .stdout(Stdio::from(err.try_clone().unwrap()))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
-    let daemon = Daemon {
-        home: home.clone(),
-        child,
-        log_path,
-    };
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline
-        && !(home.join("run/operator.sock").exists() && pid_of(&home).is_some())
-    {
-        thread::sleep(Duration::from_millis(20));
-    }
+    let daemon = start_env(&home, &[("OPENAI_API_KEY", "sk-hostsecret")]);
     assert!(home.join("run/operator.sock").exists(), "{}", daemon.log());
     inlet(
         &home,
@@ -286,20 +292,30 @@ fn spawn_hides_the_host_and_keeps_the_key() {
     let mut body = String::new();
     while Instant::now() < deadline {
         if let Ok(text) = fs::read_to_string(&result) {
-            if text.contains("HIDDEN") {
+            if text.contains("SIBWALKOK") {
                 body = text;
                 break;
             }
         }
         thread::sleep(Duration::from_millis(30));
     }
-    assert!(
-        body.contains("HIDDEN"),
-        "result {body} log {}",
-        daemon.log()
-    );
-    assert!(body.contains("SOCKOK"), "{body}");
-    assert!(!body.contains("LEAK"), "{body}");
+    for mark in [
+        "LEDGEROK",
+        "SOCKOK",
+        "KEYOK",
+        "POLICYOK",
+        "SIBOK",
+        "WORKOK",
+        "SIBWALKOK",
+        "PROCOK",
+    ] {
+        assert!(
+            body.contains(mark),
+            "missing {mark} in {body} log {}",
+            daemon.log()
+        );
+    }
+    assert!(!body.contains("LEAK"), "cell leaked a host path: {body}");
 }
 
 #[test]
@@ -329,6 +345,21 @@ fn kill9_charges_the_slice_once() {
     assert_eq!(st["held"].as_u64(), Some(100));
     assert_eq!(st["available"].as_u64(), Some(900));
     let id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let worker_pid = tasks(&st)[0]["pid"].as_i64().unwrap();
+    assert!(
+        Path::new(&format!("/proc/{worker_pid}")).exists(),
+        "worker already gone"
+    );
+    let admits_while_live = read_log(&home)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, Decoded::Rec(b) if matches!(b.as_ref(), Record::Admit { id: i, .. } if i == &id))
+        })
+        .count();
+    assert_eq!(
+        admits_while_live, 1,
+        "admit was not durable before the worker was killed"
+    );
     let pid = pid_of(&home).unwrap();
     unsafe {
         libc::kill(pid, libc::SIGKILL);
@@ -688,6 +719,179 @@ fn proxy_drains_the_purse_and_kills() {
     let st = wait_status(&home, |v| tasks(v).iter().any(|t| t["reason"] == "purse"));
     assert_eq!(st["tasks"][0]["state"], "failed");
     assert_eq!(st["available"].as_u64(), Some(970), "{st}");
+}
+
+#[test]
+fn code_crash_stays_failed() {
+    let home = scratch("code-crash");
+    policy(
+        &home,
+        &base_policy(
+            r#"bomber = { cmd = { "/bin/sh", "-c", "kill -9 $$" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "bomber",
+            "--goal",
+            "boom",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "bomber" && t["state"] == "failed")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "bomber")
+        .unwrap();
+    assert_eq!(task["reason"], "crash", "{st} {}", daemon.log());
+    assert!(task["retry_of"].is_null(), "{st}");
+    assert_eq!(tasks(&st).len(), 1, "{st}");
+    assert_eq!(st["spent"].as_u64(), Some(100));
+    assert_eq!(st["held"].as_u64(), Some(0));
+    assert_eq!(st["available"].as_u64(), Some(900));
+}
+
+#[test]
+fn clean_exit_refunds_the_slice() {
+    let home = scratch("exit");
+    policy(
+        &home,
+        &base_policy(
+            r#"done = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"return "allow""#,
+            "max_tokens = 1000,",
+            "",
+        ),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "done",
+            "--goal",
+            "finish",
+            "--no-verify",
+            "--tokens",
+            "100",
+            "--seconds",
+            "10",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["worker"] == "done" && t["state"] == "done")
+    });
+    let task = tasks(&st)
+        .into_iter()
+        .find(|t| t["worker"] == "done")
+        .unwrap();
+    assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    assert_eq!(st["held"].as_u64(), Some(0));
+    assert_eq!(st["available"].as_u64(), Some(1000), "{st}");
+    assert_eq!(st["spent"].as_u64(), Some(0));
+}
+
+#[test]
+fn slurm_isolator_denies() {
+    let home = scratch("slurm");
+    let body = base_policy("", r#"return "allow""#, "", "")
+        .replace("isolator = \"rlimit\"", "isolator = \"slurm\"");
+    policy(&home, &body);
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "cluster",
+            "--no-verify",
+            "--tokens",
+            "50",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v).iter().any(|t| t["reason"] == "isolator")
+    });
+    assert_eq!(st["live"].as_u64(), Some(0), "{st} {}", daemon.log());
+    assert_eq!(st["tasks"][0]["state"], "failed");
+    assert!(
+        !read_log(&home).iter().any(|d| matches!(
+            d,
+            Decoded::Rec(r) if matches!(r.as_ref(), Record::Spawn { .. })
+        )),
+        "slurm placed a worker"
+    );
+}
+
+#[test]
+fn watch_prints_a_post() {
+    let home = scratch("watch");
+    policy(&home, &base_policy("", r#"return "allow""#, "", ""));
+    let daemon = start(&home);
+    let mut child = Command::new(bin())
+        .args(["--home", home.to_str().unwrap(), "watch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for next in BufReader::new(stdout).lines() {
+            match next {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut line = String::new();
+    let mut posted = false;
+    while Instant::now() < deadline {
+        if !posted {
+            thread::sleep(Duration::from_millis(200));
+            inlet(&home, &["post", "board hello"]);
+            posted = true;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(next) if next.contains("board hello") => {
+                line = next;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        line.contains("operator") && line.contains("board hello"),
+        "watch line {line:?} log {}",
+        daemon.log()
+    );
 }
 
 fn say(home: &Path, text: &str) {
