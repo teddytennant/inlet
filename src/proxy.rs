@@ -24,8 +24,30 @@ pub enum Note {
 }
 
 struct Meter {
-    reserved: u64,
-    used: u64,
+    cap: u64,
+    spent: u64,
+    held: u64,
+    lent: u64,
+}
+
+impl Meter {
+    fn room(&self) -> u64 {
+        self.cap
+            .saturating_sub(self.spent)
+            .saturating_sub(self.held)
+            .saturating_sub(self.lent)
+    }
+}
+
+struct Plan {
+    output: u64,
+    hold: u64,
+}
+
+#[derive(Debug)]
+enum PlanError {
+    Empty,
+    Busy,
 }
 
 struct Inner {
@@ -68,16 +90,56 @@ impl Hub {
         g.tokens.get(token).cloned()
     }
 
-    pub fn insert(&self, id: &str, token: &str, reserved: u64) {
+    pub fn insert(&self, id: &str, token: &str, cap: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.tokens.insert(token.to_string(), id.to_string());
-        g.meters.insert(id.to_string(), Meter { reserved, used: 0 });
+        g.meters.insert(
+            id.to_string(),
+            Meter {
+                cap,
+                spent: 0,
+                held: 0,
+                lent: 0,
+            },
+        );
+    }
+
+    /// Child slice stays out of the parent's room until the child settles.
+    pub fn lend(&self, id: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(meter) = g.meters.get_mut(id) {
+            meter.lent = meter.lent.saturating_add(n);
+        }
+    }
+
+    /// Return a child slice. `used` stays spent; the rest is room again.
+    pub fn reclaim(&self, id: &str, borrowed: u64, used: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(meter) = g.meters.get_mut(id) else {
+            return;
+        };
+        let borrowed = borrowed.min(meter.lent);
+        meter.lent -= borrowed;
+        let charge = used.min(borrowed);
+        let room = meter.room();
+        meter.spent = meter.spent.saturating_add(charge.min(room));
     }
 
     pub fn remove(&self, id: &str) -> u64 {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.tokens.retain(|_, task| task != id);
-        g.meters.remove(id).map(|m| m.used).unwrap_or(0)
+        g.meters
+            .remove(id)
+            .map(|m| {
+                m.spent
+                    .saturating_add(m.held)
+                    .saturating_add(m.lent)
+                    .min(m.cap)
+            })
+            .unwrap_or(0)
     }
 
     fn note(&self, note: Note) {
@@ -153,14 +215,7 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     };
 
     let mut json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let remainder = {
-        let g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.meters
-            .get(&id)
-            .map(|m| m.reserved.saturating_sub(m.used))
-            .unwrap_or(0)
-    };
-    if remainder == 0 || json.is_null() {
+    if json.is_null() {
         hub.note(Note::Empty { id });
         return write_json(
             &mut client,
@@ -168,15 +223,45 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
             r#"{"error":{"type":"empty_purse","message":"stop and post"}}"#,
         );
     }
-    let want = clamp_body(&mut json, remainder);
-    if !reserve(hub, &id, want) {
-        hub.note(Note::Empty { id: id.clone() });
-        return write_json(
-            &mut client,
-            402,
-            r#"{"error":{"type":"empty_purse","message":"stop and post"}}"#,
-        );
-    }
+    let planned = {
+        let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = {
+            let Some(meter) = g.meters.get_mut(&id) else {
+                return write_json(
+                    &mut client,
+                    401,
+                    r#"{"error":{"type":"unauthorized","message":"token"}}"#,
+                );
+            };
+            match plan_request(meter, &json, body.len()) {
+                Ok(plan) => {
+                    apply_output(&mut json, plan.output);
+                    meter.held = meter.held.saturating_add(plan.hold);
+                    Ok(plan)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match decision {
+            Ok(plan) => plan,
+            Err(PlanError::Empty) => {
+                drop(g);
+                hub.note(Note::Empty { id });
+                return write_json(
+                    &mut client,
+                    402,
+                    r#"{"error":{"type":"empty_purse","message":"stop and post"}}"#,
+                );
+            }
+            Err(PlanError::Busy) => {
+                return write_json(
+                    &mut client,
+                    402,
+                    r#"{"error":{"type":"empty_purse","message":"stop and post"}}"#,
+                );
+            }
+        }
+    };
     let payload = serde_json::to_vec(&json)?;
     let upstream = hub
         .inner
@@ -191,7 +276,7 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
         .key
         .clone();
     let Some(upstream) = upstream else {
-        release(hub, &id, want);
+        release_hold(hub, &id, planned.hold);
         return write_json(
             &mut client,
             503,
@@ -205,23 +290,28 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     }
     match forward(&upstream, key.as_deref(), path, &payload, &mut client) {
         Ok((bytes, usage)) => {
-            let actual = usage.unwrap_or(bytes.div_ceil(4)).min(want);
-            let give_back = want.saturating_sub(actual);
-            release(hub, &id, give_back);
-            if actual > 0 {
+            let actual = usage.unwrap_or(bytes.div_ceil(4));
+            let (charge, kill) = settle(hub, &id, planned.hold, actual);
+            if charge > 0 {
                 hub.note(Note::Cost {
                     id: id.clone(),
-                    tokens: actual,
+                    tokens: charge,
                 });
             }
-            if usage.is_some_and(|u| u > want) {
+            if kill {
                 hub.note(Note::Empty { id });
             }
             Ok(())
         }
         Err(e) => {
-            // The reservation stays spent. Fail closed.
-            hub.note(Note::Cost { id, tokens: want });
+            // The hold stays spent. Fail closed. Do not kill unless the purse is actually empty.
+            let charge = settle_fail(hub, &id, planned.hold);
+            if charge > 0 {
+                hub.note(Note::Cost {
+                    id: id.clone(),
+                    tokens: charge,
+                });
+            }
             let _ = write_json(
                 &mut client,
                 502,
@@ -235,44 +325,93 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     }
 }
 
-fn reserve(hub: &Hub, id: &str, n: u64) -> bool {
-    let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(m) = g.meters.get_mut(id) else {
-        return false;
+fn plan_request(
+    meter: &Meter,
+    body: &Value,
+    raw_len: usize,
+) -> std::result::Result<Plan, PlanError> {
+    let room = meter.room();
+    if room == 0 {
+        return Err(if meter.held == 0 {
+            PlanError::Empty
+        } else {
+            PlanError::Busy
+        });
+    }
+    let prompt = (raw_len as u64 / 4).max(1);
+    let output = match explicit_output(body, room) {
+        Some(n) => n,
+        None => (room / 2).max(1).min(room),
     };
-    if m.used.saturating_add(n) > m.reserved {
-        return false;
+    let hold = prompt
+        .saturating_add(output)
+        .min(room)
+        .max(output)
+        .min(room);
+    if hold == 0 {
+        return Err(if meter.held == 0 {
+            PlanError::Empty
+        } else {
+            PlanError::Busy
+        });
     }
-    m.used += n;
-    true
+    Ok(Plan { output, hold })
 }
 
-fn release(hub: &Hub, id: &str, n: u64) {
-    if n == 0 {
-        return;
-    }
-    let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(m) = g.meters.get_mut(id) {
-        m.used = m.used.saturating_sub(n);
-    }
-}
-
-fn clamp_body(body: &mut Value, remainder: u64) -> u64 {
-    let mut saw = false;
-    let mut capped = remainder;
+fn explicit_output(body: &Value, room: u64) -> Option<u64> {
+    let mut capped = None;
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
-            let next = n.min(remainder);
-            body[key] = Value::from(next);
-            capped = capped.min(next);
+            let next = n.min(room);
+            capped = Some(capped.map(|cur: u64| cur.min(next)).unwrap_or(next));
+        }
+    }
+    capped.map(|n| n.max(1).min(room))
+}
+
+fn apply_output(body: &mut Value, output: u64) {
+    let mut saw = false;
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        if body.get(key).is_some() {
+            body[key] = Value::from(output);
             saw = true;
         }
     }
     if !saw {
-        body["max_tokens"] = Value::from(remainder);
-        remainder
-    } else {
-        capped.max(1).min(remainder)
+        body["max_tokens"] = Value::from(output);
+    }
+}
+
+fn settle(hub: &Hub, id: &str, hold: u64, actual: u64) -> (u64, bool) {
+    let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(meter) = g.meters.get_mut(id) else {
+        return (0, false);
+    };
+    meter.held = meter.held.saturating_sub(hold);
+    let room = meter.room();
+    let charge = actual.min(room);
+    meter.spent = meter.spent.saturating_add(charge);
+    (charge, actual > charge)
+}
+
+fn settle_fail(hub: &Hub, id: &str, hold: u64) -> u64 {
+    let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(meter) = g.meters.get_mut(id) else {
+        return 0;
+    };
+    meter.held = meter.held.saturating_sub(hold);
+    let charge = hold.min(meter.room());
+    meter.spent = meter.spent.saturating_add(charge);
+    charge
+}
+
+fn release_hold(hub: &Hub, id: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    let mut g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(meter) = g.meters.get_mut(id) {
+        meter.held = meter.held.saturating_sub(n);
     }
 }
 
@@ -553,7 +692,15 @@ mod tests {
     #[test]
     fn clamp_and_usage() {
         let mut body = serde_json::json!({"max_tokens": 500, "messages": []});
-        assert_eq!(clamp_body(&mut body, 40), 40);
+        let meter = Meter {
+            cap: 40,
+            spent: 0,
+            held: 0,
+            lent: 0,
+        };
+        let plan = plan_request(&meter, &body, body.to_string().len()).unwrap();
+        assert_eq!(plan.output, 40);
+        apply_output(&mut body, plan.output);
         assert_eq!(body["max_tokens"], 40);
         let raw = br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
         assert_eq!(extract_usage(raw), Some(7));
@@ -571,9 +718,67 @@ mod tests {
     fn empty_reserve_fails() {
         let hub = Hub::new(None, None);
         hub.insert("t", "tok", 10);
-        assert!(reserve(&hub, "t", 10));
-        assert!(!reserve(&hub, "t", 1));
-        release(&hub, "t", 4);
-        assert!(reserve(&hub, "t", 4));
+        assert!(hold_n(&hub, "t", 10));
+        assert!(!hold_n(&hub, "t", 1));
+        release_hold(&hub, "t", 4);
+        assert!(hold_n(&hub, "t", 4));
+    }
+
+    #[test]
+    fn unbounded_calls_split_the_room() {
+        let mut meter = Meter {
+            cap: 100,
+            spent: 0,
+            held: 0,
+            lent: 0,
+        };
+        let body = serde_json::json!({"messages": []});
+        let first = plan_request(&meter, &body, 4).unwrap();
+        meter.held += first.hold;
+        let second = plan_request(&meter, &body, 4).unwrap();
+        assert!(first.output >= 40, "{}", first.output);
+        assert!(second.output >= 20, "{}", second.output);
+        assert!(first.hold + second.hold <= 100);
+    }
+
+    #[test]
+    fn usage_above_the_hold_is_charged() {
+        let hub = Hub::new(None, None);
+        hub.insert("t", "tok", 100);
+        {
+            let mut g = hub.inner.lock().unwrap();
+            g.meters.get_mut("t").unwrap().held = 10;
+        }
+        let (charge, kill) = settle(&hub, "t", 10, 22);
+        assert_eq!(charge, 22);
+        assert!(!kill);
+        let g = hub.inner.lock().unwrap();
+        assert_eq!(g.meters.get("t").unwrap().spent, 22);
+    }
+
+    #[test]
+    fn explicit_max_keeps_the_output_cap() {
+        let meter = Meter {
+            cap: 30,
+            spent: 0,
+            held: 0,
+            lent: 0,
+        };
+        let body = serde_json::json!({"max_tokens": 20});
+        let plan = plan_request(&meter, &body, 16).unwrap();
+        assert_eq!(plan.output, 20);
+        assert!(plan.hold <= 30 && plan.hold >= 20);
+    }
+
+    fn hold_n(hub: &Hub, id: &str, n: u64) -> bool {
+        let mut g = hub.inner.lock().unwrap();
+        let Some(meter) = g.meters.get_mut(id) else {
+            return false;
+        };
+        if meter.room() < n {
+            return false;
+        }
+        meter.held += n;
+        true
     }
 }
