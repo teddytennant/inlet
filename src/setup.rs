@@ -3,13 +3,18 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use crossterm::cursor::MoveToPreviousLine;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::ExecutableCommand;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::config::{self, Policy};
 use crate::error::{err, Result};
@@ -25,10 +30,91 @@ struct Answers {
     budget: u64,
     worker: String,
     cmd: Vec<String>,
+    tags: Vec<String>,
+    net: String,
+    on_crash: String,
     passphrase: Option<String>,
     telegram: Option<String>,
     discord: Option<String>,
 }
+
+struct WorkerPreset {
+    name: &'static str,
+    cmd: &'static [&'static str],
+    tags: &'static [&'static str],
+    net: &'static str,
+    on_crash: &'static str,
+}
+
+const UPSTREAMS: &[(&str, &str)] = &[
+    ("OpenAI-compatible", "https://api.openai.com/v1"),
+    ("xAI", "https://api.x.ai/v1"),
+    ("OpenRouter", "https://openrouter.ai/api/v1"),
+    ("local", "http://127.0.0.1:8080/v1"),
+    ("environment", "env:MODEL_UPSTREAM"),
+];
+
+const KEYS: &[(&str, &str)] = &[
+    ("MODEL_API_KEY", "MODEL_API_KEY"),
+    ("OPENAI_API_KEY", "OPENAI_API_KEY"),
+    ("XAI_API_KEY", "XAI_API_KEY"),
+    ("OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+];
+
+const WORKER_CHOICES: &[(&str, &str)] = &[
+    ("check", "/bin/true"),
+    ("sleeper", "/bin/sleep 60"),
+    ("pi", "pi --mode rpc"),
+    ("prover", "prover"),
+];
+
+const WORKER_PRESETS: &[WorkerPreset] = &[
+    WorkerPreset {
+        name: "check",
+        cmd: &["/bin/true"],
+        tags: &["code"],
+        net: "host",
+        on_crash: "fail",
+    },
+    WorkerPreset {
+        name: "sleeper",
+        cmd: &["/bin/sleep", "60"],
+        tags: &["code"],
+        net: "host",
+        on_crash: "fail",
+    },
+    WorkerPreset {
+        name: "pi",
+        cmd: &["pi", "--mode", "rpc"],
+        tags: &["code"],
+        net: "host",
+        on_crash: "fail",
+    },
+    WorkerPreset {
+        name: "prover",
+        cmd: &["prover"],
+        tags: &["math"],
+        net: "none",
+        on_crash: "requeue",
+    },
+];
+
+const UPSTREAM_VALUES: &[&str] = &[
+    "https://api.openai.com/v1",
+    "https://api.x.ai/v1",
+    "https://openrouter.ai/api/v1",
+    "http://127.0.0.1:8080/v1",
+    "env:MODEL_UPSTREAM",
+];
+
+const KEY_VALUES: &[&str] = &[
+    "MODEL_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "OPENROUTER_API_KEY",
+];
+
+const WORKER_NAMES: &[&str] = &["check", "sleeper", "pi", "prover"];
 
 pub fn init(home: &Path, args: &[String]) -> Result<()> {
     let mut smoke = true;
@@ -101,20 +187,7 @@ pub fn settings(home: &Path, args: &[String]) -> Result<()> {
         && env_string("INLET_TELEGRAM_TOKEN").is_none()
         && env_string("INLET_DISCORD_TOKEN").is_none();
     if interactive {
-        print_view(home)?;
-        loop {
-            let field = ask("field", "")?;
-            if field.is_empty() {
-                break;
-            }
-            let value = if field == "telegram" || field == "discord" {
-                ask_secret(&format!("{field} token"))?
-            } else {
-                ask("value", "")?
-            };
-            apply_field(home, &field, &value)?;
-        }
-        return print_view(home);
+        return settings_tty(home);
     }
     if let Some(value) = tokens {
         patch(home, &format!("caps.max_tokens = {value}"))?;
@@ -191,7 +264,7 @@ fn plain_init(home: &Path, answers: &Answers, smoke: bool) -> Result<()> {
     );
     println!("7/{STEPS} writing the policy");
     println!("8/{STEPS} starting the daemon");
-    finish(home, answers, smoke, None)
+    finish(home, answers, smoke)
 }
 
 fn answers_from_env() -> Result<Answers> {
@@ -219,6 +292,9 @@ fn answers_from_env() -> Result<Answers> {
         budget,
         worker,
         cmd,
+        tags: vec!["code".into()],
+        net: "host".into(),
+        on_crash: "fail".into(),
         passphrase,
         telegram: env_string("INLET_TELEGRAM_TOKEN"),
         discord: env_string("INLET_DISCORD_TOKEN"),
@@ -226,84 +302,119 @@ fn answers_from_env() -> Result<Answers> {
 }
 
 fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
-    let bar = ProgressBar::new(STEPS);
-    bar.set_style(
-        ProgressStyle::with_template("{spinner} {pos}/{len} {msg}").map_err(|_| err("progress"))?,
-    );
-    bar.enable_steady_tick(Duration::from_millis(80));
-    bar.set_message("checking the cell");
+    step(1, "cell", "whether this machine can isolate a worker");
+    let bar = spin("checking the cell")?;
     let cell = crate::cell::probe(home);
+    bar.finish_and_clear();
     if cell {
-        bar.set_message("cell ready");
+        println!("cell ready");
     } else {
-        bar.set_message("cell unavailable");
-        bar.suspend(print_cell_fix);
+        println!("cell unavailable");
+        print_cell_fix();
     }
-    bar.set_position(1);
-    bar.set_message("model");
-    let upstream = bar.suspend(|| {
-        let raw = ask("upstream", "env:MODEL_UPSTREAM")?;
-        check_upstream(&raw)
-    })?;
-    let key_env = bar.suspend(|| {
-        let raw = ask("key env", "MODEL_API_KEY")?;
-        check_env_name(&raw)
-    })?;
-    bar.set_position(2);
-    bar.set_message("budgets");
-    let max_tokens = bar.suspend(|| {
-        let raw = ask("max tokens", "2000000")?;
-        parse_tokens(&raw)
-    })?;
-    let period = bar.suspend(|| {
-        let raw = ask("token period", "1d")?;
-        config::parse_period(&raw)?;
-        Ok::<_, crate::error::Error>(raw)
-    })?;
-    let budget = bar.suspend(|| {
-        let raw = ask("budget tokens", "200000")?;
-        parse_tokens(&raw)
-    })?;
-    bar.set_position(3);
-    bar.set_message("worker");
-    let worker = bar.suspend(|| {
-        let raw = ask("worker", "check")?;
-        check_worker(&raw)
-    })?;
-    let cmd = bar.suspend(|| {
-        let raw = ask("command", "/bin/true")?;
-        split_cmd(&raw)
-    })?;
-    bar.set_position(4);
-    bar.set_message("passphrase");
-    let passphrase = bar.suspend(|| ask_secret("passphrase"))?;
-    let passphrase = match passphrase {
-        value if value.is_empty() => None,
-        value if value.len() < 4 => return Err(err("passphrase too short")),
-        value => Some(value),
+
+    step(2, "upstream", "where model calls are sent");
+    let mut picked = index_of(UPSTREAMS, "env:MODEL_UPSTREAM");
+    let upstream = loop {
+        picked = choose(UPSTREAMS, picked)?;
+        let value = UPSTREAMS[picked].1.to_string();
+        if value.starts_with("env:") || probe_upstream(&value).is_ok() {
+            break value;
+        }
+        println!("upstream unreachable");
     };
-    bar.set_position(5);
-    bar.set_message("bridges");
-    let telegram = bar.suspend(|| ask_secret("telegram token"))?;
-    let discord = bar.suspend(|| ask_secret("discord token"))?;
-    bar.set_position(6);
-    bar.set_message("writing the policy");
+
+    step(3, "key", "which environment variable holds the key");
+    let key_env = KEYS[choose(KEYS, 0)?].1.to_string();
+
+    step(4, "worker", "which worker to register");
+    let preset = &WORKER_PRESETS[choose(WORKER_CHOICES, 0)?];
+
+    step(5, "budgets", "the period cap and the default task budget");
+    let max_tokens = validate_tokens(&prompt_text("max tokens", "2000000", false, |raw| {
+        validate_tokens(raw).map(|_| ())
+    })?)?;
+    let period = prompt_text("token period", "1d", false, |raw| {
+        config::parse_period(raw).map(|_| ())
+    })?;
+    let budget = validate_tokens(&prompt_text("budget", "200000", false, |raw| {
+        validate_tokens(raw).map(|_| ())
+    })?)?;
+
+    step(
+        6,
+        "passphrase",
+        "signs the policy. empty leaves it unsigned",
+    );
+    let passphrase = prompt_text("passphrase", "", true, |raw| {
+        if raw.is_empty() || raw.len() >= 4 {
+            Ok(())
+        } else {
+            Err(err("passphrase too short"))
+        }
+    })?;
+    let passphrase = none_if_empty(passphrase);
+
+    step(7, "bridges", "optional bridge tokens. empty skips");
+    let telegram = none_if_empty(prompt_text("telegram", "", true, check_token)?);
+    let discord = none_if_empty(prompt_text("discord", "", true, check_token)?);
+
     let answers = Answers {
         upstream,
         key_env,
         max_tokens,
         period,
         budget,
-        worker,
-        cmd,
+        worker: preset.name.to_string(),
+        cmd: preset.cmd.iter().map(|part| (*part).to_string()).collect(),
+        tags: preset.tags.iter().map(|tag| (*tag).to_string()).collect(),
+        net: preset.net.to_string(),
+        on_crash: preset.on_crash.to_string(),
         passphrase,
-        telegram: none_if_empty(telegram),
-        discord: none_if_empty(discord),
+        telegram,
+        discord,
     };
-    finish(home, &answers, smoke, Some(bar))
+
+    step(8, "daemon", "start inlet and run one smoke task");
+    let bar = spin("writing the policy")?;
+    let wrote = commit(home, &answers);
+    bar.finish_and_clear();
+    wrote?;
+    let bar = spin("starting the daemon")?;
+    let started = if daemon_up(home) {
+        Ok(())
+    } else {
+        spawn_daemon(home)
+    };
+    bar.finish_and_clear();
+    started?;
+    println!("daemon is up");
+    if smoke {
+        let bar = smoke_bar()?;
+        let ran = smoke_task(home, &answers.worker, Some(&bar));
+        if ran.is_ok() {
+            bar.finish();
+        } else {
+            bar.finish_and_clear();
+        }
+        ran?;
+    }
+    print_summary(&answers, cell);
+    Ok(())
 }
 
-fn finish(home: &Path, answers: &Answers, smoke: bool, bar: Option<ProgressBar>) -> Result<()> {
+fn finish(home: &Path, answers: &Answers, smoke: bool) -> Result<()> {
+    commit(home, answers)?;
+    start_daemon(home)?;
+    if smoke {
+        println!("smoke");
+        smoke_task(home, &answers.worker, None)?;
+        println!("smoke ok");
+    }
+    Ok(())
+}
+
+fn commit(home: &Path, answers: &Answers) -> Result<()> {
     let body = render(answers);
     Policy::parse(&body)?;
     let policy = paths::policy(home);
@@ -326,25 +437,6 @@ fn finish(home: &Path, answers: &Answers, smoke: bool, bar: Option<ProgressBar>)
     if let Some(token) = &answers.discord {
         write_token(&home.join("keys/discord.token"), token)?;
     }
-    if let Some(bar) = &bar {
-        bar.set_position(7);
-        bar.set_message("starting the daemon");
-    }
-    start_daemon(home)?;
-    if smoke {
-        if let Some(bar) = &bar {
-            bar.set_message("smoke");
-        } else {
-            println!("smoke");
-        }
-        smoke_task(home, &answers.worker)?;
-        if bar.is_none() {
-            println!("smoke ok");
-        }
-    }
-    if let Some(bar) = bar {
-        bar.finish_with_message("ready");
-    }
     Ok(())
 }
 
@@ -353,6 +445,12 @@ fn render(answers: &Answers) -> String {
         .cmd
         .iter()
         .map(|part| lua_string(part))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tags = answers
+        .tags
+        .iter()
+        .map(|tag| lua_string(tag))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -385,7 +483,7 @@ proxy = {{
   key = {key},
 }}
 workers = {{
-  {worker} = {{ cmd = {{ {cmd} }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+  {worker} = {{ cmd = {{ {cmd} }}, tags = {{ {tags} }}, net = {net}, on_crash = {crash} }},
 }}
 function admit(ctx)
   if ctx.tags.math and ctx.depth > 1 then return "deny" end
@@ -398,6 +496,9 @@ end
         upstream = lua_string(&answers.upstream),
         key = lua_string(&format!("env:{}", answers.key_env)),
         worker = answers.worker,
+        tags = tags,
+        net = lua_string(&answers.net),
+        crash = lua_string(&answers.on_crash),
     )
 }
 
@@ -406,6 +507,10 @@ fn start_daemon(home: &Path) -> Result<()> {
         println!("daemon is up");
         return Ok(());
     }
+    spawn_daemon(home)
+}
+
+fn spawn_daemon(home: &Path) -> Result<()> {
     let log_path = home.join("run/init.log");
     let log = File::create(&log_path)?;
     let err_log = log.try_clone()?;
@@ -432,7 +537,7 @@ fn start_daemon(home: &Path) -> Result<()> {
     Err(err(format!("daemon did not come up: {text}")))
 }
 
-fn smoke_task(home: &Path, worker: &str) -> Result<()> {
+fn smoke_task(home: &Path, worker: &str, bar: Option<&ProgressBar>) -> Result<()> {
     let reply = crate::proto::rpc(
         home,
         serde_json::json!({
@@ -453,35 +558,47 @@ fn smoke_task(home: &Path, worker: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(12);
     while Instant::now() < deadline {
         let status = crate::proto::rpc(home, serde_json::json!({"op":"status"}))?;
-        let done = status
-            .get("tasks")
-            .and_then(|tasks| tasks.as_array())
-            .map(|tasks| {
-                tasks.iter().any(|task| {
-                    task.get("goal").and_then(|g| g.as_str()) == Some("smoke")
-                        && task.get("state").and_then(|s| s.as_str()) == Some("done")
-                })
-            })
-            .unwrap_or(false);
+        let (label, live, queued, done, failed) = smoke_view(&status);
+        if let Some(bar) = bar {
+            let pos = match label {
+                "running" | "blocked" => 80,
+                "done" => 100,
+                "failed" | "killed" => 80,
+                _ => 40,
+            };
+            bar.set_position(pos);
+            bar.set_message(format!("smoke  {label}  live {live}  queued {queued}"));
+        }
         if done {
             return Ok(());
         }
-        let failed = status
-            .get("tasks")
-            .and_then(|tasks| tasks.as_array())
-            .map(|tasks| {
-                tasks.iter().any(|task| {
-                    task.get("goal").and_then(|g| g.as_str()) == Some("smoke")
-                        && task.get("state").and_then(|s| s.as_str()) == Some("failed")
-                })
-            })
-            .unwrap_or(false);
         if failed {
             return Err(err("smoke failed"));
         }
         thread::sleep(Duration::from_millis(40));
     }
     Err(err("smoke timed out"))
+}
+
+fn smoke_view(status: &serde_json::Value) -> (&str, u64, u64, bool, bool) {
+    let live = status.get("live").and_then(|v| v.as_u64()).unwrap_or(0);
+    let queued = status.get("queued").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut label = "queued";
+    let mut done = false;
+    let mut failed = false;
+    if let Some(tasks) = status.get("tasks").and_then(|tasks| tasks.as_array()) {
+        for task in tasks {
+            if task.get("goal").and_then(|g| g.as_str()) != Some("smoke") {
+                continue;
+            }
+            if let Some(state) = task.get("state").and_then(|s| s.as_str()) {
+                label = state;
+                done = state == "done";
+                failed = state == "failed" || state == "killed";
+            }
+        }
+    }
+    (label, live, queued, done, failed)
 }
 
 fn print_view(home: &Path) -> Result<()> {
@@ -562,30 +679,41 @@ fn token_state(path: &Path) -> &'static str {
     }
 }
 
-fn apply_field(home: &Path, field: &str, value: &str) -> Result<()> {
+fn apply_field_with(home: &Path, field: &str, value: &str, pass: Option<&str>) -> Result<()> {
     match field {
-        "max_tokens" => patch(home, &format!("caps.max_tokens = {}", parse_tokens(value)?)),
+        "max_tokens" => patch_pass(
+            home,
+            &format!("caps.max_tokens = {}", parse_tokens(value)?),
+            pass,
+        ),
         "token_period" => {
             config::parse_period(value)?;
-            patch(home, &format!("caps.token_period = {}", lua_string(value)))
+            patch_pass(
+                home,
+                &format!("caps.token_period = {}", lua_string(value)),
+                pass,
+            )
         }
-        "upstream" => patch(
+        "upstream" => patch_pass(
             home,
             &format!("proxy.upstream = {}", lua_string(&check_upstream(value)?)),
+            pass,
         ),
-        "key" => patch(
+        "key" => patch_pass(
             home,
             &format!(
                 "proxy.key = {}",
                 lua_string(&format!("env:{}", check_env_name(value)?))
             ),
+            pass,
         ),
-        "budget" => patch(
+        "budget" => patch_pass(
             home,
             &format!("default_budget.tokens = {}", parse_tokens(value)?),
+            pass,
         ),
-        "worker" => patch_worker(home, Some(&check_worker(value)?), None),
-        "command" => patch_worker(home, None, Some(value)),
+        "worker" => patch_worker_pass(home, Some(&check_worker(value)?), None, pass),
+        "command" => patch_worker_pass(home, None, Some(value), pass),
         "telegram" => write_token(&home.join("keys/telegram.token"), value),
         "discord" => write_token(&home.join("keys/discord.token"), value),
         other => Err(err(format!("unknown field {other}"))),
@@ -593,14 +721,27 @@ fn apply_field(home: &Path, field: &str, value: &str) -> Result<()> {
 }
 
 fn patch(home: &Path, line: &str) -> Result<()> {
+    patch_pass(home, line, None)
+}
+
+fn patch_pass(home: &Path, line: &str, pass: Option<&str>) -> Result<()> {
     let path = paths::policy(home);
     let src = fs::read_to_string(&path)?;
     let next = apply_line(&src, line);
     Policy::parse(&next)?;
-    store_policy(home, &next)
+    store_policy_pass(home, &next, pass)
 }
 
 fn patch_worker(home: &Path, name: Option<&str>, cmd: Option<&str>) -> Result<()> {
+    patch_worker_pass(home, name, cmd, None)
+}
+
+fn patch_worker_pass(
+    home: &Path,
+    name: Option<&str>,
+    cmd: Option<&str>,
+    pass: Option<&str>,
+) -> Result<()> {
     let path = paths::policy(home);
     let src = fs::read_to_string(&path)?;
     let policy = Policy::parse(&src)?;
@@ -635,7 +776,7 @@ fn patch_worker(home: &Path, name: Option<&str>, cmd: Option<&str>) -> Result<()
     );
     let next = apply_line(&src, &line);
     Policy::parse(&next)?;
-    store_policy(home, &next)
+    store_policy_pass(home, &next, pass)
 }
 
 fn apply_line(src: &str, line: &str) -> String {
@@ -670,15 +811,22 @@ fn split_trailer(src: &str) -> (String, BTreeMap<String, String>) {
     (base, have)
 }
 
-fn store_policy(home: &Path, body: &str) -> Result<()> {
+fn store_policy_pass(home: &Path, body: &str, given: Option<&str>) -> Result<()> {
     let signed = paths::policy_sig(home).exists();
     if !signed {
         write_secret(&paths::policy(home), body.as_bytes())?;
         return Ok(());
     }
-    let pass = passphrase()?;
+    let owned;
+    let pass = match given {
+        Some(value) => value,
+        None => {
+            owned = passphrase()?;
+            owned.as_str()
+        }
+    };
     let wrapped = fs::read(paths::key_priv(home)).map_err(|_| err("no signing key"))?;
-    let sig = crate::sign::sign_with(&wrapped, &pass, body.as_bytes())?;
+    let sig = crate::sign::sign_with(&wrapped, pass, body.as_bytes())?;
     if daemon_up(home) {
         fs::write(paths::policy_draft(home), body)?;
         let reply = crate::proto::rpc(
@@ -774,28 +922,6 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
-}
-
-fn ask(label: &str, default: &str) -> Result<String> {
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| err("no tty"))?;
-    if default.is_empty() {
-        writeln!(tty, "{label}")?;
-    } else {
-        writeln!(tty, "{label} [{default}]")?;
-    }
-    tty.flush()?;
-    let mut line = String::new();
-    BufReader::new(tty).read_line(&mut line)?;
-    let line = line.trim();
-    if line.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(line.to_string())
-    }
 }
 
 fn ask_secret(label: &str) -> Result<String> {
@@ -956,6 +1082,747 @@ fn quoted(value: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone)]
+struct Field {
+    name: &'static str,
+    value: String,
+    secret: bool,
+    editable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nav {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Esc,
+    Backspace,
+    Char(char),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectStep {
+    Stay(usize),
+    Pick(usize),
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditStep {
+    Stay,
+    Submit,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsStep {
+    Stay(usize),
+    Edit(usize),
+    Exit,
+}
+
+struct RawGuard;
+
+impl RawGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().map_err(|e| err(e.to_string()))?;
+        Ok(RawGuard)
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+struct Cooked;
+
+impl Cooked {
+    fn enter() -> Result<Self> {
+        disable_raw_mode().map_err(|e| err(e.to_string()))?;
+        Ok(Cooked)
+    }
+}
+
+impl Drop for Cooked {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+    }
+}
+
+fn settings_tty(home: &Path) -> Result<()> {
+    let before = load_fields(home)?;
+    if before
+        .iter()
+        .any(|field| field.name == "cell" && field.value == "unavailable")
+    {
+        print_cell_fix();
+    }
+    let signed = before
+        .iter()
+        .any(|field| field.name == "policy" && field.value == "signed");
+    let hint = if signed {
+        "signed  arrows move, enter edits, esc or q leaves"
+    } else {
+        "unsigned  arrows move, enter edits, esc or q leaves"
+    };
+    println!("{}", dim(hint));
+    let mut rows = before.clone();
+    let mut cursor = 0usize;
+    let mut editing = false;
+    let mut buf = String::new();
+    let mut asking_pass = false;
+    let mut pass_buf = String::new();
+    let mut cache: Option<String> = None;
+    let _raw = RawGuard::enter()?;
+    loop {
+        let lines = draw_settings(&rows, cursor, editing, &buf, asking_pass, &pass_buf);
+        let nav = read_nav()?;
+        if !editing && !asking_pass {
+            match settings_browse(cursor, rows.len(), &nav) {
+                SettingsStep::Exit => break,
+                SettingsStep::Stay(next) => {
+                    rewind(lines);
+                    cursor = next;
+                }
+                SettingsStep::Edit(next) => {
+                    rewind(lines);
+                    cursor = next;
+                    if rows[next].editable {
+                        editing = true;
+                        buf.clear();
+                    }
+                }
+            }
+            continue;
+        }
+        rewind(lines);
+        if asking_pass {
+            match edit_apply(&mut pass_buf, &nav) {
+                EditStep::Stay => {}
+                EditStep::Cancel => {
+                    asking_pass = false;
+                    editing = false;
+                    pass_buf.clear();
+                    buf.clear();
+                }
+                EditStep::Submit => {
+                    if pass_buf.len() < 4 {
+                        emit("passphrase too short");
+                        continue;
+                    }
+                    let name = rows[cursor].name;
+                    let value = buf.clone();
+                    match apply_field_with(home, name, &value, Some(&pass_buf)) {
+                        Ok(()) => {
+                            cache = Some(std::mem::take(&mut pass_buf));
+                            asking_pass = false;
+                            editing = false;
+                            buf.clear();
+                            rows = load_fields(home)?;
+                        }
+                        Err(e) => {
+                            emit(&e.to_string());
+                            pass_buf.clear();
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let presets = field_presets(rows[cursor].name);
+        let current = rows[cursor].value.clone();
+        match editing_key(&mut buf, presets, &current, &nav) {
+            EditStep::Stay => {}
+            EditStep::Cancel => {
+                editing = false;
+                buf.clear();
+            }
+            EditStep::Submit => {
+                if buf.trim().is_empty() {
+                    editing = false;
+                    buf.clear();
+                    continue;
+                }
+                let name = rows[cursor].name;
+                let normalized = match validate_field(name, &buf) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        emit(&e.to_string());
+                        continue;
+                    }
+                };
+                if name == "upstream" && !normalized.starts_with("env:") {
+                    if let Err(e) = probe_upstream_raw(&normalized) {
+                        emit(&e.to_string());
+                        continue;
+                    }
+                }
+                buf = normalized;
+                let needs = signed && name != "telegram" && name != "discord";
+                if needs && cache.is_none() {
+                    asking_pass = true;
+                    continue;
+                }
+                let pass = if needs { cache.as_deref() } else { None };
+                match apply_field_with(home, name, &buf, pass) {
+                    Ok(()) => {
+                        editing = false;
+                        buf.clear();
+                        rows = load_fields(home)?;
+                    }
+                    Err(e) => {
+                        emit(&e.to_string());
+                        if needs {
+                            cache = None;
+                            asking_pass = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(_raw);
+    let after = load_fields(home)?;
+    let before_pairs: Vec<(&str, &str)> = before
+        .iter()
+        .map(|field| (field.name, field.value.as_str()))
+        .collect();
+    let after_pairs: Vec<(&str, &str)> = after
+        .iter()
+        .map(|field| (field.name, field.value.as_str()))
+        .collect();
+    println!("{}", diff_line(&before_pairs, &after_pairs));
+    Ok(())
+}
+
+fn load_fields(home: &Path) -> Result<Vec<Field>> {
+    let src = fs::read_to_string(paths::policy(home))?;
+    let policy = Policy::parse(&src)?;
+    let cfg = &policy.cfg;
+    let (worker, command) = match cfg.workers.iter().next() {
+        Some((name, worker)) => (name.clone(), worker.cmd.join(" ")),
+        None => ("check".into(), "/bin/true".into()),
+    };
+    let cell = if crate::cell::probe(home) {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    let signed = if paths::policy_sig(home).exists() {
+        "signed"
+    } else {
+        "unsigned"
+    };
+    Ok(vec![
+        Field {
+            name: "cell",
+            value: cell.into(),
+            secret: false,
+            editable: false,
+        },
+        Field {
+            name: "max_tokens",
+            value: cfg.caps.max_tokens.to_string(),
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "token_period",
+            value: last_quoted(&src, "token_period").unwrap_or_else(|| "1d".into()),
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "budget",
+            value: cfg.default_budget.tokens.to_string(),
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "upstream",
+            value: last_quoted(&src, "upstream").unwrap_or_else(|| "unset".into()),
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "key",
+            value: last_quoted(&src, "key").unwrap_or_else(|| "unset".into()),
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "worker",
+            value: worker,
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "command",
+            value: command,
+            secret: false,
+            editable: true,
+        },
+        Field {
+            name: "policy",
+            value: signed.into(),
+            secret: false,
+            editable: false,
+        },
+        Field {
+            name: "telegram",
+            value: token_state(&home.join("keys/telegram.token")).into(),
+            secret: true,
+            editable: true,
+        },
+        Field {
+            name: "discord",
+            value: token_state(&home.join("keys/discord.token")).into(),
+            secret: true,
+            editable: true,
+        },
+    ])
+}
+
+fn draw_settings(
+    rows: &[Field],
+    cursor: usize,
+    editing: bool,
+    buf: &str,
+    asking_pass: bool,
+    pass_buf: &str,
+) -> u16 {
+    let mut n = 0u16;
+    for (i, row) in rows.iter().enumerate() {
+        let mark = if i == cursor { ">" } else { " " };
+        let shown = if editing && i == cursor {
+            if buf.is_empty() {
+                dim(&row.value)
+            } else if row.secret {
+                masked(buf)
+            } else {
+                buf.to_string()
+            }
+        } else {
+            row.value.clone()
+        };
+        emit(&format!("{mark} {name:<14}{shown}", name = row.name));
+        n += 1;
+    }
+    if asking_pass {
+        let shown = if pass_buf.is_empty() {
+            dim("passphrase")
+        } else {
+            masked(pass_buf)
+        };
+        emit(&format!("  {shown}"));
+        n += 1;
+    }
+    n
+}
+
+fn step(n: u64, title: &str, hint: &str) {
+    println!("{}  {title}", dim(&format!("{n}/{STEPS}")));
+    println!("{}", dim(hint));
+    let _ = io::stdout().flush();
+}
+
+fn print_summary(answers: &Answers, cell: bool) {
+    row("cell", if cell { "ready" } else { "unavailable" });
+    row("upstream", &answers.upstream);
+    row("key", &answers.key_env);
+    row("max_tokens", &answers.max_tokens.to_string());
+    row("token_period", &answers.period);
+    row("budget", &answers.budget.to_string());
+    row("worker", &answers.worker);
+    row(
+        "policy",
+        if answers.passphrase.is_some() {
+            "signed"
+        } else {
+            "unsigned"
+        },
+    );
+    row(
+        "telegram",
+        if answers.telegram.is_some() {
+            "set"
+        } else {
+            "unset"
+        },
+    );
+    row(
+        "discord",
+        if answers.discord.is_some() {
+            "set"
+        } else {
+            "unset"
+        },
+    );
+    println!();
+    println!("inlet up");
+    println!("inlet add -w {} -g hello --no-verify", answers.worker);
+    println!("inlet");
+}
+
+fn choose(options: &[(&str, &str)], start: usize) -> Result<usize> {
+    let _raw = RawGuard::enter()?;
+    let mut index = start.min(options.len().saturating_sub(1));
+    loop {
+        let lines = draw_choices(options, index);
+        let nav = read_nav()?;
+        rewind(lines);
+        match select_index(index, options.len(), &nav) {
+            SelectStep::Stay(next) => index = next,
+            SelectStep::Pick(picked) => {
+                let (label, value) = options[picked];
+                if value.is_empty() || value == label {
+                    emit(label);
+                } else {
+                    emit(&format!("{label}  {value}"));
+                }
+                return Ok(picked);
+            }
+            SelectStep::Cancel => {}
+        }
+    }
+}
+
+fn draw_choices(options: &[(&str, &str)], index: usize) -> u16 {
+    let mut n = 0u16;
+    for (i, (label, value)) in options.iter().enumerate() {
+        let mark = if i == index { ">" } else { " " };
+        if i == index && *value != *label && !value.is_empty() {
+            emit(&format!("{mark} {label}  {}", dim(value)));
+        } else {
+            emit(&format!("{mark} {label}"));
+        }
+        n += 1;
+    }
+    n
+}
+
+fn prompt_text(
+    label: &str,
+    placeholder: &str,
+    secret: bool,
+    check: impl Fn(&str) -> Result<()>,
+) -> Result<String> {
+    let _raw = RawGuard::enter()?;
+    let mut buf = String::new();
+    loop {
+        let lines = draw_prompt(label, placeholder, &buf, secret);
+        let nav = read_nav()?;
+        rewind(lines);
+        match edit_apply(&mut buf, &nav) {
+            EditStep::Stay => {}
+            EditStep::Cancel => buf.clear(),
+            EditStep::Submit => {
+                let value = if buf.trim().is_empty() {
+                    placeholder.to_string()
+                } else {
+                    buf.trim().to_string()
+                };
+                match check(&value) {
+                    Ok(()) => {
+                        let shown = if secret {
+                            if value.is_empty() {
+                                "skipped".to_string()
+                            } else {
+                                masked(&value)
+                            }
+                        } else {
+                            value.clone()
+                        };
+                        emit(&format!("{label}  {shown}"));
+                        return Ok(value);
+                    }
+                    Err(e) => emit(&e.to_string()),
+                }
+            }
+        }
+    }
+}
+
+fn draw_prompt(label: &str, placeholder: &str, buf: &str, secret: bool) -> u16 {
+    let shown = if buf.is_empty() {
+        let ghost = if placeholder.is_empty() {
+            "skip"
+        } else {
+            placeholder
+        };
+        dim(ghost)
+    } else if secret {
+        masked(buf)
+    } else {
+        buf.to_string()
+    };
+    emit(&format!("{label}  {shown}"));
+    1
+}
+
+fn spin(msg: &str) -> Result<ProgressBar> {
+    let bar = ProgressBar::new_spinner();
+    bar.set_style(ProgressStyle::with_template("{spinner} {msg}").map_err(|_| err("progress"))?);
+    bar.set_draw_target(ProgressDrawTarget::stdout());
+    bar.set_message(msg.to_string());
+    bar.enable_steady_tick(Duration::from_millis(80));
+    Ok(bar)
+}
+
+fn smoke_bar() -> Result<ProgressBar> {
+    let bar = ProgressBar::new(100);
+    bar.set_style(
+        ProgressStyle::with_template("{bar:16} {msg}")
+            .map_err(|_| err("progress"))?
+            .progress_chars("=> "),
+    );
+    bar.set_draw_target(ProgressDrawTarget::stdout());
+    bar.set_position(40);
+    bar.set_message("smoke  queued  live 0  queued 0");
+    Ok(bar)
+}
+
+fn probe_upstream(url: &str) -> Result<()> {
+    let bar = spin("checking the upstream")?;
+    let result = reach_upstream(url);
+    bar.finish_and_clear();
+    result
+}
+
+fn probe_upstream_raw(url: &str) -> Result<()> {
+    let _cooked = Cooked::enter()?;
+    probe_upstream(url)
+}
+
+fn reach_upstream(raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.starts_with("env:") {
+        return Ok(());
+    }
+    let rest = if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else {
+        return Err(err("upstream unreachable"));
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if hostport.is_empty() {
+        return Err(err("upstream unreachable"));
+    }
+    let default_port: u16 = if raw.starts_with("https://") { 443 } else { 80 };
+    let target = if hostport.starts_with('[') || hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:{default_port}")
+    };
+    let addr = match target.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => return Err(err("upstream unreachable")),
+        },
+        Err(_) => return Err(err("upstream unreachable")),
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(800))
+        .map_err(|_| err("upstream unreachable"))?;
+    Ok(())
+}
+
+fn validate_tokens(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    if raw.parse::<u64>().is_err() {
+        return Err(err("tokens are a number"));
+    }
+    parse_tokens(raw)
+}
+
+fn validate_field(name: &str, value: &str) -> Result<String> {
+    match name {
+        "max_tokens" | "budget" => validate_tokens(value).map(|n| n.to_string()),
+        "token_period" => {
+            config::parse_period(value)?;
+            Ok(value.trim().to_string())
+        }
+        "upstream" => check_upstream(value),
+        "key" => check_env_name(value),
+        "worker" => check_worker(value),
+        "command" => {
+            split_cmd(value)?;
+            Ok(value.trim().to_string())
+        }
+        "telegram" | "discord" => check_token(value).map(|()| value.to_string()),
+        other => Err(err(format!("unknown field {other}"))),
+    }
+}
+
+fn check_token(raw: &str) -> Result<()> {
+    if raw.chars().any(|c| c.is_whitespace()) {
+        Err(err("token"))
+    } else {
+        Ok(())
+    }
+}
+
+fn field_presets(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "upstream" => Some(UPSTREAM_VALUES),
+        "key" => Some(KEY_VALUES),
+        "worker" => Some(WORKER_NAMES),
+        _ => None,
+    }
+}
+
+fn index_of(options: &[(&str, &str)], value: &str) -> usize {
+    options
+        .iter()
+        .position(|(_, item)| *item == value)
+        .unwrap_or(0)
+}
+
+fn select_index(index: usize, len: usize, nav: &Nav) -> SelectStep {
+    let last = len.saturating_sub(1);
+    match nav {
+        Nav::Up => SelectStep::Stay(index.saturating_sub(1)),
+        Nav::Down => SelectStep::Stay((index + 1).min(last)),
+        Nav::Enter => SelectStep::Pick(index.min(last)),
+        Nav::Esc => SelectStep::Cancel,
+        _ => SelectStep::Stay(index.min(last)),
+    }
+}
+
+fn edit_apply(buf: &mut String, nav: &Nav) -> EditStep {
+    match nav {
+        Nav::Char(c) if !c.is_control() => {
+            buf.push(*c);
+            EditStep::Stay
+        }
+        Nav::Backspace => {
+            buf.pop();
+            EditStep::Stay
+        }
+        Nav::Enter => EditStep::Submit,
+        Nav::Esc => EditStep::Cancel,
+        _ => EditStep::Stay,
+    }
+}
+
+fn editing_key(buf: &mut String, presets: Option<&[&str]>, current: &str, nav: &Nav) -> EditStep {
+    if let Some(presets) = presets {
+        if matches!(nav, Nav::Left | Nav::Right) && !presets.is_empty() {
+            let base = if buf.is_empty() {
+                current
+            } else {
+                buf.as_str()
+            };
+            *buf = cycle_value(base, presets, nav);
+            return EditStep::Stay;
+        }
+    }
+    edit_apply(buf, nav)
+}
+
+fn cycle_index(index: usize, len: usize, nav: &Nav) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    match nav {
+        Nav::Left => index.min(last).saturating_sub(1),
+        Nav::Right => (index + 1).min(last),
+        _ => index.min(last),
+    }
+}
+
+fn cycle_value(current: &str, presets: &[&str], nav: &Nav) -> String {
+    let stripped = current.strip_prefix("env:").unwrap_or(current);
+    let index = presets
+        .iter()
+        .position(|item| *item == current || *item == stripped)
+        .unwrap_or(0);
+    presets[cycle_index(index, presets.len(), nav)].to_string()
+}
+
+fn settings_browse(cursor: usize, len: usize, nav: &Nav) -> SettingsStep {
+    let last = len.saturating_sub(1);
+    match nav {
+        Nav::Up => SettingsStep::Stay(cursor.saturating_sub(1)),
+        Nav::Down => SettingsStep::Stay((cursor + 1).min(last)),
+        Nav::Enter => SettingsStep::Edit(cursor.min(last)),
+        Nav::Esc => SettingsStep::Exit,
+        Nav::Char('q') => SettingsStep::Exit,
+        _ => SettingsStep::Stay(cursor.min(last)),
+    }
+}
+
+fn masked(secret: &str) -> String {
+    "*".repeat(secret.chars().count())
+}
+
+fn diff_line(before: &[(&str, &str)], after: &[(&str, &str)]) -> String {
+    let mut parts = Vec::new();
+    let n = before.len().min(after.len());
+    for i in 0..n {
+        if before[i].1 != after[i].1 {
+            parts.push(format!("{} {} -> {}", before[i].0, before[i].1, after[i].1));
+        }
+    }
+    if parts.is_empty() {
+        "unchanged".into()
+    } else {
+        format!("changed  {}", parts.join(", "))
+    }
+}
+
+fn dim(text: &str) -> String {
+    format!("\x1b[2m{text}\x1b[0m")
+}
+
+fn emit(line: &str) {
+    let mut out = io::stdout();
+    let _ = write!(out, "{line}\r\n");
+    let _ = out.flush();
+}
+
+fn rewind(n: u16) {
+    if n == 0 {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = out.execute(MoveToPreviousLine(n));
+    let _ = out.execute(Clear(ClearType::FromCursorDown));
+}
+
+fn read_nav() -> Result<Nav> {
+    loop {
+        let ev = event::read().map_err(|e| err(e.to_string()))?;
+        let Event::Key(key) = ev else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Err(err("interrupted"));
+        }
+        let nav = match key.code {
+            KeyCode::Up => Nav::Up,
+            KeyCode::Down => Nav::Down,
+            KeyCode::Left => Nav::Left,
+            KeyCode::Right => Nav::Right,
+            KeyCode::Enter => Nav::Enter,
+            KeyCode::Esc => Nav::Esc,
+            KeyCode::Backspace | KeyCode::Delete => Nav::Backspace,
+            KeyCode::Char(c) => Nav::Char(c),
+            _ => continue,
+        };
+        return Ok(nav);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1843,205 @@ mod tests {
             check_env_name("env:MODEL_API_KEY").unwrap(),
             "MODEL_API_KEY"
         );
+    }
+
+    #[test]
+    fn select_clamps_and_picks() {
+        assert_eq!(select_index(0, 4, &Nav::Up), SelectStep::Stay(0));
+        assert_eq!(select_index(3, 4, &Nav::Down), SelectStep::Stay(3));
+        assert_eq!(select_index(1, 4, &Nav::Down), SelectStep::Stay(2));
+        assert_eq!(select_index(1, 4, &Nav::Enter), SelectStep::Pick(1));
+        assert_eq!(select_index(1, 4, &Nav::Esc), SelectStep::Cancel);
+        assert_eq!(select_index(2, 4, &Nav::Left), SelectStep::Stay(2));
+    }
+
+    #[test]
+    fn edit_pushes_and_submits() {
+        let mut buf = String::new();
+        assert_eq!(edit_apply(&mut buf, &Nav::Char('n')), EditStep::Stay);
+        assert_eq!(edit_apply(&mut buf, &Nav::Char('o')), EditStep::Stay);
+        assert_eq!(edit_apply(&mut buf, &Nav::Backspace), EditStep::Stay);
+        assert_eq!(buf, "n");
+        assert_eq!(edit_apply(&mut buf, &Nav::Enter), EditStep::Submit);
+        assert_eq!(edit_apply(&mut buf, &Nav::Esc), EditStep::Cancel);
+        assert_eq!(buf, "n");
+    }
+
+    #[test]
+    fn editing_cycles_presets_and_types() {
+        let presets = ["check", "sleeper", "pi", "prover"];
+        let mut buf = String::new();
+        assert_eq!(
+            editing_key(&mut buf, Some(&presets), "check", &Nav::Right),
+            EditStep::Stay
+        );
+        assert_eq!(buf, "sleeper");
+        assert_eq!(
+            editing_key(&mut buf, Some(&presets), "check", &Nav::Right),
+            EditStep::Stay
+        );
+        assert_eq!(buf, "pi");
+        assert_eq!(
+            editing_key(&mut buf, Some(&presets), "check", &Nav::Char('x')),
+            EditStep::Stay
+        );
+        assert_eq!(buf, "pix");
+        assert_eq!(
+            editing_key(&mut buf, None, "1d", &Nav::Left),
+            EditStep::Stay
+        );
+        assert_eq!(buf, "pix");
+        let keys = ["MODEL_API_KEY", "OPENAI_API_KEY"];
+        let mut key = String::new();
+        assert_eq!(
+            editing_key(&mut key, Some(&keys), "env:MODEL_API_KEY", &Nav::Right),
+            EditStep::Stay
+        );
+        assert_eq!(key, "OPENAI_API_KEY");
+        assert_eq!(
+            cycle_value("env:MODEL_UPSTREAM", UPSTREAM_VALUES, &Nav::Left),
+            "http://127.0.0.1:8080/v1"
+        );
+        assert_eq!(
+            cycle_value("http://127.0.0.1:8080/v1", UPSTREAM_VALUES, &Nav::Left),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            cycle_value(UPSTREAM_VALUES[0], UPSTREAM_VALUES, &Nav::Left),
+            UPSTREAM_VALUES[0]
+        );
+        assert_eq!(
+            cycle_value(
+                UPSTREAM_VALUES[UPSTREAM_VALUES.len() - 1],
+                UPSTREAM_VALUES,
+                &Nav::Right
+            ),
+            UPSTREAM_VALUES[UPSTREAM_VALUES.len() - 1]
+        );
+    }
+
+    #[test]
+    fn settings_browse_moves_and_leaves() {
+        assert_eq!(settings_browse(0, 3, &Nav::Up), SettingsStep::Stay(0));
+        assert_eq!(settings_browse(2, 3, &Nav::Down), SettingsStep::Stay(2));
+        assert_eq!(settings_browse(1, 3, &Nav::Down), SettingsStep::Stay(2));
+        assert_eq!(settings_browse(1, 3, &Nav::Enter), SettingsStep::Edit(1));
+        assert_eq!(settings_browse(1, 3, &Nav::Esc), SettingsStep::Exit);
+        assert_eq!(settings_browse(1, 3, &Nav::Char('q')), SettingsStep::Exit);
+        assert_eq!(
+            settings_browse(1, 3, &Nav::Char('x')),
+            SettingsStep::Stay(1)
+        );
+    }
+
+    #[test]
+    fn secrets_stay_masked() {
+        let secret = "mint-leaf";
+        let shown = masked(secret);
+        assert_eq!(shown, "*********");
+        assert!(!shown.contains("mint"));
+        assert!(!shown.contains(secret));
+    }
+
+    #[test]
+    fn diff_line_names_the_change() {
+        assert_eq!(
+            diff_line(&[("max_tokens", "1")], &[("max_tokens", "1")]),
+            "unchanged"
+        );
+        assert_eq!(
+            diff_line(
+                &[("max_tokens", "2000000"), ("budget", "200000")],
+                &[("max_tokens", "250000"), ("budget", "200000")]
+            ),
+            "changed  max_tokens 2000000 -> 250000"
+        );
+        assert_eq!(
+            diff_line(
+                &[("max_tokens", "1"), ("budget", "2")],
+                &[("max_tokens", "3"), ("budget", "4")]
+            ),
+            "changed  max_tokens 1 -> 3, budget 2 -> 4"
+        );
+    }
+
+    #[test]
+    fn tokens_and_periods_fail_inline() {
+        assert_eq!(
+            validate_tokens("nope").unwrap_err().to_string(),
+            "tokens are a number"
+        );
+        assert_eq!(
+            validate_tokens("0").unwrap_err().to_string(),
+            "token budget is empty"
+        );
+        assert_eq!(validate_tokens("200").unwrap(), 200);
+        assert_eq!(
+            config::parse_period("yesterday").unwrap_err().to_string(),
+            "bad token_period yesterday"
+        );
+        assert!(config::parse_period("1d").is_ok());
+        assert_eq!(
+            validate_field("worker", "Nope").unwrap_err().to_string(),
+            "bad worker name"
+        );
+    }
+
+    #[test]
+    fn upstream_reach_skips_env_and_refuses_a_closed_port() {
+        assert!(reach_upstream("env:MODEL_UPSTREAM").is_ok());
+        assert_eq!(
+            reach_upstream("http://127.0.0.1:1")
+                .unwrap_err()
+                .to_string(),
+            "upstream unreachable"
+        );
+        assert_eq!(
+            reach_upstream("not a url").unwrap_err().to_string(),
+            "upstream unreachable"
+        );
+    }
+
+    fn sample_answers(worker: &str) -> Answers {
+        Answers {
+            upstream: "env:MODEL_UPSTREAM".into(),
+            key_env: "MODEL_API_KEY".into(),
+            max_tokens: 2_000_000,
+            period: "1d".into(),
+            budget: 200_000,
+            worker: worker.into(),
+            cmd: vec!["/bin/true".into()],
+            tags: vec!["code".into()],
+            net: "host".into(),
+            on_crash: "fail".into(),
+            passphrase: None,
+            telegram: None,
+            discord: None,
+        }
+    }
+
+    #[test]
+    fn prover_preset_is_a_math_worker() {
+        let body = render(&sample_answers("check"));
+        assert!(body.contains(
+            "check = { cmd = { \"/bin/true\" }, tags = { \"code\" }, net = \"host\", on_crash = \"fail\" }"
+        ));
+        Policy::parse(&body).unwrap();
+        let mut answers = sample_answers("prover");
+        answers.cmd = vec!["prover".into()];
+        answers.tags = vec!["math".into()];
+        answers.net = "none".into();
+        answers.on_crash = "requeue".into();
+        let policy = Policy::parse(&render(&answers)).unwrap();
+        assert_eq!(policy.cfg.workers["prover"].net, config::Net::None);
+        assert_eq!(
+            policy.cfg.workers["prover"].on_crash,
+            config::OnCrash::Requeue
+        );
+        assert_eq!(policy.cfg.workers["prover"].tags, vec!["math".to_string()]);
+        assert_eq!(WORKER_PRESETS.len(), WORKER_CHOICES.len());
+        assert_eq!(WORKER_PRESETS[0].name, "check");
+        assert_eq!(WORKER_PRESETS[3].net, "none");
+        assert_eq!(WORKER_PRESETS[3].on_crash, "requeue");
     }
 }
