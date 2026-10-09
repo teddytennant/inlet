@@ -14,11 +14,11 @@ use crossterm::cursor::MoveToPreviousLine;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::ExecutableCommand;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::config::{self, Policy};
 use crate::error::{err, Result};
 use crate::paths;
+use crate::spin::{self, Sink};
 
 const STEPS: u64 = 8;
 
@@ -303,9 +303,10 @@ fn answers_from_env() -> Result<Answers> {
 
 fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
     step(1, "cell", "whether this machine can isolate a worker");
-    let bar = spin("checking the cell")?;
-    let cell = crate::cell::probe(home);
-    bar.finish_and_clear();
+    let cell = {
+        let _hold = spin::Hold::start_on(&spin::CELL, Sink::Stdout)?;
+        crate::cell::probe(home)
+    };
     if cell {
         println!("cell ready");
     } else {
@@ -376,28 +377,25 @@ fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
     };
 
     step(8, "daemon", "start inlet and run one smoke task");
-    let bar = spin("writing the policy")?;
-    let wrote = commit(home, &answers);
-    bar.finish_and_clear();
-    wrote?;
-    let bar = spin("starting the daemon")?;
-    let started = if daemon_up(home) {
-        Ok(())
+    let writing = if answers.passphrase.is_some() {
+        &spin::SIGN
     } else {
-        spawn_daemon(home)
+        &spin::POLICY
     };
-    bar.finish_and_clear();
-    started?;
+    {
+        let _hold = spin::Hold::start_on(writing, Sink::Stdout)?;
+        commit(home, &answers)?;
+    }
+    {
+        let _hold = spin::Hold::start_on(&spin::UP, Sink::Stdout)?;
+        if !daemon_up(home) {
+            spawn_daemon(home)?;
+        }
+    }
     println!("daemon is up");
     if smoke {
-        let bar = smoke_bar()?;
-        let ran = smoke_task(home, &answers.worker, Some(&bar));
-        if ran.is_ok() {
-            bar.finish();
-        } else {
-            bar.finish_and_clear();
-        }
-        ran?;
+        let hold = spin::Hold::start_on(&spin::QUEUED, Sink::Stdout)?;
+        smoke_task(home, &answers.worker, Some(&hold))?;
     }
     print_summary(&answers, cell);
     Ok(())
@@ -537,7 +535,7 @@ fn spawn_daemon(home: &Path) -> Result<()> {
     Err(err(format!("daemon did not come up: {text}")))
 }
 
-fn smoke_task(home: &Path, worker: &str, bar: Option<&ProgressBar>) -> Result<()> {
+fn smoke_task(home: &Path, worker: &str, hold: Option<&spin::Hold>) -> Result<()> {
     let reply = crate::proto::rpc(
         home,
         serde_json::json!({
@@ -559,15 +557,10 @@ fn smoke_task(home: &Path, worker: &str, bar: Option<&ProgressBar>) -> Result<()
     while Instant::now() < deadline {
         let status = crate::proto::rpc(home, serde_json::json!({"op":"status"}))?;
         let (label, live, queued, done, failed) = smoke_view(&status);
-        if let Some(bar) = bar {
-            let pos = match label {
-                "running" | "blocked" => 80,
-                "done" => 100,
-                "failed" | "killed" => 80,
-                _ => 40,
-            };
-            bar.set_position(pos);
-            bar.set_message(format!("smoke  {label}  live {live}  queued {queued}"));
+        if let Some(hold) = hold {
+            if let Some(state) = smoke_spin(label) {
+                hold.show(state, &format!("live {live}  queued {queued}"));
+            }
         }
         if done {
             return Ok(());
@@ -599,6 +592,15 @@ fn smoke_view(status: &serde_json::Value) -> (&str, u64, u64, bool, bool) {
         }
     }
     (label, live, queued, done, failed)
+}
+
+fn smoke_spin(label: &str) -> Option<&'static spin::State> {
+    match label {
+        "queued" => Some(&spin::QUEUED),
+        "running" => Some(&spin::RUNNING),
+        "blocked" => Some(&spin::BLOCKED),
+        _ => None,
+    }
 }
 
 fn print_view(home: &Path) -> Result<()> {
@@ -1564,33 +1566,9 @@ fn draw_prompt(label: &str, placeholder: &str, buf: &str, secret: bool) -> u16 {
     1
 }
 
-fn spin(msg: &str) -> Result<ProgressBar> {
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(ProgressStyle::with_template("{spinner} {msg}").map_err(|_| err("progress"))?);
-    bar.set_draw_target(ProgressDrawTarget::stdout());
-    bar.set_message(msg.to_string());
-    bar.enable_steady_tick(Duration::from_millis(80));
-    Ok(bar)
-}
-
-fn smoke_bar() -> Result<ProgressBar> {
-    let bar = ProgressBar::new(100);
-    bar.set_style(
-        ProgressStyle::with_template("{bar:16} {msg}")
-            .map_err(|_| err("progress"))?
-            .progress_chars("=> "),
-    );
-    bar.set_draw_target(ProgressDrawTarget::stdout());
-    bar.set_position(40);
-    bar.set_message("smoke  queued  live 0  queued 0");
-    Ok(bar)
-}
-
 fn probe_upstream(url: &str) -> Result<()> {
-    let bar = spin("checking the upstream")?;
-    let result = reach_upstream(url);
-    bar.finish_and_clear();
-    result
+    let _hold = spin::Hold::start_on(&spin::UPSTREAM, Sink::Stdout)?;
+    reach_upstream(url)
 }
 
 fn probe_upstream_raw(url: &str) -> Result<()> {

@@ -20,6 +20,7 @@ pub mod registry;
 pub mod setup;
 pub mod sign;
 pub mod snap;
+pub mod spin;
 pub mod state;
 pub mod text;
 pub mod tui;

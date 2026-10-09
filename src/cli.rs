@@ -28,8 +28,13 @@ pub fn run() -> Result<()> {
         }
         Some("up") => {
             let foreground = args.iter().any(|a| a == "-f" || a == "--foreground");
-            daemon::serve(&home, foreground)?;
-            if !foreground {
+            if foreground {
+                daemon::serve(&home, true)?;
+            } else {
+                {
+                    let _hold = crate::spin::Hold::start(&crate::spin::UP)?;
+                    daemon::serve(&home, false)?;
+                }
                 println!("inlet up");
             }
             Ok(())
@@ -56,19 +61,14 @@ pub fn run() -> Result<()> {
         Some("vote") => vote(&home, &args[1..]),
         Some("digest") => {
             let channel = args.get(1).map(String::as_str).unwrap_or("general");
-            let v = proto::rpc(&home, json!({"op":"digest","channel": channel}))?;
-            if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
-                return Err(err(v
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("failed")));
-            }
-            println!("{}", v.get("text").and_then(|t| t.as_str()).unwrap_or(""));
-            Ok(())
+            digest(&home, channel)
         }
         Some("pin") => {
             let name = args.get(1).ok_or_else(|| err("usage: inlet pin <name>"))?;
-            let v = proto::rpc(&home, json!({"op":"pin","name": name}))?;
+            let v = {
+                let _hold = crate::spin::Hold::start(&crate::spin::PIN)?;
+                proto::rpc(&home, json!({"op":"pin","name": name}))?
+            };
             print_ok(&v)
         }
         Some("kill") => {
@@ -144,10 +144,13 @@ fn vote(home: &Path, args: &[String]) -> Result<()> {
     }
     let target = target.ok_or_else(|| err(usage))?;
     let choice = choice.ok_or_else(|| err(usage))?;
-    let v = proto::rpc(
-        home,
-        json!({"op":"vote","target": target, "choice": choice, "channel": channel, "human": human}),
-    )?;
+    let v = {
+        let _hold = crate::spin::Hold::start(&crate::spin::VOTE)?;
+        proto::rpc(
+            home,
+            json!({"op":"vote","target": target, "choice": choice, "channel": channel, "human": human}),
+        )?
+    };
     print_ok(&v)
 }
 
@@ -286,40 +289,86 @@ fn draft_policy(home: &Path) -> Result<()> {
     print_ok(&v)
 }
 
+fn digest(home: &Path, channel: &str) -> Result<()> {
+    let state = digest_spin(home, channel);
+    let v = {
+        let _hold = crate::spin::Hold::start(state)?;
+        proto::rpc(home, json!({"op":"digest","channel": channel}))?
+    };
+    if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
+        return Err(err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("failed")));
+    }
+    println!("{}", v.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+    Ok(())
+}
+
+fn digest_spin(home: &Path, channel: &str) -> &'static crate::spin::State {
+    let Ok(policy) = crate::config::Policy::load(&paths::policy(home)) else {
+        return &crate::spin::ROLLUP;
+    };
+    if policy.cfg.rollup != crate::config::Rollup::Model {
+        return &crate::spin::DIGEST;
+    }
+    if policy.cfg.decision.endpoint.is_none() {
+        return &crate::spin::DIGEST;
+    }
+    let Ok(status) = proto::rpc(home, json!({"op":"status"})) else {
+        return &crate::spin::ROLLUP;
+    };
+    let spent = status
+        .get("gate_spent")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let cap = status.get("gate_cap").and_then(|n| n.as_u64()).unwrap_or(0);
+    let posts = status.get("posts").and_then(|p| p.as_array());
+    let seen = status.get("posts_seen").and_then(|n| n.as_u64());
+    let count = match (posts, seen) {
+        (Some(posts), Some(seen)) if seen == posts.len() as u64 => Some(
+            posts
+                .iter()
+                .filter(|post| post.get("channel").and_then(|c| c.as_str()) == Some(channel))
+                .count(),
+        ),
+        _ => None,
+    };
+    crate::spin::model_digest_state(spent, cap, count)
+}
+
 fn add(home: &Path, args: &[String]) -> Result<()> {
     if let Some(path) = flag(args, "-f").or_else(|| flag(args, "--file")) {
         let tasks = read_jsonl(Path::new(&path))?;
-        let bar = ProgressBar::new(tasks.len() as u64);
-        bar.set_style(
-            ProgressStyle::with_template("intake {bar:28} {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
         let body = json!({
             "op": "add_batch",
             "tasks": tasks.iter().map(proto::task_value).collect::<Vec<_>>(),
         });
-        let v = proto::rpc(home, body)?;
+        let v = {
+            let _hold = crate::spin::Hold::start(&crate::spin::INTAKE)?;
+            proto::rpc(home, body)?
+        };
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
-            bar.abandon();
             return Err(err(v
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("add failed")));
         }
-        bar.set_position(tasks.len() as u64);
         let n = v
             .get("ids")
             .and_then(|i| i.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
-        bar.finish_with_message(format!("{n} queued"));
+        println!("{n} queued");
         return Ok(());
     }
     let task = parse_add_flags(args)?;
     let mut body = proto::task_value(&task);
     body["op"] = json!("add");
-    let v = proto::rpc(home, body)?;
+    let v = {
+        let _hold = crate::spin::Hold::start(&crate::spin::ADD)?;
+        proto::rpc(home, body)?
+    };
     if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
         return Err(err(v
             .get("error")

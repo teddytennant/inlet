@@ -9,11 +9,11 @@ Gastown, reimagined. Kubernetes for AI agents.
     inlet add -w pi -g "fix the flaky test" --no-verify
     inlet
 
-- one static binary, 2.94MB
+- one static binary, 2.95MB
 - scheduler, ledger, token proxy, board, tui
-- 13,426 lines in src/
+- 13,892 lines in src/
 - 2.2MB RSS, empty
-- 102 tests
+- 108 tests
 
 Workers run in a cell. A spend is a ledger record.
 

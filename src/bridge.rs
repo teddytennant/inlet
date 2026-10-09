@@ -48,6 +48,7 @@ pub fn telegram(home: &Path) -> Result<()> {
     let mut writer = stream.try_clone()?;
     writer.write_all(b"{\"op\":\"watch\",\"debug\":0}\n")?;
     writer.flush()?;
+    let _hold = crate::spin::Hold::start(&crate::spin::BRIDGE)?;
     let chat = Arc::new(Mutex::new(only));
     let writer = Arc::new(Mutex::new(writer));
     let poll_writer = Arc::clone(&writer);
