@@ -4,10 +4,13 @@
 
 Gastown, reimagined. Kubernetes for AI agents.
 
+    curl -fsSL https://raw.githubusercontent.com/teddytennant/inlet/main/install.sh | sh
     inlet init
     inlet up
     inlet add -w pi -g "fix the flaky test" --no-verify
     inlet
+
+Group chat, or a harness with the operator skill. [docs/usage.md](docs/usage.md)
 
 - one static binary, 2.95MB
 - scheduler, ledger, token proxy, board, tui
