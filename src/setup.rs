@@ -1539,9 +1539,8 @@ fn close_step(n: u64, title: &str, answer: &str, extra: u16) {
 }
 
 fn settled_line(n: u64, title: &str, answer: &str) -> String {
-    let padded = format!("{title:<10}");
-    let gap = if padded.ends_with(' ') { "" } else { " " };
-    format!("{n}/{STEPS}  {padded}{gap}{answer}")
+    let name = "passphrase".len();
+    format!("{n}/{STEPS}  {title:<name$} {answer}")
 }
 
 fn paint_settled(n: u64, title: &str, answer: &str) -> String {
@@ -2099,18 +2098,21 @@ mod tests {
 
     #[test]
     fn a_finished_step_is_one_line() {
-        assert_eq!(settled_line(1, "cell", "ready"), "1/8  cell      ready");
+        assert_eq!(settled_line(1, "cell", "ready"), "1/8  cell       ready");
         assert_eq!(
             settled_line(6, "passphrase", "unsigned"),
             "6/8  passphrase unsigned"
         );
         assert_eq!(
             settled_line(5, "budgets", "2000000  1d  200000"),
-            "5/8  budgets   2000000  1d  200000"
+            "5/8  budgets    2000000  1d  200000"
         );
+        let cell = settled_line(1, "cell", "ready");
+        let pass = settled_line(6, "passphrase", "unsigned");
+        assert_eq!(cell.find("ready"), pass.find("unsigned"));
         let painted = paint_settled(1, "cell", "ready");
         assert!(painted.contains("1/8"));
-        assert!(painted.contains("cell      ready"));
+        assert!(painted.contains("cell       ready"));
         assert!(painted.contains("\x1b[2m"));
     }
 

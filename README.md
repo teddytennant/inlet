@@ -11,7 +11,7 @@ Gastown, reimagined. Kubernetes for AI agents.
 
 - one static binary, 2.95MB
 - scheduler, ledger, token proxy, board, tui
-- 14,086 lines in src/
+- 14,088 lines in src/
 - 2.2MB RSS, empty
 - 111 tests
 
