@@ -14,6 +14,7 @@ use crossterm::cursor::MoveToPreviousLine;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::ExecutableCommand;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::config::{self, Policy};
 use crate::error::{err, Result};
@@ -302,36 +303,40 @@ fn answers_from_env() -> Result<Answers> {
 }
 
 fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
-    step(1, "cell", "whether this machine can isolate a worker");
+    open_step(1, "cell", "whether this machine can isolate a worker");
     let cell = {
         let _hold = spin::Hold::start_on(&spin::CELL, Sink::Stdout)?;
         crate::cell::probe(home)
     };
-    if cell {
-        println!("cell ready");
-    } else {
-        println!("cell unavailable");
+    close_step(1, "cell", if cell { "ready" } else { "unavailable" }, 0);
+    if !cell {
         print_cell_fix();
     }
 
-    step(2, "upstream", "where model calls are sent");
+    open_step(2, "upstream", "where model calls are sent");
     let mut picked = index_of(UPSTREAMS, "env:MODEL_UPSTREAM");
-    let upstream = loop {
-        picked = choose(UPSTREAMS, picked)?;
-        let value = UPSTREAMS[picked].1.to_string();
-        if value.starts_with("env:") || probe_upstream(&value).is_ok() {
-            break value;
+    let mut upstream_fault: Option<String> = None;
+    let (upstream, upstream_shown) = loop {
+        picked = choose(UPSTREAMS, picked, upstream_fault.as_deref())?;
+        let (label, value) = UPSTREAMS[picked];
+        if value.starts_with("env:") || probe_upstream(value).is_ok() {
+            break (value.to_string(), label);
         }
-        println!("upstream unreachable");
+        upstream_fault = Some("upstream unreachable".to_string());
     };
+    close_step(2, "upstream", upstream_shown, 0);
 
-    step(3, "key", "which environment variable holds the key");
-    let key_env = KEYS[choose(KEYS, 0)?].1.to_string();
+    open_step(3, "key", "which environment variable holds the key");
+    let key_i = choose(KEYS, 0, None)?;
+    let key_env = KEYS[key_i].1.to_string();
+    close_step(3, "key", &key_env, 0);
 
-    step(4, "worker", "which worker to register");
-    let preset = &WORKER_PRESETS[choose(WORKER_CHOICES, 0)?];
+    open_step(4, "worker", "which worker to register");
+    let worker_i = choose(WORKER_CHOICES, 0, None)?;
+    let preset = &WORKER_PRESETS[worker_i];
+    close_step(4, "worker", preset.name, 0);
 
-    step(5, "budgets", "the period cap and the default task budget");
+    open_step(5, "budgets", "the period cap and the default task budget");
     let max_tokens = validate_tokens(&prompt_text("max tokens", "2000000", false, |raw| {
         validate_tokens(raw).map(|_| ())
     })?)?;
@@ -341,8 +346,14 @@ fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
     let budget = validate_tokens(&prompt_text("budget", "200000", false, |raw| {
         validate_tokens(raw).map(|_| ())
     })?)?;
+    close_step(
+        5,
+        "budgets",
+        &format!("{max_tokens}  {period}  {budget}"),
+        3,
+    );
 
-    step(
+    open_step(
         6,
         "passphrase",
         "signs the policy. empty leaves it unsigned",
@@ -355,10 +366,28 @@ fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
         }
     })?;
     let passphrase = none_if_empty(passphrase);
+    close_step(
+        6,
+        "passphrase",
+        if passphrase.is_some() {
+            "signed"
+        } else {
+            "unsigned"
+        },
+        1,
+    );
 
-    step(7, "bridges", "optional bridge tokens. empty skips");
+    open_step(7, "bridges", "optional bridge tokens. empty skips");
     let telegram = none_if_empty(prompt_text("telegram", "", true, check_token)?);
     let discord = none_if_empty(prompt_text("discord", "", true, check_token)?);
+    let telegram_mark = if telegram.is_some() { "set" } else { "unset" };
+    let discord_mark = if discord.is_some() { "set" } else { "unset" };
+    close_step(
+        7,
+        "bridges",
+        &format!("telegram {telegram_mark}  discord {discord_mark}"),
+        2,
+    );
 
     let answers = Answers {
         upstream,
@@ -376,7 +405,7 @@ fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
         discord,
     };
 
-    step(8, "daemon", "start inlet and run one smoke task");
+    open_step(8, "daemon", "start inlet and run one smoke task");
     let writing = if answers.passphrase.is_some() {
         &spin::SIGN
     } else {
@@ -392,10 +421,19 @@ fn answers_from_tty(home: &Path, smoke: bool) -> Result<()> {
             spawn_daemon(home)?;
         }
     }
-    println!("daemon is up");
-    if smoke {
-        let hold = spin::Hold::start_on(&spin::QUEUED, Sink::Stdout)?;
-        smoke_task(home, &answers.worker, Some(&hold))?;
+    let smoke_elapsed = if smoke {
+        let mut bar = SmokeBar::open()?;
+        let ran = smoke_task(home, &answers.worker, Some(&mut bar));
+        let elapsed = bar.stamp();
+        drop(bar);
+        ran?;
+        Some(elapsed)
+    } else {
+        None
+    };
+    close_step(8, "daemon", "up", 0);
+    if let Some(elapsed) = smoke_elapsed {
+        println!("smoke  done  {elapsed}");
     }
     print_summary(&answers, cell);
     Ok(())
@@ -535,7 +573,7 @@ fn spawn_daemon(home: &Path) -> Result<()> {
     Err(err(format!("daemon did not come up: {text}")))
 }
 
-fn smoke_task(home: &Path, worker: &str, hold: Option<&spin::Hold>) -> Result<()> {
+fn smoke_task(home: &Path, worker: &str, bar: Option<&mut SmokeBar>) -> Result<()> {
     let reply = crate::proto::rpc(
         home,
         serde_json::json!({
@@ -556,11 +594,9 @@ fn smoke_task(home: &Path, worker: &str, hold: Option<&spin::Hold>) -> Result<()
     let deadline = Instant::now() + Duration::from_secs(12);
     while Instant::now() < deadline {
         let status = crate::proto::rpc(home, serde_json::json!({"op":"status"}))?;
-        let (label, live, queued, done, failed) = smoke_view(&status);
-        if let Some(hold) = hold {
-            if let Some(state) = smoke_spin(label) {
-                hold.show(state, &format!("live {live}  queued {queued}"));
-            }
+        let (label, _, _, done, failed) = smoke_view(&status);
+        if let Some(bar) = &bar {
+            bar.show(label);
         }
         if done {
             return Ok(());
@@ -600,6 +636,67 @@ fn smoke_spin(label: &str) -> Option<&'static spin::State> {
         "running" => Some(&spin::RUNNING),
         "blocked" => Some(&spin::BLOCKED),
         _ => None,
+    }
+}
+
+struct SmokeBar {
+    bar: Option<ProgressBar>,
+    started: Instant,
+}
+
+impl SmokeBar {
+    fn open() -> Result<Self> {
+        let started = Instant::now();
+        if spin::plain_mode(io::stdout().is_terminal()) {
+            return Ok(Self { bar: None, started });
+        }
+        let bar = ProgressBar::new(100);
+        bar.set_style(
+            ProgressStyle::with_template("{bar:16} {spinner} {msg}")
+                .map_err(|_| err("progress"))?
+                .progress_chars("━━─"),
+        );
+        bar.set_draw_target(ProgressDrawTarget::stdout());
+        bar.set_position(25);
+        bar.set_message(format!(
+            "{}  {}",
+            spin::label(&spin::QUEUED, 0, false),
+            elapsed_label(Duration::ZERO)
+        ));
+        bar.enable_steady_tick(Duration::from_millis(80));
+        Ok(Self {
+            bar: Some(bar),
+            started,
+        })
+    }
+
+    fn show(&self, label: &str) {
+        let Some(bar) = &self.bar else {
+            return;
+        };
+        let pos = match label {
+            "running" | "blocked" => 75,
+            "done" => 100,
+            _ => 25,
+        };
+        bar.set_position(pos);
+        let Some(state) = smoke_spin(label) else {
+            return;
+        };
+        let verb = spin::label(state, spin::tick_at(self.started.elapsed()), false);
+        bar.set_message(format!("{verb}  {}", elapsed_label(self.started.elapsed())));
+    }
+
+    fn stamp(&self) -> String {
+        elapsed_label(self.started.elapsed())
+    }
+}
+
+impl Drop for SmokeBar {
+    fn drop(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.finish_and_clear();
+        }
     }
 }
 
@@ -1426,13 +1523,44 @@ fn draw_settings(
     n
 }
 
-fn step(n: u64, title: &str, hint: &str) {
+fn open_step(n: u64, title: &str, hint: &str) {
+    if n > 1 {
+        println!();
+    }
     println!("{}  {title}", dim(&format!("{n}/{STEPS}")));
     println!("{}", dim(hint));
     let _ = io::stdout().flush();
 }
 
+fn close_step(n: u64, title: &str, answer: &str, extra: u16) {
+    rewind(2 + extra);
+    println!("{}", paint_settled(n, title, answer));
+    let _ = io::stdout().flush();
+}
+
+fn settled_line(n: u64, title: &str, answer: &str) -> String {
+    let padded = format!("{title:<10}");
+    let gap = if padded.ends_with(' ') { "" } else { " " };
+    format!("{n}/{STEPS}  {padded}{gap}{answer}")
+}
+
+fn paint_settled(n: u64, title: &str, answer: &str) -> String {
+    let line = settled_line(n, title, answer);
+    let mark = format!("{n}/{STEPS}");
+    format!("{}{}", dim(&mark), &line[mark.len()..])
+}
+
+fn fault_text(msg: &str) -> String {
+    format!("  ! {msg}")
+}
+
+fn elapsed_label(elapsed: Duration) -> String {
+    let tenths = (elapsed.as_millis() + 50) / 100;
+    format!("{}.{}s", tenths / 10, tenths % 10)
+}
+
 fn print_summary(answers: &Answers, cell: bool) {
+    println!();
     row("cell", if cell { "ready" } else { "unavailable" });
     row("upstream", &answers.upstream);
     row("key", &answers.key_env);
@@ -1465,35 +1593,34 @@ fn print_summary(answers: &Answers, cell: bool) {
         },
     );
     println!();
-    println!("inlet up");
-    println!("inlet add -w {} -g hello --no-verify", answers.worker);
-    println!("inlet");
+    println!("{}", dim("next"));
+    println!("{}", dim("  inlet up"));
+    println!(
+        "{}",
+        dim(&format!(
+            "  inlet add -w {} -g hello --no-verify",
+            answers.worker
+        ))
+    );
+    println!("{}", dim("  inlet"));
 }
 
-fn choose(options: &[(&str, &str)], start: usize) -> Result<usize> {
+fn choose(options: &[(&str, &str)], start: usize, fault: Option<&str>) -> Result<usize> {
     let _raw = RawGuard::enter()?;
     let mut index = start.min(options.len().saturating_sub(1));
     loop {
-        let lines = draw_choices(options, index);
+        let lines = draw_choices(options, index, fault);
         let nav = read_nav()?;
         rewind(lines);
         match select_index(index, options.len(), &nav) {
             SelectStep::Stay(next) => index = next,
-            SelectStep::Pick(picked) => {
-                let (label, value) = options[picked];
-                if value.is_empty() || value == label {
-                    emit(label);
-                } else {
-                    emit(&format!("{label}  {value}"));
-                }
-                return Ok(picked);
-            }
+            SelectStep::Pick(picked) => return Ok(picked),
             SelectStep::Cancel => {}
         }
     }
 }
 
-fn draw_choices(options: &[(&str, &str)], index: usize) -> u16 {
+fn draw_choices(options: &[(&str, &str)], index: usize, fault: Option<&str>) -> u16 {
     let mut n = 0u16;
     for (i, (label, value)) in options.iter().enumerate() {
         let mark = if i == index { ">" } else { " " };
@@ -1502,6 +1629,10 @@ fn draw_choices(options: &[(&str, &str)], index: usize) -> u16 {
         } else {
             emit(&format!("{mark} {label}"));
         }
+        n += 1;
+    }
+    if let Some(msg) = fault {
+        emit(&paint_fault(msg));
         n += 1;
     }
     n
@@ -1515,13 +1646,17 @@ fn prompt_text(
 ) -> Result<String> {
     let _raw = RawGuard::enter()?;
     let mut buf = String::new();
+    let mut fault: Option<String> = None;
     loop {
-        let lines = draw_prompt(label, placeholder, &buf, secret);
+        let lines = draw_prompt(label, placeholder, &buf, secret, fault.as_deref());
         let nav = read_nav()?;
         rewind(lines);
         match edit_apply(&mut buf, &nav) {
             EditStep::Stay => {}
-            EditStep::Cancel => buf.clear(),
+            EditStep::Cancel => {
+                buf.clear();
+                fault = None;
+            }
             EditStep::Submit => {
                 let value = if buf.trim().is_empty() {
                     placeholder.to_string()
@@ -1542,14 +1677,20 @@ fn prompt_text(
                         emit(&format!("{label}  {shown}"));
                         return Ok(value);
                     }
-                    Err(e) => emit(&e.to_string()),
+                    Err(e) => fault = Some(e.to_string()),
                 }
             }
         }
     }
 }
 
-fn draw_prompt(label: &str, placeholder: &str, buf: &str, secret: bool) -> u16 {
+fn draw_prompt(
+    label: &str,
+    placeholder: &str,
+    buf: &str,
+    secret: bool,
+    fault: Option<&str>,
+) -> u16 {
     let shown = if buf.is_empty() {
         let ghost = if placeholder.is_empty() {
             "skip"
@@ -1563,7 +1704,12 @@ fn draw_prompt(label: &str, placeholder: &str, buf: &str, secret: bool) -> u16 {
         buf.to_string()
     };
     emit(&format!("{label}  {shown}"));
-    1
+    let mut n = 1u16;
+    if let Some(msg) = fault {
+        emit(&paint_fault(msg));
+        n += 1;
+    }
+    n
 }
 
 fn probe_upstream(url: &str) -> Result<()> {
@@ -1759,6 +1905,14 @@ fn dim(text: &str) -> String {
     format!("\x1b[2m{text}\x1b[0m")
 }
 
+fn dim_red(text: &str) -> String {
+    format!("\x1b[2;31m{text}\x1b[0m")
+}
+
+fn paint_fault(msg: &str) -> String {
+    dim_red(&fault_text(msg))
+}
+
 fn emit(line: &str) {
     let mut out = io::stdout();
     let _ = write!(out, "{line}\r\n");
@@ -1941,6 +2095,46 @@ mod tests {
             ),
             "changed  max_tokens 1 -> 3, budget 2 -> 4"
         );
+    }
+
+    #[test]
+    fn a_finished_step_is_one_line() {
+        assert_eq!(settled_line(1, "cell", "ready"), "1/8  cell      ready");
+        assert_eq!(
+            settled_line(6, "passphrase", "unsigned"),
+            "6/8  passphrase unsigned"
+        );
+        assert_eq!(
+            settled_line(5, "budgets", "2000000  1d  200000"),
+            "5/8  budgets   2000000  1d  200000"
+        );
+        let painted = paint_settled(1, "cell", "ready");
+        assert!(painted.contains("1/8"));
+        assert!(painted.contains("cell      ready"));
+        assert!(painted.contains("\x1b[2m"));
+    }
+
+    #[test]
+    fn a_fault_is_marked_and_indented() {
+        assert_eq!(fault_text("tokens are a number"), "  ! tokens are a number");
+        assert_eq!(
+            fault_text("upstream unreachable"),
+            "  ! upstream unreachable"
+        );
+        assert_eq!(
+            fault_text("bad token_period yesterday"),
+            "  ! bad token_period yesterday"
+        );
+        let painted = paint_fault("tokens are a number");
+        assert!(painted.contains("  ! tokens are a number"));
+        assert!(painted.contains("\x1b[2;31m"));
+    }
+
+    #[test]
+    fn smoke_elapsed_uses_tenths() {
+        assert_eq!(elapsed_label(Duration::from_millis(0)), "0.0s");
+        assert_eq!(elapsed_label(Duration::from_millis(800)), "0.8s");
+        assert_eq!(elapsed_label(Duration::from_millis(1490)), "1.5s");
     }
 
     #[test]

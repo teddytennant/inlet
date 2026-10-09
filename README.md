@@ -11,9 +11,9 @@ Gastown, reimagined. Kubernetes for AI agents.
 
 - one static binary, 2.95MB
 - scheduler, ledger, token proxy, board, tui
-- 13,892 lines in src/
+- 14,086 lines in src/
 - 2.2MB RSS, empty
-- 108 tests
+- 111 tests
 
 Workers run in a cell. A spend is a ledger record.
 
