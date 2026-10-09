@@ -25,16 +25,12 @@ jobs:
       - name: musl-tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: aarch64 musl toolchain
+      - uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/aarch64-musl.tgz" https://musl.cc/aarch64-linux-musl-cross.tgz
-          sudo tar -C /opt -xzf "$RUNNER_TEMP/aarch64-musl.tgz"
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+        with:
+          target: aarch64-unknown-linux-musl
       - name: build
         env:
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo build --release --target "${{ matrix.target }}"
