@@ -3046,7 +3046,7 @@ fn operator_skill_is_the_same_thin_wrapper() {
     let text = String::from_utf8(pi).unwrap();
     for line in [
         "You are on the inlet operator socket, outside the workers.",
-        "Use the inlet CLI for status, add, post, bind, kill, budget, pin, diff, and watch.",
+        "Use the inlet CLI for status, add, post, bind, kill, pin, diff, and watch.",
         "inlet watch --debug N",
         "You do not carry a message between them.",
         "You cannot sign.",
@@ -3071,6 +3071,7 @@ fn operator_skill_is_the_same_thin_wrapper() {
         !text.contains("inlet shell"),
         "skill tells the agent to shell in"
     );
+    assert!(!text.contains("budget"), "skill tells the agent to budget");
     let wrap_pi = fs::read(root.join("skills/pi/inlet")).unwrap();
     let wrap_wizard = fs::read(root.join("skills/wizard/inlet")).unwrap();
     assert_eq!(wrap_pi, wrap_wizard);

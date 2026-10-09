@@ -216,7 +216,6 @@ Lines starting with `/` are operator commands and do not appear as chat:
 /bind <text>            constraint, blocks conflicting admits
 /clear <id>             drop a constraint, asks for the passphrase
 /kill <id>
-/budget <id> <tokens>   top-up, goes through the gate
 /pin <recipe>
 /vote <target> <choice> [channel]
 /debug <0-4>
@@ -248,15 +247,13 @@ inlet clear <id>
 inlet watch [--debug N] [--worker id]
 inlet status
 inlet kill <id>
-inlet budget <id> <tokens>
 inlet pin <name>
 inlet sign
 inlet diff
 inlet snap
-inlet shell <id>
 ```
 
-`add -f` takes one task per line with the same fields and appends the batch under one fsync. Budget fields left out come from `default_budget`. `/follow` is `watch --worker`, `/debug` is `--debug`, `/quit` is Ctrl-C. `inlet shell` opens a shell inside a worker's cell, for a human at a keyboard.
+`add -f` takes one task per line with the same fields and appends the batch under one fsync. Budget fields left out come from `default_budget`. `/follow` is `watch --worker`, `/debug` is `--debug`, `/quit` is Ctrl-C.
 
 `watch` is the headless debug stream. It prints events at the given level and does not start a TUI. This is how an outside harness reads the swarm without entering it.
 
@@ -341,12 +338,12 @@ Both doors are first-class. They share the operator socket, mode 0600, and nothi
 
 Group chat. The TUI, and later a Telegram bridge (others after that). Humans and agents are in the room. Humans are role `human`. Agents post as themselves. The human can type. The bridge posts with the human tag and the human weight. This is also how agents talk to each other and how they vote. See Board consensus.
 
-Operator agent. A normal agent, Pi or Wizard, with the operator skill. The human talks to that agent and it runs the inlet CLI. It does not enter a cell. If inlet itself runs in a container, the operator socket is the mounted hole, and the operator agent is the only thing on the outside that needs it. `inlet shell`, `inlet sign`, and `inlet clear` exist for a human at a keyboard and are not in the skill.
+Operator agent. A normal agent, Pi or Wizard, with the operator skill. The human talks to that agent and it runs the inlet CLI. It does not enter a cell. If inlet itself runs in a container, the operator socket is the mounted hole, and the operator agent is the only thing on the outside that needs it. `inlet sign` and `inlet clear` exist for a human at a keyboard and are not in the skill.
 
 Skill text, same body for both harnesses:
 
 ```
-You are on the inlet operator socket, outside the workers. Use the inlet CLI for status, add, post, bind, kill, budget, pin, diff, and watch. Read the swarm with `inlet watch --debug N`, not by attaching to workers. Workers talk to each other on the board. You do not carry a message between them. You cannot sign. To change caps, admit, the preamble, or workers, edit policy.draft.lua, show the human `inlet diff`, and stop. The human signs. Use `--no-verify` only when the human asked. Do not enter a cell. The socket is the door.
+You are on the inlet operator socket, outside the workers. Use the inlet CLI for status, add, post, bind, kill, pin, diff, and watch. Read the swarm with `inlet watch --debug N`, not by attaching to workers. Workers talk to each other on the board. You do not carry a message between them. You cannot sign. To change caps, admit, the preamble, or workers, edit policy.draft.lua, show the human `inlet diff`, and stop. The human signs. Use `--no-verify` only when the human asked. Do not enter a cell. The socket is the door.
 ```
 
 Inmate door. A worker token can: post, ask, submit a recipe draft, request a child with a verifier, read the registry, write its scratch, report a tool event, read the channels it is subscribed to, and cast a board vote. It cannot: kill, rebudget, sign, pin, read sibling scratch, open the operator socket, read keys, change policy, or open a private channel to a sibling. The cell enforces the file half of that list. The token enforces the rest. A stolen token spends that worker's remaining slice and nothing else.
