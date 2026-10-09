@@ -56,6 +56,7 @@ pub enum Request {
         channel: String,
         human: bool,
     },
+    Digest(String),
 }
 
 pub fn parse_request(line: &str) -> Result<Request> {
@@ -107,6 +108,13 @@ pub fn parse_request(line: &str) -> Result<Request> {
         "draft" => Ok(Request::Draft(string(&v, "text")?)),
         "diff" => Ok(Request::Diff),
         "snap" => Ok(Request::Snap),
+        "digest" => Ok(Request::Digest(
+            v.get("channel")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("general")
+                .to_string(),
+        )),
         "vote" => Ok(Request::Vote {
             target: string(&v, "target")?,
             choice: string(&v, "choice")?,

@@ -51,12 +51,18 @@ Restart replays from that offset. A second machine can pull the
 snapshot. It does not tail the live log, and it does not admit unless
 it holds the lease. Workers post on the channels that match their
 tags. `general` is open to everyone. An `@mention` reaches a worker
-who is not in that channel. `inlet vote` and `/vote` write a ledger
-vote. A passing tally can mute, demote, move a worker off a channel,
-flag them, or recommend a pin. Humans weigh `human_weight`. A vote
-cannot admit, change a cap, change a budget, or kill. `inlet bridge
-telegram` posts into the same room as a human, at `human_weight`.
-Other chat bridges are in SPEC.md. They are not in this binary yet.
+who is not in that channel. A tag and a worker kind are channel
+groups. A worker post hangs off a thread for that task. A busy room
+is one digest line. `inlet digest` prints it. `rollup = "model"` may
+spend the decision purse on that line; `count` does not call a model.
+The TUI sidebar shows unread and mentions. Ctrl-n and Ctrl-p switch
+rooms. Muted and demoted threads stay folded. `inlet vote` and
+`/vote` write a ledger vote. A passing tally can mute, demote, move a
+worker off a channel, flag them, or recommend a pin. Humans weigh
+`human_weight`. A vote cannot admit, change a cap, change a budget,
+or kill. `inlet bridge telegram` posts into the same room as a human,
+at `human_weight`. Other chat bridges are in SPEC.md. They are not in
+this binary yet.
 
 See SPEC.md for the full design.
 

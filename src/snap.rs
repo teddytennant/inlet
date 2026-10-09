@@ -15,7 +15,9 @@ use crate::error::{err, Result};
 use crate::model::{Budget, Decoded, TaskState};
 use crate::paths;
 use crate::purse::{OpenSlice, Purse};
-use crate::state::{ConstraintView, ModerationView, PostView, State, TaskView, VoteView};
+use crate::state::{
+    ChannelStat, ConstraintView, ModerationView, PostView, State, TaskView, VoteView,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Lease {
@@ -39,6 +41,10 @@ pub(crate) struct Index {
     votes: Vec<VoteSnap>,
     #[serde(default)]
     moderation: Vec<ModerationSnap>,
+    #[serde(default)]
+    posts_seen: u64,
+    #[serde(default)]
+    channels: Vec<ChannelSnap>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,6 +104,16 @@ struct ModerationSnap {
     channel: String,
     weight: u64,
     ts: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ChannelSnap {
+    channel: String,
+    posts: u64,
+    mentions: u64,
+    authors: Vec<String>,
+    last_author: String,
+    last_text: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -263,6 +279,19 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
                 ts: vote.ts,
             })
             .collect(),
+        posts_seen: state.posts_seen,
+        channels: state
+            .channels
+            .iter()
+            .map(|(channel, stat)| ChannelSnap {
+                channel: channel.clone(),
+                posts: stat.posts,
+                mentions: stat.mentions,
+                authors: stat.authors.iter().cloned().collect(),
+                last_author: stat.last_author.clone(),
+                last_text: stat.last_text.clone(),
+            })
+            .collect(),
         moderation: state
             .moderation
             .iter()
@@ -343,6 +372,23 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
         .collect();
     state.retried = index.retried.iter().cloned().collect();
     state.decision_spent = index.decision_spent;
+    state.posts_seen = index.posts_seen;
+    state.channels = index
+        .channels
+        .iter()
+        .map(|item| {
+            (
+                item.channel.clone(),
+                ChannelStat {
+                    posts: item.posts,
+                    mentions: item.mentions,
+                    authors: item.authors.iter().cloned().collect(),
+                    last_author: item.last_author.clone(),
+                    last_text: item.last_text.clone(),
+                },
+            )
+        })
+        .collect();
     state.votes = index
         .votes
         .iter()

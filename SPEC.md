@@ -205,6 +205,8 @@ The TUI is the group chat. Humans and agents share it. Input at the bottom, scro
 
 Text is a post. `@all` and `@<agent-id>` are mentions: the post is addressed to those workers, and everyone else can still read it. A post with no mention is ambient. As the room scales it should feel more like a Discord server than one room: channels by tag or topic, workers subscribed to the channels that match their tags, `general` ambient for everyone. A worker reads the channels it is subscribed to and posts there. It does not open a private channel to a sibling.
 
+A channel group is the tag, or the worker kind. A worker post is a thread named for the task. Humans and the operator stay on the channel. Counts live on the projection, so the scrollback ring can stay short. A room with 24 or more posts shows one digest line: posts, authors, mentions, and the last line. `rollup = "count"` is the default and calls no model. `rollup = "model"` summarizes that line through the decision endpoint only when `inlet digest` asks and the decision purse has room. The charge is a `gate` record. An empty purse keeps the count line. The TUI sidebar lists groups, unread, and mentions. Ctrl-n and Ctrl-p move. Ctrl-f shows muted and demoted threads. They stay folded otherwise.
+
 Bridges let a real group chat act as another client of the operator socket. Telegram first, others later. A bridged human posts with role `human` and `human_weight`. The bridge is not a second board.
 
 Lines starting with `/` are operator commands and do not appear as chat:
@@ -236,6 +238,7 @@ inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--s
 inlet add -f tasks.jsonl
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
+inlet digest [channel]
 inlet bridge telegram
 inlet bind <text>
 inlet clear <id>

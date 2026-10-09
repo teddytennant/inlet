@@ -47,6 +47,18 @@ pub fn run() -> Result<()> {
             print_ok(&v)
         }
         Some("vote") => vote(&home, &args[1..]),
+        Some("digest") => {
+            let channel = args.get(1).map(String::as_str).unwrap_or("general");
+            let v = proto::rpc(&home, json!({"op":"digest","channel": channel}))?;
+            if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
+                return Err(err(v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("failed")));
+            }
+            println!("{}", v.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+            Ok(())
+        }
         Some("pin") => {
             let name = args.get(1).ok_or_else(|| err("usage: inlet pin <name>"))?;
             let v = proto::rpc(&home, json!({"op":"pin","name": name}))?;
@@ -77,6 +89,7 @@ inlet add -f tasks.jsonl
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
 inlet bridge telegram
+inlet digest [channel]
 inlet bind <text>
 inlet clear <id>
 inlet sign

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -16,6 +17,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
+use crate::board::{self, Digest};
 use crate::cli::{self, shell_split};
 use crate::error::{err, Result};
 use crate::paths;
@@ -27,6 +29,30 @@ enum Pending {
     Clear(String),
 }
 
+struct Hit {
+    author: String,
+    text: String,
+    channel: String,
+    thread: String,
+    worker: String,
+}
+
+struct Slot {
+    posts: u32,
+    unread: u32,
+    mentions: u32,
+    authors: BTreeSet<String>,
+    last_author: String,
+    last_text: String,
+}
+
+struct Row {
+    group: String,
+    channel: String,
+    thread: String,
+    label: String,
+}
+
 pub struct Ui {
     pub live: u64,
     pub queued: u64,
@@ -34,10 +60,18 @@ pub struct Ui {
     pub cap: u64,
     pub debug: u64,
     pub follow: Option<String>,
-    pub lines: std::collections::VecDeque<String>,
+    pub lines: VecDeque<String>,
     pub input: String,
     home: PathBuf,
     secret: Option<Pending>,
+    hits: VecDeque<Hit>,
+    slots: BTreeMap<(String, String), Slot>,
+    kinds: HashMap<String, String>,
+    folded: HashSet<String>,
+    show_folded: bool,
+    open_group: String,
+    open_channel: String,
+    open_thread: String,
 }
 
 impl Default for Ui {
@@ -49,10 +83,18 @@ impl Default for Ui {
             cap: 0,
             debug: 1,
             follow: None,
-            lines: std::collections::VecDeque::new(),
+            lines: VecDeque::new(),
             input: String::new(),
             home: PathBuf::new(),
             secret: None,
+            hits: VecDeque::new(),
+            slots: BTreeMap::new(),
+            kinds: HashMap::new(),
+            folded: HashSet::new(),
+            show_folded: false,
+            open_group: "tag:general".into(),
+            open_channel: "general".into(),
+            open_thread: String::new(),
         }
     }
 }
@@ -62,6 +104,18 @@ impl Ui {
         let Ok(value) = serde_json::from_str::<Value>(raw) else {
             return;
         };
+        if let Some(tasks) = value.get("tasks").and_then(|t| t.as_array()) {
+            for task in tasks {
+                if let (Some(id), Some(worker)) = (task["id"].as_str(), task["worker"].as_str()) {
+                    self.kinds.insert(id.to_string(), worker.to_string());
+                }
+            }
+        }
+        if let Some(items) = value.get("moderation").and_then(|m| m.as_array()) {
+            for item in items {
+                self.note_fold(item);
+            }
+        }
         if let Some(posts) = value.get("posts").and_then(|p| p.as_array()) {
             for post in posts {
                 self.push_post(post);
@@ -102,12 +156,9 @@ impl Ui {
                 short(value["target"].as_str().unwrap_or(""))
             )),
             Some("moderation") => {
+                self.note_fold(&value);
                 let action = value["action"].as_str().unwrap_or("");
                 let target = value["target"].as_str().unwrap_or("");
-                if action == "mute" {
-                    let prefix = format!("{target}  ");
-                    self.lines.retain(|line| !line.starts_with(&prefix));
-                }
                 self.push(format!("moderation {action} {}", short(target)));
             }
             Some("admit") | Some("spawn") | Some("kill") | Some("task") | Some("reset") => {
@@ -121,10 +172,130 @@ impl Ui {
         }
     }
 
+    fn note_fold(&mut self, item: &Value) {
+        let action = item["action"].as_str().unwrap_or("");
+        let target = item["target"].as_str().unwrap_or("");
+        if matches!(action, "mute" | "demote") && !target.is_empty() {
+            self.folded.insert(target.to_string());
+        }
+    }
+
     fn push_post(&mut self, post: &Value) {
-        let author = post["author"].as_str().unwrap_or("?");
-        let text = post["text"].as_str().unwrap_or("");
-        self.push(format!("{author}  {text}"));
+        let author = post["author"].as_str().unwrap_or("?").to_string();
+        let role = post["role"].as_str().unwrap_or("").to_string();
+        let text = post["text"].as_str().unwrap_or("").to_string();
+        let channel = post
+            .get("channel")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .unwrap_or("general")
+            .to_string();
+        let worker = post
+            .get("worker")
+            .and_then(|w| w.as_str())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.kinds.get(&author).cloned())
+            .unwrap_or_default();
+        let thread = board::thread_of(&role, &author);
+        let mentions = post
+            .get("mentions")
+            .and_then(|m| m.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|m| m.as_str())
+                    .filter(|m| *m == "all" || *m == "you")
+                    .count()
+            })
+            .unwrap_or_else(|| {
+                crate::text::mentions(&text)
+                    .into_iter()
+                    .filter(|m| m == "all" || m == "you")
+                    .count()
+            });
+        let folded = self.folded.contains(&author);
+        self.bump(
+            &format!("tag:{channel}"),
+            "",
+            &author,
+            &text,
+            mentions,
+            folded,
+        );
+        if !thread.is_empty() {
+            self.bump(
+                &format!("tag:{channel}"),
+                &thread,
+                &author,
+                &text,
+                mentions,
+                folded,
+            );
+        }
+        if !worker.is_empty() {
+            self.bump(
+                &format!("kind:{worker}"),
+                "",
+                &author,
+                &text,
+                mentions,
+                folded,
+            );
+            if !thread.is_empty() {
+                self.bump(
+                    &format!("kind:{worker}"),
+                    &thread,
+                    &author,
+                    &text,
+                    mentions,
+                    folded,
+                );
+            }
+        }
+        if self.hits.len() >= RING {
+            self.hits.pop_front();
+        }
+        self.hits.push_back(Hit {
+            author,
+            text,
+            channel,
+            thread,
+            worker,
+        });
+    }
+
+    fn bump(
+        &mut self,
+        group: &str,
+        thread: &str,
+        author: &str,
+        text: &str,
+        mentions: usize,
+        folded: bool,
+    ) {
+        let open = self.open_group == group && self.open_thread == thread;
+        let slot = self
+            .slots
+            .entry((group.to_string(), thread.to_string()))
+            .or_insert_with(|| Slot {
+                posts: 0,
+                unread: 0,
+                mentions: 0,
+                authors: BTreeSet::new(),
+                last_author: String::new(),
+                last_text: String::new(),
+            });
+        slot.posts = slot.posts.saturating_add(1);
+        if !folded && !open {
+            slot.unread = slot.unread.saturating_add(1);
+        }
+        if mentions > 0 && !folded {
+            slot.mentions = slot.mentions.saturating_add(1);
+        }
+        slot.authors.insert(author.to_string());
+        slot.last_author = author.to_string();
+        slot.last_text = text.to_string();
     }
 
     fn push(&mut self, line: String) {
@@ -135,20 +306,187 @@ impl Ui {
     }
 
     pub fn visible(&self) -> Vec<String> {
-        self.lines
+        let mut out = self.room_lines();
+        if self.open_channel == "general" && self.open_thread.is_empty() {
+            out.extend(self.lines.iter().cloned());
+        }
+        match &self.follow {
+            Some(id) => out.into_iter().filter(|line| line.contains(id)).collect(),
+            None => out,
+        }
+    }
+
+    fn room_lines(&self) -> Vec<String> {
+        let slot = self
+            .slots
+            .get(&(self.open_group.clone(), self.open_thread.clone()));
+        let posts = slot.map(|s| s.posts).unwrap_or(0) as usize;
+        if posts >= board::ROLLUP_AT {
+            let item = Digest {
+                posts,
+                authors: slot.map(|s| s.authors.len()).unwrap_or(0),
+                mentions: slot.map(|s| s.mentions).unwrap_or(0) as usize,
+                last_author: slot.map(|s| s.last_author.clone()).unwrap_or_default(),
+                last_text: slot.map(|s| s.last_text.clone()).unwrap_or_default(),
+            };
+            let scope = if self.open_thread.is_empty() {
+                self.open_channel.clone()
+            } else {
+                short(&self.open_thread).to_string()
+            };
+            return vec![board::digest_line(&scope, &item)];
+        }
+        self.hits
             .iter()
-            .filter(|line| match &self.follow {
-                Some(id) => line.contains(id),
-                None => true,
-            })
-            .cloned()
+            .filter(|hit| self.hit_open(hit))
+            .map(|hit| format!("{}  {}", hit.author, hit.text))
             .collect()
+    }
+
+    fn hit_open(&self, hit: &Hit) -> bool {
+        if self.folded.contains(&hit.author) && !self.show_folded {
+            return false;
+        }
+        if self.open_group.starts_with("kind:") {
+            let kind = self.open_group.trim_start_matches("kind:");
+            if hit.worker != kind {
+                return false;
+            }
+        } else if hit.channel != self.open_channel {
+            return false;
+        }
+        if self.open_thread.is_empty() {
+            true
+        } else {
+            hit.thread == self.open_thread
+        }
+    }
+
+    pub fn sidebar(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut folded_here = 0u32;
+        let rows = self.rows();
+        let mut last_group = String::new();
+        for row in &rows {
+            if row.group != last_group {
+                lines.push(group_label(&row.group));
+                last_group = row.group.clone();
+            }
+            let mark = if row.group == self.open_group
+                && row.channel == self.open_channel
+                && row.thread == self.open_thread
+            {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(format!("{mark}{}", row.label));
+        }
+        for (group, thread) in self.slots.keys() {
+            if group.starts_with("tag:")
+                && *group == self.open_group
+                && !thread.is_empty()
+                && self.folded.contains(thread)
+            {
+                folded_here += 1;
+            }
+        }
+        if folded_here > 0 && !self.show_folded {
+            lines.push(format!("  {folded_here} folded"));
+        }
+        if lines.is_empty() {
+            lines.push("general".into());
+            lines.push(" ># general".into());
+        }
+        lines
+    }
+
+    fn rows(&self) -> Vec<Row> {
+        let mut groups = BTreeSet::new();
+        for (group, _) in self.slots.keys() {
+            groups.insert(group.clone());
+        }
+        groups.insert("tag:general".into());
+        let mut ordered: Vec<String> = groups.into_iter().collect();
+        ordered.sort_by(|a, b| group_rank(a).cmp(&group_rank(b)).then(a.cmp(b)));
+        let mut rows = Vec::new();
+        for group in ordered {
+            let channel = group
+                .trim_start_matches("tag:")
+                .trim_start_matches("kind:")
+                .to_string();
+            let slot = self.slots.get(&(group.clone(), String::new()));
+            rows.push(Row {
+                group: group.clone(),
+                channel: channel.clone(),
+                thread: String::new(),
+                label: format!("# {channel}  {}", counts(slot)),
+            });
+            if group != self.open_group {
+                continue;
+            }
+            let mut threads: Vec<(&str, &Slot)> = self
+                .slots
+                .iter()
+                .filter(|((g, thread), _)| g == &group && !thread.is_empty())
+                .map(|((_, thread), slot)| (thread.as_str(), slot))
+                .filter(|(thread, _)| self.show_folded || !self.folded.contains(*thread))
+                .collect();
+            threads.sort_by(|a, b| b.1.posts.cmp(&a.1.posts).then(a.0.cmp(b.0)));
+            for (thread, slot) in threads.into_iter().take(12) {
+                rows.push(Row {
+                    group: group.clone(),
+                    channel: channel.clone(),
+                    thread: thread.to_string(),
+                    label: format!("  {}  {}", short(thread), counts(Some(slot))),
+                });
+            }
+        }
+        rows
+    }
+
+    fn open_row(&mut self, delta: isize) {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return;
+        }
+        let cur = rows
+            .iter()
+            .position(|row| {
+                row.group == self.open_group
+                    && row.channel == self.open_channel
+                    && row.thread == self.open_thread
+            })
+            .unwrap_or(0);
+        let n = rows.len() as isize;
+        let next = (cur as isize + delta).rem_euclid(n) as usize;
+        self.open_group = rows[next].group.clone();
+        self.open_channel = rows[next].channel.clone();
+        self.open_thread = rows[next].thread.clone();
+        if let Some(slot) = self
+            .slots
+            .get_mut(&(self.open_group.clone(), self.open_thread.clone()))
+        {
+            slot.unread = 0;
+        }
     }
 
     /// Returns a line to send, or quit.
     pub fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return KeyAction::Quit;
+        }
+        if code == KeyCode::Char('n') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_row(1);
+            return KeyAction::None;
+        }
+        if code == KeyCode::Char('p') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_row(-1);
+            return KeyAction::None;
+        }
+        if code == KeyCode::Char('f') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.show_folded = !self.show_folded;
+            return KeyAction::None;
         }
         match code {
             KeyCode::Esc => {
@@ -323,7 +661,9 @@ impl Ui {
                 return KeyAction::None;
             }
         };
-        if self.lines.iter().any(|line| line.contains(&passphrase)) {
+        if self.lines.iter().any(|line| line.contains(&passphrase))
+            || self.hits.iter().any(|hit| hit.text.contains(&passphrase))
+        {
             self.push("passphrase leaked into the scrollback".into());
         }
         match pending {
@@ -341,6 +681,37 @@ pub enum KeyAction {
     None,
     Quit,
     Send(String),
+}
+
+fn group_label(group: &str) -> String {
+    if let Some(name) = group.strip_prefix("kind:") {
+        name.to_string()
+    } else if let Some(name) = group.strip_prefix("tag:") {
+        name.to_string()
+    } else {
+        group.to_string()
+    }
+}
+
+fn group_rank(group: &str) -> u8 {
+    if group == "tag:general" {
+        0
+    } else if group.starts_with("tag:") {
+        1
+    } else {
+        2
+    }
+}
+
+fn counts(slot: Option<&Slot>) -> String {
+    let Some(slot) = slot else {
+        return "0".into();
+    };
+    if slot.mentions > 0 {
+        format!("{} @{}", slot.unread, slot.mentions)
+    } else {
+        format!("{}", slot.unread)
+    }
 }
 
 pub fn draw(frame: &mut Frame, ui: &Ui) {
@@ -363,8 +734,17 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
         Paragraph::new(status).style(Style::default().fg(Color::Cyan)),
         chunks[0],
     );
+    let body = if chunks[1].width >= 48 {
+        let split =
+            Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).split(chunks[1]);
+        let side: Vec<Line> = ui.sidebar().into_iter().map(Line::from).collect();
+        frame.render_widget(Paragraph::new(side), split[0]);
+        split[1]
+    } else {
+        chunks[1]
+    };
     let lines: Vec<Line> = ui.visible().into_iter().map(Line::from).collect();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
     let prompt = if ui.secret.is_some() {
         format!("passphrase {}", "*".repeat(ui.input.chars().count()))
     } else {
@@ -534,5 +914,59 @@ mod tests {
             KeyAction::Quit => panic!("quit"),
         }
         assert!(ui.lines.iter().all(|line| !line.contains("keyboard-cat")));
+    }
+
+    #[test]
+    fn sidebar_switches_and_folds() {
+        let mut ui = Ui::default();
+        ui.on_line(r#"{"ev":"post","author":"w1","role":"worker","text":"secret","channel":"code","worker":"sleeper"}"#);
+        ui.on_line(r#"{"ev":"post","author":"you","role":"human","text":"hello @all","channel":"general"}"#);
+        let side = ui.sidebar().join("\n");
+        assert!(side.contains("general"), "{side}");
+        assert!(side.contains("code"), "{side}");
+        assert!(side.contains("sleeper"), "{side}");
+        assert!(side.contains('@'), "{side}");
+        ui.key(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(ui.open_channel, "code");
+        assert!(ui.visible().iter().any(|line| line.contains("secret")));
+        ui.on_line(r#"{"ev":"moderation","action":"mute","target":"w1"}"#);
+        let side = ui.sidebar().join("\n");
+        assert!(side.contains("folded"), "{side}");
+        assert!(ui.visible().iter().all(|line| !line.contains("secret")));
+        ui.key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(ui.visible().iter().any(|line| line.contains("secret")));
+        ui.on_line(r#"{"ev":"moderation","action":"demote","target":"w1"}"#);
+        ui.key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(ui.visible().iter().all(|line| !line.contains("secret")));
+    }
+
+    #[test]
+    fn thousands_of_posts_stay_a_digest() {
+        let mut ui = Ui::default();
+        let started = std::time::Instant::now();
+        for i in 0..4_000 {
+            ui.on_line(&format!(
+                r#"{{"ev":"post","author":"w{i}","role":"worker","text":"n","channel":"code","worker":"sleeper"}}"#
+            ));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sidebar took {:?}",
+            started.elapsed()
+        );
+        ui.key(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let lines = ui.visible();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("4000 posts"), "{}", lines[0]);
+        assert!(lines[0].contains("4000 workers"), "{}", lines[0]);
+        let side = ui.sidebar();
+        assert!(side.iter().any(|line| line.contains("code")), "{side:?}");
+        assert!(side.iter().any(|line| line.contains("sleeper")), "{side:?}");
+        assert!(side.len() < 40, "{side:?}");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let drawn = std::time::Instant::now();
+        term.draw(|frame| draw(frame, &ui)).unwrap();
+        assert!(drawn.elapsed() < Duration::from_millis(200));
     }
 }

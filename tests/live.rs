@@ -5058,3 +5058,161 @@ fn telegram_bridge_posts_as_human() {
     let _ = bridge.wait();
     let _ = daemon;
 }
+
+fn flood_operator(home: &Path, n: usize) {
+    let mut sock = UnixStream::connect(home.join("run/operator.sock")).unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut body = String::new();
+    for i in 0..n {
+        if i % 10 == 0 {
+            body.push_str(&format!(r#"{{"op":"post","text":"@all n{i}"}}"#));
+        } else {
+            body.push_str(&format!(r#"{{"op":"post","text":"n{i}"}}"#));
+        }
+        body.push('\n');
+        if body.len() > 32 * 1024 {
+            sock.write_all(body.as_bytes()).unwrap();
+            body.clear();
+        }
+    }
+    if !body.is_empty() {
+        sock.write_all(body.as_bytes()).unwrap();
+    }
+}
+
+#[test]
+fn swarm_rollup_stays_responsive() {
+    let home = scratch("swarm");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "swarm",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "40",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    for i in 0..30 {
+        let text = if i == 0 {
+            "@all code-line".to_string()
+        } else {
+            format!("code-{i}")
+        };
+        let posted = worker_rpc(
+            &home,
+            serde_json::json!({"op":"post","token": token, "channel":"code","text": text}),
+        );
+        assert_eq!(posted["ok"], true, "{posted}");
+    }
+    let flood = Instant::now();
+    flood_operator(&home, 2000);
+    wait_status(&home, |v| v["posts_seen"].as_u64().unwrap_or(0) >= 2030);
+    assert!(
+        flood.elapsed() < Duration::from_secs(15),
+        "flood took {:?}",
+        flood.elapsed()
+    );
+    let status_at = Instant::now();
+    let again = status(&home);
+    assert!(
+        status_at.elapsed() < Duration::from_secs(2),
+        "status took {:?}",
+        status_at.elapsed()
+    );
+    assert!(again["posts_seen"].as_u64().unwrap_or(0) >= 2030, "{again}");
+    assert_eq!(again["gate_spent"].as_u64(), Some(0), "{again}");
+    let general = inlet(&home, &["digest"]);
+    let general = String::from_utf8_lossy(&general.stdout);
+    assert!(
+        general.contains("2000 posts") && general.contains("200 mentions"),
+        "{general}"
+    );
+    let code = inlet(&home, &["digest", "code"]);
+    let code = String::from_utf8_lossy(&code.stdout);
+    assert!(
+        code.contains("30 posts") && code.contains("1 mentions"),
+        "{code}"
+    );
+    stop(&mut daemon);
+    let scan = Instant::now();
+    let log = read_log(&home);
+    assert!(
+        scan.elapsed() < Duration::from_secs(2),
+        "scan took {:?}",
+        scan.elapsed()
+    );
+    let posts = log
+        .iter()
+        .filter(|rec| matches!(rec, Decoded::Rec(b) if matches!(b.as_ref(), Record::Post { .. })))
+        .count();
+    assert!(posts >= 2030, "{posts}");
+    assert!(
+        !log.iter().any(|rec| {
+            matches!(rec, Decoded::Rec(b) if matches!(b.as_ref(), Record::Gate { .. }))
+        }),
+        "rollup called a model"
+    );
+}
+
+#[test]
+fn model_rollup_uses_the_purse() {
+    let reply = br#"{"choices":[{"message":{"content":"quiet room"}}],"usage":{"total_tokens":7}}"#;
+    let fake = fake_decision(Arc::new(|_| DecisionReply::Body(reply.to_vec())));
+    let home = scratch("rollup-model");
+    let body = format!(
+        "{}\nrollup = \"model\"\n",
+        decision_policy("", fake.port, "purse_tokens = 20,\n")
+    );
+    policy(&home, &body);
+    let daemon = start(&home);
+    flood_operator(&home, 24);
+    wait_status(&home, |v| v["posts_seen"].as_u64().unwrap_or(0) >= 24);
+    let out = inlet(&home, &["digest"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("quiet room"), "{text}");
+    let st = status(&home);
+    assert_eq!(st["gate_spent"].as_u64(), Some(7), "{st}");
+    let hits = wait_bodies(&fake, |hits| !hits.is_empty());
+    assert!(
+        hits.iter().any(|hit| hit.body.contains("rollup")),
+        "{hits:?}"
+    );
+    let _ = daemon;
+
+    let skipped = fake_decision(Arc::new(|_| DecisionReply::Body(reply.to_vec())));
+    let empty = scratch("rollup-empty");
+    let body = format!(
+        "{}\nrollup = \"model\"\n",
+        decision_policy("", skipped.port, "purse_tokens = 0,\n")
+    );
+    policy(&empty, &body);
+    let daemon = start(&empty);
+    flood_operator(&empty, 24);
+    wait_status(&empty, |v| v["posts_seen"].as_u64().unwrap_or(0) >= 24);
+    let out = inlet(&empty, &["digest"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("24 posts"), "{text}");
+    assert!(!text.contains("quiet room"), "{text}");
+    assert_eq!(status(&empty)["gate_spent"].as_u64(), Some(0));
+    thread::sleep(Duration::from_millis(200));
+    assert!(skipped.hits.lock().unwrap().is_empty());
+    let _ = daemon;
+}

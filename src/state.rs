@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::config::{Config, OnCrash};
 use crate::gate::samples_key;
@@ -99,6 +99,17 @@ pub struct State {
     /// Last vote per (voter, target, channel). Earlier votes stay in the log.
     pub votes: BTreeMap<(String, String, String), VoteView>,
     pub moderation: Vec<ModerationView>,
+    pub posts_seen: u64,
+    pub channels: BTreeMap<String, ChannelStat>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChannelStat {
+    pub posts: u64,
+    pub mentions: u64,
+    pub authors: BTreeSet<String>,
+    pub last_author: String,
+    pub last_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +153,8 @@ impl State {
             fence: 0,
             votes: BTreeMap::new(),
             moderation: Vec::new(),
+            posts_seen: 0,
+            channels: BTreeMap::new(),
         }
     }
 
@@ -292,6 +305,15 @@ impl State {
                     mentions: mentions.clone(),
                     ts: *ts,
                 });
+                self.posts_seen = self.posts_seen.saturating_add(1);
+                let stat = self.channels.entry(channel.clone()).or_default();
+                stat.posts = stat.posts.saturating_add(1);
+                if !mentions.is_empty() {
+                    stat.mentions = stat.mentions.saturating_add(1);
+                }
+                stat.authors.insert(author.clone());
+                stat.last_author = author.clone();
+                stat.last_text = text.clone();
             }
             Record::Cost { id, tokens, .. } => {
                 self.purse.note_used(id, *tokens);

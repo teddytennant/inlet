@@ -90,6 +90,21 @@ pub struct WorkerCfg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rollup {
+    Count,
+    Model,
+}
+
+impl Rollup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rollup::Count => "count",
+            Rollup::Model => "model",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionKind {
     Off,
     OpenAi,
@@ -136,6 +151,7 @@ pub struct Config {
     pub decision: DecisionCfg,
     pub proxy: ProxyCfg,
     pub workers: BTreeMap<String, WorkerCfg>,
+    pub rollup: Rollup,
 }
 
 pub struct Policy {
@@ -279,6 +295,9 @@ fn read_config(lua: &Lua) -> Result<Config> {
     if let Some(v) = g.get::<Option<i64>>("debug")? {
         cfg.debug = v.clamp(0, 4) as u8;
     }
+    if let Some(v) = g.get::<Option<String>>("rollup")? {
+        cfg.rollup = parse_rollup(&v)?;
+    }
     if let Some(v) = g.get::<Option<String>>("preamble")? {
         if !v.is_empty() {
             cfg.preamble = Some(v);
@@ -387,6 +406,14 @@ fn parse_decision_kind(v: &str) -> Result<DecisionKind> {
         "openai" => Ok(DecisionKind::OpenAi),
         "jev" => Ok(DecisionKind::Jev),
         other => Err(err(format!("unknown decision.kind {other}"))),
+    }
+}
+
+fn parse_rollup(v: &str) -> Result<Rollup> {
+    match v {
+        "count" => Ok(Rollup::Count),
+        "model" => Ok(Rollup::Model),
+        other => Err(err(format!("unknown rollup {other}"))),
     }
 }
 
@@ -526,6 +553,7 @@ pub fn preset(setup: &str) -> Config {
             key: None,
         },
         workers: BTreeMap::new(),
+        rollup: Rollup::Count,
     }
 }
 

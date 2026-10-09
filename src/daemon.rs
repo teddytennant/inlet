@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::board;
 use crate::cell::{self, SpawnRequest};
-use crate::config::{AdmitCtx, DecisionKind, OnCrash, Policy};
+use crate::config::{AdmitCtx, DecisionKind, OnCrash, Policy, Rollup};
 use crate::decision::{self, Answer, Call, ConstraintIn, Header, PostIn};
 use crate::error::{err, Result};
 use crate::gate::{self, Verdict};
@@ -1239,6 +1239,10 @@ impl Daemon {
                 self.hub.set_debug(self.max_debug());
                 self.reply(id, self.status_json());
             }
+            Request::Digest(channel) => match self.digest_channel(&channel) {
+                Ok(body) => self.reply(id, body),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
             Request::Vote {
                 target,
                 choice,
@@ -1732,6 +1736,7 @@ impl Daemon {
             })).collect::<Vec<_>>(),
             "lease": self.holder,
             "fence": self.fence,
+            "posts_seen": self.state.posts_seen,
             "snap_offset": self.snap_offset,
             "tasks": tasks,
             "posts": self.state.posts.iter().filter(|post| board::operator_sees(&self.state, post)).map(post_json).collect::<Vec<_>>(),
@@ -1744,6 +1749,61 @@ impl Daemon {
                 "ts": item.ts,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    fn digest_channel(&mut self, channel: &str) -> Result<Value> {
+        let channel = if channel.is_empty() {
+            "general"
+        } else {
+            channel
+        };
+        let stat = self.state.channels.get(channel);
+        let posts = stat.map(|s| s.posts).unwrap_or(0) as usize;
+        let mentions = stat.map(|s| s.mentions).unwrap_or(0) as usize;
+        let authors = stat.map(|s| s.authors.len()).unwrap_or(0);
+        let last_author = stat.map(|s| s.last_author.clone()).unwrap_or_default();
+        let last_text = stat.map(|s| s.last_text.clone()).unwrap_or_default();
+        let item = board::Digest {
+            posts,
+            authors,
+            mentions,
+            last_author,
+            last_text,
+        };
+        let line = board::digest_line(channel, &item);
+        let spent = self.state.decision_spent;
+        let cap = self.policy.cfg.decision.purse_tokens;
+        let want_model = self.policy.cfg.rollup == Rollup::Model
+            && board::model_allowed(spent, cap, posts)
+            && self.policy.cfg.decision.endpoint.is_some();
+        if !want_model {
+            return Ok(json!({"ok": true, "text": line, "model": false, "posts": posts}));
+        }
+        let endpoint = self
+            .policy
+            .cfg
+            .decision
+            .endpoint
+            .clone()
+            .unwrap_or_default();
+        let timeout = Duration::from_millis(self.policy.cfg.decision.timeout_ms.max(1));
+        match decision::summarize(&endpoint, &line, timeout) {
+            Ok((summary, tokens)) => {
+                let left = cap.saturating_sub(spent);
+                let charge = tokens.min(left).max(1);
+                self.commit(
+                    &[Record::Gate {
+                        tokens: charge,
+                        ts: now_ms(),
+                    }],
+                    true,
+                )?;
+                Ok(
+                    json!({"ok": true, "text": summary, "model": true, "posts": posts, "tokens": charge}),
+                )
+            }
+            Err(_) => Ok(json!({"ok": true, "text": line, "model": false, "posts": posts})),
+        }
     }
 
     fn tag_blocked(&self, task: &crate::state::TaskView) -> bool {

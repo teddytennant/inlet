@@ -6,6 +6,8 @@ use crate::error::{err, Result};
 use crate::state::{PostView, State};
 
 pub const GENERAL: &str = "general";
+/// A channel busier than this shows a digest instead of the raw posts.
+pub const ROLLUP_AT: usize = 24;
 
 pub struct Passing {
     pub target: String,
@@ -100,6 +102,77 @@ pub fn show_post(state: &State, reader: &str, tags: &[String], post: &PostView) 
 
 pub fn operator_sees(state: &State, post: &PostView) -> bool {
     !muted(state, &post.author)
+}
+
+/// Worker posts hang off the task. Humans and the operator stay on the channel.
+pub fn thread_of(role: &str, author: &str) -> String {
+    if role == "worker" && !author.is_empty() {
+        author.to_string()
+    } else {
+        String::new()
+    }
+}
+
+pub fn tag_group(channel: &str) -> String {
+    if channel.is_empty() {
+        GENERAL.to_string()
+    } else {
+        channel.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Digest {
+    pub posts: usize,
+    pub authors: usize,
+    pub mentions: usize,
+    pub last_author: String,
+    pub last_text: String,
+}
+
+pub struct Brief<'a> {
+    pub author: &'a str,
+    pub text: &'a str,
+    pub mentions: usize,
+}
+
+pub fn digest<'a>(posts: impl IntoIterator<Item = Brief<'a>>) -> Digest {
+    let mut out = Digest {
+        posts: 0,
+        authors: 0,
+        mentions: 0,
+        last_author: String::new(),
+        last_text: String::new(),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for post in posts {
+        out.posts += 1;
+        if seen.insert(post.author.to_string()) {
+            out.authors += 1;
+        }
+        if post.mentions > 0 {
+            out.mentions += 1;
+        }
+        out.last_author = post.author.to_string();
+        out.last_text = post.text.to_string();
+    }
+    out
+}
+
+pub fn digest_line(scope: &str, item: &Digest) -> String {
+    let last = if item.last_author.is_empty() {
+        String::new()
+    } else {
+        format!("  last {} {}", item.last_author, item.last_text)
+    };
+    format!(
+        "{scope}  {} posts, {} workers, {} mentions{last}",
+        item.posts, item.authors, item.mentions
+    )
+}
+
+pub fn model_allowed(spent: u64, cap: u64, posts: usize) -> bool {
+    posts >= ROLLUP_AT && spent < cap
 }
 
 /// Winning choice weighs at least `human_weight` and more than every other choice.
@@ -272,5 +345,29 @@ mod tests {
         assert_eq!(weight_for("human", 4, true), 0);
         assert_eq!(weight_for("worker", 4, false), 1);
         assert_eq!(weight_for("operator", 4, false), 1);
+    }
+
+    #[test]
+    fn a_busy_channel_is_one_line() {
+        let posts: Vec<Brief> = (0..40)
+            .map(|i| Brief {
+                author: if i % 2 == 0 { "a" } else { "b" },
+                text: "ping",
+                mentions: usize::from(i == 3),
+            })
+            .collect();
+        let item = digest(posts);
+        assert_eq!(item.posts, 40);
+        assert_eq!(item.authors, 2);
+        assert_eq!(item.mentions, 1);
+        let line = digest_line("code", &item);
+        assert!(line.contains("40 posts"));
+        assert!(line.contains("2 workers"));
+        assert!(!model_allowed(10, 10, 40));
+        assert!(!model_allowed(0, 10, 3));
+        assert!(model_allowed(0, 10, 40));
+        assert_eq!(thread_of("worker", "abc"), "abc");
+        assert!(thread_of("human", "you").is_empty());
+        assert_eq!(tag_group(""), "general");
     }
 }

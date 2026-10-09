@@ -141,6 +141,52 @@ pub fn ask(endpoint: &str, call: &Call, timeout: Duration) -> Result<Answer> {
     parse_answer(payload)
 }
 
+/// One short summary. The caller charges the decision purse and skips the call when it is empty.
+pub fn summarize(endpoint: &str, prompt: &str, timeout: Duration) -> Result<(String, u64)> {
+    let url = parse_url(endpoint)?;
+    let body = serde_json::to_vec(&json!({
+        "model": "rollup",
+        "messages": [{ "role": "user", "content": prompt }],
+    }))?;
+    let mut stream = connect(&url, timeout)?;
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        url.path,
+        url.host_header(),
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    let mut raw = Vec::new();
+    read_http(&mut stream, &mut raw, timeout)?;
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(err(format!("rollup http {status}")));
+    }
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(raw.len());
+    let value: Value =
+        serde_json::from_slice(&raw[header_end..]).map_err(|_| err("rollup body"))?;
+    let summary = value
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err("rollup body"))?
+        .to_string();
+    let tokens = usage_tokens(&value).unwrap_or(1).max(1);
+    Ok((summary, tokens))
+}
+
 pub fn parse_answer(body: &[u8]) -> Result<Answer> {
     let value: Value = serde_json::from_slice(body).map_err(|_| err("decision body"))?;
     let tokens = usage_tokens(&value).unwrap_or_else(|| (body.len() as u64 / 4).max(1));
