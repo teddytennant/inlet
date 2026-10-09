@@ -207,7 +207,7 @@ Text is a post. `@all` and `@<agent-id>` are mentions: the post is addressed to 
 
 A channel group is the tag, or the worker kind. A worker post is a thread named for the task. Humans and the operator stay on the channel. Counts live on the projection, so the scrollback ring can stay short. A room with 24 or more posts shows one digest line: posts, authors, mentions, and the last line. `rollup = "count"` is the default and calls no model. `rollup = "model"` summarizes that line through the decision endpoint only when `inlet digest` asks and the decision purse has room. The charge is a `gate` record. An empty purse keeps the count line. The TUI sidebar lists groups, unread, and mentions. Ctrl-n and Ctrl-p move. Ctrl-f shows muted and demoted threads. They stay folded otherwise.
 
-Bridges let a real group chat act as another client of the operator socket. Telegram first, others later. A bridged human posts with role `human` and `human_weight`. The bridge is not a second board.
+Bridges let a real group chat act as another client of the operator socket. Telegram and Discord are in this binary. A bridged human posts with role `human` and `human_weight`. The bridge is not a second board. Discord uses the gateway websocket for inbound text and REST for outbound. An inlet channel group is a category, a channel is a channel, and a task thread is a thread. When the room is busy, or REST returns 429, the bridge sends one digest instead of the raw posts. The bot token is `DISCORD_BOT_TOKEN` or `keys/discord.token` mode `0600`. It is not written to the log.
 
 Lines starting with `/` are operator commands and do not appear as chat:
 
@@ -240,6 +240,7 @@ inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
 inlet digest [channel]
 inlet bridge telegram
+inlet bridge discord
 inlet bind <text>
 inlet clear <id>
 inlet watch [--debug N] [--worker id]
@@ -398,4 +399,4 @@ Each step is usable before the next one exists.
 10. Signed policy: passphrase key, `init`, `sign`, `clear`, constraints, human weight in the decision input. Until then `policy.lua` loads unsigned and only the human edits it.
 11. Snapshots. Lease and a second machine only after a sweep has survived `kill -9` of the daemon with purse totals matching the ledger.
 12. Channels, mentions, and votes. Workers post and read the channels that match their tags, `@mention` each other, and cast `vote` records. Consensus writes `moderation` for the board only. It does not admit, rebudget, or kill.
-13. Chat bridges. Telegram first, then others. A bridge is a client of the operator socket. Bridged humans post with role `human` and `human_weight`.
+13. Chat bridges. Telegram and Discord. A bridge is a client of the operator socket. Bridged humans post with role `human` and `human_weight`. Discord maps groups, channels, and threads onto categories, channels, and threads.

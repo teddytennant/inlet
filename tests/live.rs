@@ -5059,6 +5059,328 @@ fn telegram_bridge_posts_as_human() {
     let _ = daemon;
 }
 
+fn ws_accept(key: &str) -> String {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import hashlib,base64,sys; key=sys.argv[1]; print(base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode())",
+            key,
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn server_text(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    let mut out = vec![0x81];
+    if payload.len() < 126 {
+        out.push(payload.len() as u8);
+    } else {
+        out.push(126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+fn take_client_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let masked = buf[1] & 0x80 != 0;
+    let mut len = (buf[1] & 0x7f) as usize;
+    let mut pos = 2usize;
+    if len == 126 {
+        if buf.len() < 4 {
+            return None;
+        }
+        len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        pos = 4;
+    }
+    let mask_len = if masked { 4 } else { 0 };
+    if buf.len() < pos + mask_len + len {
+        return None;
+    }
+    let mask = buf[pos..pos + mask_len].to_vec();
+    pos += mask_len;
+    let mut data = buf[pos..pos + len].to_vec();
+    if masked {
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
+    }
+    buf.drain(..pos + len);
+    Some(data)
+}
+
+fn read_client_payload(sock: &mut TcpStream) -> Vec<u8> {
+    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        if let Some(payload) = take_client_frame(&mut buf) {
+            return payload;
+        }
+        match sock.read(&mut tmp) {
+            Ok(0) | Err(_) => return Vec::new(),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+}
+
+#[test]
+fn discord_bridge_posts_as_human() {
+    let home = scratch("discord");
+    policy(
+        &home,
+        &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "--worker",
+            "sleeper",
+            "--goal",
+            "bridge",
+            "--no-verify",
+            "--tokens",
+            "20",
+            "--seconds",
+            "40",
+        ],
+    );
+    let st = wait_status(&home, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["state"] == "running" && t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let task_id = tasks(&st)[0]["id"].as_str().unwrap().to_string();
+    let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sent_bg = Arc::clone(&sent);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            let sent_bg = Arc::clone(&sent_bg);
+            thread::spawn(move || {
+                let req = read_http(&mut sock);
+                if req.to_ascii_lowercase().contains("upgrade: websocket") {
+                    let key = req
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("sec-websocket-key") {
+                                Some(value.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let accept = ws_accept(&key);
+                    let header = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                    if sock.write_all(header.as_bytes()).is_err() {
+                        return;
+                    }
+                    let hello = server_text(
+                        r#"{"op":10,"s":null,"t":null,"d":{"heartbeat_interval":2000}}"#,
+                    );
+                    if sock.write_all(&hello).is_err() {
+                        return;
+                    }
+                    let identify = read_client_payload(&mut sock);
+                    let saw_op = identify.windows(6).any(|w| w == b"\"op\":2");
+                    let saw_token = identify
+                        .windows(b"disc-secret-token".len())
+                        .any(|w| w == b"disc-secret-token");
+                    if !saw_op || !saw_token {
+                        return;
+                    }
+                    let bot = server_text(
+                        r#"{"op":0,"t":"MESSAGE_CREATE","s":1,"d":{"content":"bot-secret","author":{"bot":true}}}"#,
+                    );
+                    let human = server_text(
+                        r#"{"op":0,"t":"MESSAGE_CREATE","s":2,"d":{"content":"hello from discord","author":{"bot":false,"username":"ada"}}}"#,
+                    );
+                    let _ = sock.write_all(&bot);
+                    let _ = sock.write_all(&human);
+                    loop {
+                        if read_client_payload(&mut sock).is_empty() {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                let recorded = req
+                    .lines()
+                    .filter(|line| !line.to_ascii_lowercase().starts_with("authorization:"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                sent_bg.lock().unwrap().push(recorded);
+                let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let name = value.get("name").and_then(|n| n.as_str()).unwrap_or("x");
+                let reply = if req.contains("/messages") && body.contains("operator: rate-me") {
+                    (429, r#"{"message":"slow","retry_after":0.3}"#.to_string())
+                } else if req.contains("/messages") {
+                    (200, r#"{"id":"m1"}"#.to_string())
+                } else if req.contains("/threads") {
+                    (200, format!(r#"{{"id":"thr-{name}"}}"#))
+                } else if body.contains("\"type\":4") {
+                    (200, format!(r#"{{"id":"cat-{name}"}}"#))
+                } else {
+                    (200, format!(r#"{{"id":"chan-{name}"}}"#))
+                };
+                let (status, payload) = reply;
+                let reason = if status == 429 {
+                    "Too Many Requests"
+                } else {
+                    "OK"
+                };
+                let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+                let _ = sock.write_all(resp.as_bytes());
+            });
+        }
+    });
+    let err_path = home.join("bridge.err");
+    let err_file = File::create(&err_path).unwrap();
+    let mut bridge = Command::new(bin())
+        .args(["--home", home.to_str().unwrap(), "bridge", "discord"])
+        .env("DISCORD_BOT_TOKEN", "disc-secret-token")
+        .env(
+            "DISCORD_API_BASE",
+            format!("http://127.0.0.1:{port}/api/v10"),
+        )
+        .env("DISCORD_GATEWAY", format!("ws://127.0.0.1:{port}/gateway"))
+        .env("DISCORD_GUILD", "g1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut st = Value::Null;
+    while Instant::now() < deadline {
+        if let Some(status) = bridge.try_wait().unwrap() {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            let _ = bridge.wait();
+            panic!("bridge exited {status}: {err}");
+        }
+        st = status(&home);
+        if post_texts(&st).iter().any(|t| t == "hello from discord") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let post = st["posts"]
+        .as_array()
+        .and_then(|posts| {
+            posts
+                .iter()
+                .find(|post| post["text"] == "hello from discord")
+        })
+        .unwrap_or_else(|| {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            panic!("missing discord post {st} bridge {err} {}", daemon.log())
+        });
+    assert_eq!(post["role"], "human", "{post}");
+    assert_eq!(post["author"], "you", "{post}");
+    assert_eq!(post["weight"], 4, "{post}");
+    assert!(!post_texts(&st).iter().any(|t| t == "bot-secret"), "{st}");
+    inlet(&home, &["post", "rate-me"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let dumped = sent.lock().unwrap().join("\n");
+        if dumped.matches("operator: rate-me").count() == 1
+            && dumped.contains("1 posts")
+            && dumped.contains("rate-me")
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            let err = fs::read_to_string(&err_path).unwrap_or_default();
+            panic!("missing rate digest bridge {err}");
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    thread::sleep(Duration::from_millis(400));
+    inlet(&home, &["post", "from-operator"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let dumped = sent.lock().unwrap().join("\n");
+        if dumped.contains("from-operator") {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("missing operator relay");
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    thread::sleep(Duration::from_millis(400));
+    let worker = worker_rpc(
+        &home,
+        serde_json::json!({"op":"post","token": token, "channel":"code","text":"from-worker"}),
+    );
+    assert_eq!(worker["ok"], true, "{worker}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let dumped = sent.lock().unwrap().join("\n");
+        let mapped = dumped.contains("from-worker")
+            && dumped.contains("\"type\":4")
+            && dumped.contains("cat-code")
+            && dumped.contains("sleeper")
+            && dumped.contains("/threads")
+            && dumped.contains(&task_id);
+        if mapped {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("missing channel map");
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    thread::sleep(Duration::from_millis(400));
+    flood_operator(&home, 30);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let dumped = sent.lock().unwrap().join("\n");
+        if dumped.contains("30 posts") {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("missing burst digest");
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let mut sock = UnixStream::connect(home.join("run/operator.sock")).unwrap();
+    sock.write_all(b"{\"op\":\"say\",\"text\":\"human-secret\"}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(sock).read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"), "{line}");
+    thread::sleep(Duration::from_millis(500));
+    let dumped = sent.lock().unwrap().join("\n");
+    assert!(dumped.contains("from-operator"), "{dumped}");
+    assert!(dumped.contains("from-worker"));
+    assert!(!dumped.contains("human-secret"), "{dumped}");
+    assert!(!dumped.contains("hello from discord"), "{dumped}");
+    assert!(!dumped.contains("operator: n0"));
+    let err = fs::read_to_string(&err_path).unwrap_or_default();
+    assert!(!err.contains("disc-secret-token"), "{err}");
+    assert!(!daemon.log().contains("disc-secret-token"));
+    let _ = bridge.kill();
+    let _ = bridge.wait();
+    let _ = daemon;
+}
+
 fn flood_operator(home: &Path, n: usize) {
     let mut sock = UnixStream::connect(home.join("run/operator.sock")).unwrap();
     sock.set_write_timeout(Some(Duration::from_secs(20)))

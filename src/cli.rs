@@ -89,6 +89,7 @@ inlet add -f tasks.jsonl
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
 inlet bridge telegram
+inlet bridge discord
 inlet digest [channel]
 inlet bind <text>
 inlet clear <id>
@@ -104,7 +105,8 @@ inlet status [--json]
 fn bridge_cmd(home: &Path, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("telegram") => crate::bridge::telegram(home),
-        _ => Err(err("usage: inlet bridge telegram")),
+        Some("discord") => crate::discord::run(home),
+        _ => Err(err("usage: inlet bridge telegram|discord")),
     }
 }
 

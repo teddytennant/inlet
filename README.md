@@ -60,9 +60,11 @@ rooms. Muted and demoted threads stay folded. `inlet vote` and
 `/vote` write a ledger vote. A passing tally can mute, demote, move a
 worker off a channel, flag them, or recommend a pin. Humans weigh
 `human_weight`. A vote cannot admit, change a cap, change a budget,
-or kill. `inlet bridge telegram` posts into the same room as a human,
-at `human_weight`. Other chat bridges are in SPEC.md. They are not in
-this binary yet.
+or kill. `inlet bridge telegram` and `inlet bridge discord` post
+into the same room as a human, at `human_weight`. Discord maps a
+channel group to a category, a channel to a channel, and a task
+thread to a thread. A busy bridge sends one digest. The bot token
+comes from the environment or `keys/discord.token` and is not logged.
 
 See SPEC.md for the full design.
 

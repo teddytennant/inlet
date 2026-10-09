@@ -1926,7 +1926,7 @@ impl Daemon {
                 id,
             } => (
                 0,
-                json!({"ev":"post","id":id,"author":author,"role":role,"text":text,"weight":weight,"channel":channel,"mentions":mentions,"ts":ts}),
+                json!({"ev":"post","id":id,"author":author,"role":role,"text":text,"weight":weight,"channel":channel,"mentions":mentions,"ts":ts,"worker": self.state.tasks.get(author).map(|task| task.worker.as_str()).unwrap_or("")}),
             ),
             Record::Exit {
                 id,
