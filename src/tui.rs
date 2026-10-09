@@ -396,7 +396,7 @@ impl Ui {
         }
         if lines.is_empty() {
             lines.push("general".into());
-            lines.push(" ># general".into());
+            lines.push("># general".into());
         }
         lines
     }
@@ -420,7 +420,7 @@ impl Ui {
                 group: group.clone(),
                 channel: channel.clone(),
                 thread: String::new(),
-                label: format!("# {channel}  {}", counts(slot)),
+                label: format!("# {:<10}{}", channel, counts(slot)),
             });
             if group != self.open_group {
                 continue;
@@ -438,7 +438,7 @@ impl Ui {
                     group: group.clone(),
                     channel: channel.clone(),
                     thread: thread.to_string(),
-                    label: format!("  {}  {}", short(thread), counts(Some(slot))),
+                    label: format!("  {:<10} {}", short(thread), counts(Some(slot))),
                 });
             }
         }
@@ -731,7 +731,7 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
         ui.live, ui.queued, ui.spent, ui.cap, ui.debug
     );
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         chunks[0],
     );
     let body = if chunks[1].width >= 48 {

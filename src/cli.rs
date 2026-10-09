@@ -87,7 +87,7 @@ pub fn run() -> Result<()> {
 
 const HELP: &str = "\
 inlet up [-f]            daemon. -f stays in the foreground
-inlet                    attach the TUI
+inlet                    attach the tui
 inlet init [--defaults] [--no-smoke]
 inlet settings           view or change setup
 inlet --settings
@@ -167,7 +167,7 @@ fn clear(home: &Path, id: Option<&str>) -> Result<()> {
     let msg = format!("clear\n{id}\n");
     let bar = ProgressBar::new_spinner();
     if io::stderr().is_terminal() {
-        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
         bar.set_message("clear");
         bar.enable_steady_tick(Duration::from_millis(80));
     }
@@ -186,7 +186,7 @@ fn sign_policy(home: &Path) -> Result<()> {
     let wrapped = fs::read(paths::key_priv(home)).map_err(|_| err("no signing key"))?;
     let bar = ProgressBar::new_spinner();
     if io::stderr().is_terminal() {
-        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
         bar.set_message("signing");
         bar.enable_steady_tick(Duration::from_millis(80));
     }
@@ -202,7 +202,7 @@ fn sign_policy(home: &Path) -> Result<()> {
 fn snap(home: &Path) -> Result<()> {
     let bar = ProgressBar::new_spinner();
     if io::stderr().is_terminal() {
-        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
         bar.set_message("snapshot");
         bar.enable_steady_tick(Duration::from_millis(80));
     }
@@ -291,7 +291,7 @@ fn add(home: &Path, args: &[String]) -> Result<()> {
         let tasks = read_jsonl(Path::new(&path))?;
         let bar = ProgressBar::new(tasks.len() as u64);
         bar.set_style(
-            ProgressStyle::with_template("intake {bar:28.cyan/blue} {pos}/{len} {msg}")
+            ProgressStyle::with_template("intake {bar:28} {pos}/{len} {msg}")
                 .unwrap()
                 .progress_chars("=>-"),
         );
@@ -476,7 +476,7 @@ fn status(home: &Path, json_out: bool) -> Result<()> {
     let spent = v.get("spent").and_then(|n| n.as_u64()).unwrap_or(0);
     let bar = ProgressBar::new(cap);
     bar.set_style(
-        ProgressStyle::with_template("{prefix} {bar:28.cyan/blue} {pos}/{len} {msg}")
+        ProgressStyle::with_template("{prefix} {bar:28} {pos}/{len} {msg}")
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -499,7 +499,7 @@ fn status(home: &Path, json_out: bool) -> Result<()> {
             let spent = v.get("gate_spent").and_then(|n| n.as_u64()).unwrap_or(0);
             let gate = ProgressBar::new(cap);
             gate.set_style(
-                ProgressStyle::with_template("{prefix} {bar:28.cyan/blue} {pos}/{len}")
+                ProgressStyle::with_template("{prefix} {bar:28} {pos}/{len}")
                     .unwrap()
                     .progress_chars("=>-"),
             );
@@ -511,7 +511,7 @@ fn status(home: &Path, json_out: bool) -> Result<()> {
     if let Some(tasks) = v.get("tasks").and_then(|t| t.as_array()) {
         for task in tasks {
             println!(
-                "{}  {:<8} {}  {}",
+                "{:<26}  {:<8}  {:<12}  {}",
                 task["id"].as_str().unwrap_or(""),
                 task["state"].as_str().unwrap_or(""),
                 task["worker"].as_str().unwrap_or(""),
@@ -534,7 +534,7 @@ fn watch(home: &Path, args: &[String]) -> Result<()> {
     let tty = io::stderr().is_terminal();
     let bar = ProgressBar::new_spinner();
     if tty {
-        bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        bar.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
         bar.enable_steady_tick(Duration::from_millis(80));
     }
     let mut reader = io::BufReader::new(stream);
