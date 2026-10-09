@@ -43,8 +43,13 @@ the cell starts. The worker socket speaks JSON lines on one connection;
 see `doc/worker-socket.md`. The gate can call a decision endpoint
 (`decision.kind` of `openai` or `jev`). `off` stays the local formula.
 Pi and Wizard share one operator skill (`skills/pi`, `skills/wizard`):
-it runs the inlet CLI and does not enter a cell. `inlet init` pins a
-passphrase key. `inlet sign` and `inlet clear` read it from the tty.
+it runs the inlet CLI and does not enter a cell. `inlet init` walks
+through the cell, the model, the budgets, a worker, and an optional
+passphrase. An empty passphrase leaves the policy unsigned. `inlet
+settings` and `inlet --settings` show that setup and change it later.
+A signed policy still asks for the passphrase. Bridge tokens stay in
+`keys/`, not in `policy.lua`. `inlet sign` and `inlet clear` read the
+passphrase from the tty.
 A constraint binds until the human clears it. `inlet snap` commits the
 registry, the signed policy, and a header index at the log offset.
 Restart replays from that offset. A second machine can pull the

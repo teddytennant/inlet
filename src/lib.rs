@@ -17,6 +17,7 @@ pub mod proto;
 pub mod proxy;
 pub mod purse;
 pub mod registry;
+pub mod setup;
 pub mod sign;
 pub mod snap;
 pub mod state;

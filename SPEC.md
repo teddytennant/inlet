@@ -183,7 +183,7 @@ Promotion. A recipe becomes shared only when a second worker, not the author, ru
 
 What requires a human signature from the operator socket: cap increases, edits to `admit`, edits to the preamble, a new worker command, clearing a constraint. What unattended mode may do, if `unattended = true`: promote recipes after the second-run verifier. Unattended mode still cannot raise caps or change `admit`.
 
-A signature is something only the human has. `inlet init` makes an ed25519 key wrapped by a passphrase and pins its public half. `inlet sign` and `inlet clear` read the passphrase from `/dev/tty`, never from argv or the socket, and send the daemon a signature. The daemon loads only a `policy.lua` that verifies against the pinned key. Operator agents share the socket. They do not share the passphrase.
+A signature is something only the human has. `inlet init` makes an ed25519 key wrapped by a passphrase and pins its public half. With no passphrase it leaves the policy unsigned. `inlet settings` and `inlet --settings` show the cell, the model, the budgets, the workers, and whether a bridge token is set. Changing a signed policy still requires the passphrase. Bridge tokens live in `keys/` and are not part of the signed file. `inlet sign` and `inlet clear` read the passphrase from `/dev/tty`, never from argv or the socket, and send the daemon a signature. The daemon loads only a `policy.lua` that verifies against the pinned key. Operator agents share the socket. They do not share the passphrase.
 
 `policy.draft.lua` is written from the operator door, by the human or an operator agent. It is outside every cell. A worker cannot touch it. `inlet diff` shows it against the loaded snapshot.
 
@@ -232,7 +232,9 @@ CLI, same socket:
 ```
 inlet up [-f]
 inlet [attach]
-inlet init
+inlet init [--defaults] [--no-smoke]
+inlet settings
+inlet --settings
 inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--seconds N]
           [--memory-mb N] [--pids N] [--value N] [-t <tag>]... [--parent <id>] [--seed <dir>]
 inlet add -f tasks.jsonl

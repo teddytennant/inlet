@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -5537,4 +5537,142 @@ fn model_rollup_uses_the_purse() {
     thread::sleep(Duration::from_millis(200));
     assert!(skipped.hits.lock().unwrap().is_empty());
     let _ = daemon;
+}
+
+fn stop_pid(home: &Path) {
+    if let Some(pid) = pid_of(home) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+#[test]
+fn init_without_a_tty() {
+    let home = scratch("init-plain");
+    let out = inlet(&home, &["init", "--no-smoke"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1/8 checking the cell"), "{text}");
+    assert!(text.contains("cell ready"), "{text}");
+    assert!(text.contains("unsigned"), "{text}");
+    assert!(text.contains("telegram unset"), "{text}");
+    assert!(!home.join("policy.sig").exists());
+    let body = fs::read_to_string(home.join("policy.lua")).unwrap();
+    assert!(body.contains("env:MODEL_UPSTREAM"), "{body}");
+    assert!(body.contains("check"), "{body}");
+    assert!(pid_of(&home).is_some(), "{text}");
+    let view = inlet(&home, &["settings"]);
+    let view = String::from_utf8_lossy(&view.stdout);
+    assert!(view.contains("unsigned"), "{view}");
+    assert!(view.contains("2000000"), "{view}");
+    assert!(view.contains("discord"), "{view}");
+    let same = inlet(&home, &["--settings"]);
+    assert!(String::from_utf8_lossy(&same.stdout).contains("cell"));
+    stop_pid(&home);
+}
+
+#[test]
+fn first_run_smokes_and_signs() {
+    let home = scratch("init-smoke");
+    let out = Command::new(bin())
+        .args(["--home", home.to_str().unwrap()])
+        .env("INLET_PASSPHRASE", "cell-pass")
+        .env("INLET_DISCORD_TOKEN", "disc-secret-token")
+        .env("INLET_UPSTREAM", "http://127.0.0.1:9/v1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}{err}");
+    assert!(text.contains("signed"), "{text}");
+    assert!(text.contains("smoke ok"), "{text}");
+    assert!(text.contains("discord set"), "{text}");
+    assert!(!text.contains("disc-secret-token"), "{text}");
+    assert!(!err.contains("disc-secret-token"), "{err}");
+    assert!(home.join("policy.sig").exists());
+    let token = fs::read_to_string(home.join("keys/discord.token")).unwrap();
+    assert_eq!(token, "disc-secret-token");
+    let mode = fs::metadata(home.join("keys/discord.token"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+    assert!(!fs::read_to_string(home.join("policy.lua"))
+        .unwrap()
+        .contains("disc-secret-token"));
+    let st = status(&home);
+    assert!(
+        tasks(&st)
+            .iter()
+            .any(|t| t["goal"] == "smoke" && t["state"] == "done"),
+        "{st}"
+    );
+    stop_pid(&home);
+}
+
+#[test]
+fn settings_keep_the_passphrase() {
+    let home = scratch("settings");
+    inlet(&home, &["init", "--defaults", "--no-smoke"]);
+    let changed = inlet(&home, &["settings", "--tokens", "4321"]);
+    let view = String::from_utf8_lossy(&changed.stdout);
+    assert!(view.contains("4321"), "{view}");
+    let body = fs::read_to_string(home.join("policy.lua")).unwrap();
+    assert!(body.contains("caps.max_tokens = 4321"), "{body}");
+    stop_pid(&home);
+
+    let home = scratch("settings-sign");
+    let out = Command::new(bin())
+        .args(["--home", home.to_str().unwrap(), "init", "--no-smoke"])
+        .env("INLET_PASSPHRASE", "cell-pass")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let denied = inlet_out(&home, &["settings", "--tokens", "50"]);
+    assert!(
+        !denied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("passphrase"));
+    let wrong = Command::new(bin())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "settings",
+            "--tokens",
+            "50",
+        ])
+        .env("INLET_PASSPHRASE", "nope-pass")
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("bad passphrase"));
+    assert!(!fs::read_to_string(home.join("policy.lua"))
+        .unwrap()
+        .contains("caps.max_tokens = 50"));
+    let ok = Command::new(bin())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "--settings",
+            "--tokens",
+            "50",
+        ])
+        .env("INLET_PASSPHRASE", "cell-pass")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&ok.stdout);
+    let err = String::from_utf8_lossy(&ok.stderr);
+    assert!(ok.status.success(), "{text}{err}");
+    assert!(text.contains("50"), "{text}");
+    assert!(text.contains("signed"), "{text}");
+    let st = status(&home);
+    assert_eq!(st["cap"].as_u64(), Some(50), "{st}");
+    stop_pid(&home);
 }

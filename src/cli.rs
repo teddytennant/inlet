@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +7,6 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
 
-use crate::config::DEFAULT_POLICY;
 use crate::daemon;
 use crate::error::{err, Result};
 use crate::paths;
@@ -19,7 +17,15 @@ pub fn run() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let home = take_home(&mut args)?;
     match args.first().map(String::as_str) {
-        None | Some("attach") => tui::attach(&home),
+        None | Some("attach") => {
+            if !paths::policy(&home).exists() {
+                crate::setup::init(&home, &[])?;
+                if !io::stdout().is_terminal() {
+                    return Ok(());
+                }
+            }
+            tui::attach(&home)
+        }
         Some("up") => {
             let foreground = args.iter().any(|a| a == "-f" || a == "--foreground");
             daemon::serve(&home, foreground)?;
@@ -28,7 +34,8 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some("init") => init(&home, &args[1..]),
+        Some("init") => crate::setup::init(&home, &args[1..]),
+        Some("settings") | Some("--settings") => crate::setup::settings(&home, &args[1..]),
         Some("add") => add(&home, &args[1..]),
         Some("bind") => bind(&home, &args[1..]),
         Some("clear") => clear(&home, args.get(1).map(String::as_str)),
@@ -81,7 +88,9 @@ pub fn run() -> Result<()> {
 const HELP: &str = "\
 inlet up [-f]            daemon. -f stays in the foreground
 inlet                    attach the TUI
-inlet init               write policy.lua and pin a signing key
+inlet init [--defaults] [--no-smoke]
+inlet settings           view or change setup
+inlet --settings
 inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID] [--recipe NAME]
         [--seed DIR]
@@ -140,46 +149,6 @@ fn vote(home: &Path, args: &[String]) -> Result<()> {
         json!({"op":"vote","target": target, "choice": choice, "channel": channel, "human": human}),
     )?;
     print_ok(&v)
-}
-
-fn init(home: &Path, args: &[String]) -> Result<()> {
-    if !args.is_empty() {
-        return Err(err("passphrase is read from /dev/tty"));
-    }
-    fs::create_dir_all(home)?;
-    fs::create_dir_all(home.join("ledger"))?;
-    fs::create_dir_all(home.join("registry"))?;
-    fs::create_dir_all(home.join("run"))?;
-    fs::create_dir_all(home.join("keys"))?;
-    let policy = paths::policy(home);
-    if !policy.exists() {
-        fs::write(&policy, DEFAULT_POLICY)?;
-        println!("wrote {}", policy.display());
-    } else {
-        println!("{} already exists", policy.display());
-    }
-    if paths::key_pub(home).exists() {
-        println!("signing key already pinned");
-        return Ok(());
-    }
-    let passphrase = crate::sign::read_passphrase("passphrase: ")?;
-    let (public, wrapped) = crate::sign::generate(&passphrase)?;
-    let body = fs::read(&policy)?;
-    let sig = crate::sign::sign_with(&wrapped, &passphrase, &body)?;
-    write_private(&paths::key_pub(home), &public)?;
-    write_private(&paths::key_priv(home), &wrapped)?;
-    write_private(&paths::policy_sig(home), &sig)?;
-    println!("pinned signing key");
-    Ok(())
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, bytes)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
 }
 
 fn bind(home: &Path, args: &[String]) -> Result<()> {
