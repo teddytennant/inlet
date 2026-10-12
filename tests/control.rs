@@ -1951,3 +1951,71 @@ node_grace = 8"#,
     thread::sleep(Duration::from_millis(1500));
     assert_eq!(status(&leader)["available"], 10000 - 22, "{st}");
 }
+
+#[test]
+fn a_leader_told_to_wait_never_works_a_goal_twice() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 1; echo ok > out" } },"#;
+    let east = node_home("waiteast", job);
+    let west = node_home("waitwest", job);
+    let leader = scratch("waitleader");
+    let gate = leader.join("cut");
+    policy(
+        &leader,
+        r#"job = { on = "nodes" },"#,
+        &format!(
+            r#"nodes = {{
+  east = {{ cmd = {{ "/bin/sh", "-c", "test -e {gate} && exit 1; exec {bin} --home {east} \"$@\"", "sh" }}, slots = 2 }},
+  west = {{ cmd = {{ "{bin}", "--home", "{west}" }}, slots = 2 }},
+}}
+node_grace = 4
+node_loss = "wait""#,
+            gate = gate.display(),
+            bin = bin().display(),
+            east = east.display(),
+            west = west.display(),
+        ),
+    );
+    let east_d = start(&east);
+    let daemon = start(&leader);
+    wait(&leader, &daemon, |v| {
+        v["nodes"]
+            .as_array()
+            .is_some_and(|n| n.iter().any(|n| n["name"] == "east" && n["ready"] == true))
+    });
+    for goal in ["a", "b"] {
+        inlet(
+            &leader,
+            &["add", "-w", "job", "-g", goal, "--verify", "grep -q ok out"],
+        );
+    }
+    wait(&east, &east_d, |v| v["live"] == 2);
+    // Cut off, east finishes both. West is up and idle, and stays idle.
+    fs::write(&gate, "").unwrap();
+    let west_d = start(&west);
+    wait(&east, &east_d, |v| {
+        tasks(v).iter().filter(|t| t["state"] == "done").count() == 2
+    });
+    wait(&leader, &daemon, |v| {
+        v["nodes"]
+            .as_array()
+            .is_some_and(|n| n.iter().any(|n| n["name"] == "east" && n["ready"] == false))
+    });
+    thread::sleep(Duration::from_secs(2));
+    let st = status(&leader);
+    assert_eq!(st["live"], 2, "still east's: {st}");
+    assert!(
+        tasks(&status(&west)).is_empty(),
+        "west was given east's work"
+    );
+    // The link is back and the answers with it.
+    fs::remove_file(&gate).unwrap();
+    let st = wait(&leader, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let all = tasks(&st);
+    assert_eq!(all.len(), 2, "{st}");
+    assert!(all.iter().all(|t| t["state"] == "done"), "{st}");
+    assert!(
+        tasks(&status(&west)).is_empty(),
+        "west was given east's work"
+    );
+    drop(west_d);
+}

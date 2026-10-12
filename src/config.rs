@@ -205,6 +205,9 @@ pub struct Config {
     pub nodes: BTreeMap<String, NodeCfg>,
     /// A node silent this long is given up on, and its tasks are placed again.
     pub node_grace_ms: u64,
+    /// `node_loss = "wait"`: a silent node's tasks stay its tasks until it
+    /// answers again or the policy stops naming it. No goal is worked twice.
+    pub node_wait: bool,
     /// A settled task is forgotten, and its workdir and transcripts removed,
     /// this long after it settled. 0 keeps everything.
     pub retain_ms: u64,
@@ -387,6 +390,17 @@ fn read_config(lua: &Lua) -> Result<Config> {
     if g.contains_key("node_grace")? {
         // Shorter than this and one slow ssh would look like a dead node.
         cfg.node_grace_ms = read_span(g.get::<Value>("node_grace")?)?.max(3000);
+    }
+    if g.contains_key("node_loss")? {
+        cfg.node_wait = match g.get::<String>("node_loss")?.as_str() {
+            "wait" => true,
+            "move" => false,
+            other => {
+                return Err(err(format!(
+                    "node_loss is \"move\" or \"wait\", not {other:?}"
+                )))
+            }
+        };
     }
     if g.contains_key("retain")? {
         cfg.retain_ms = read_span(g.get::<Value>("retain")?)?;
@@ -714,6 +728,7 @@ pub fn preset(setup: &str) -> Config {
         retain_ms: 30 * 86_400_000,
         nodes: BTreeMap::new(),
         node_grace_ms: 60_000,
+        node_wait: false,
     }
 }
 

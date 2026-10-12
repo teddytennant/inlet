@@ -1431,6 +1431,12 @@ impl Daemon {
                 eprintln!("inlet: node {name} is not answering");
             }
             rt.1 = false;
+            if self.policy.cfg.node_wait {
+                // Nothing new goes there, and what is there stays there. The
+                // node stops what it was running when its lease runs out and
+                // says so when it is back; only then is it placed again.
+                return Ok(());
+            }
             // Given up on. Its tasks go to another node. If it comes back it
             // may still finish them: twice done, never lost.
             for (id, _) in mine {

@@ -18,6 +18,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("inlet")
 ap.add_argument("--tasks", type=int, default=200)
 ap.add_argument("--home", default="")
+ap.add_argument("--wait", action="store_true", help='node_loss = "wait": no goal may be finished twice')
 args = ap.parse_args()
 binary = os.path.abspath(args.inlet)
 root = args.home or tempfile.mkdtemp(prefix="inlet-netns-", dir=os.path.expanduser("~/.cache"))
@@ -99,7 +100,7 @@ for name, home in homes.items():
     if name == "leader":
         nodes = "".join('  n%d = { cmd = { %s, "%s", "--home", "%s" }, slots = 6 },\n' % (
             i, ", ".join('"%s"' % a for a in ssh_prefix(i)), binary, homes["n%d" % i]) for i in NODES)
-        open(home + "/policy.lua", "w").write(COMMON + "node_grace = %d\nnodes = {\n%s}\nworkers = { plain = { on = \"nodes\" } }\n" % (GRACE, nodes))
+        open(home + "/policy.lua", "w").write(COMMON + "node_grace = %d\n" % GRACE + ('node_loss = "wait"\n' if args.wait else "") + "nodes = {\n%s}\nworkers = { plain = { on = \"nodes\" } }\n" % nodes)
     else:
         open(home + "/policy.lua", "w").write(COMMON + """
 workers = {
@@ -218,6 +219,8 @@ try:
         for t in ns["tasks"]:
             if t["state"] == "done":
                 twice[t["goal"]] += 1
+    if args.wait and any(n > 1 for n in twice.values()):
+        problems.append("told to wait, and %d goals were finished twice" % sum(1 for n in twice.values() if n > 1))
     reported = CAP - st["available"]
     print("%d tasks in %ds over %s  moved off the cut node %d  fenced there %d  goals finished twice %d  leader charged %d" % (
         args.tasks, time.time() - started, "netem delay 60ms loss 10%" if netem else "a clean link (no netem)",

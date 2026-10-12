@@ -94,7 +94,7 @@ A node is another machine running `inlet up` with its own policy. The leader nee
 
 A second leader waits its turn: `inlet up -f --standby` on the same home takes over the moment the first one's process is gone.
 
-The worker `pi` is defined in east's policy. Tasks for it are placed on the node with the most room, run there in cells, and are retried there. `inlet get nodes` shows who is answering. A node silent for `node_grace` (a minute by default) loses its tasks to another.
+The worker `pi` is defined in east's policy. Tasks for it are placed on the node with the most room, run there in cells, and are retried there. `inlet get nodes` shows who is answering. A node silent for `node_grace` (a minute by default) loses its tasks to another. That can do a goal twice if the node had finished it and nobody heard. Set `node_loss = "wait"` and the tasks stay with the node until it answers again, so nothing is worked twice.
 
 ## keeping the daemon up
 
