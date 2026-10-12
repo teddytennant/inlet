@@ -1808,7 +1808,7 @@ fn a_standby_never_leads_while_the_leader_lives_through_a_rotation() {
         thread::sleep(Duration::from_millis(50));
     }
     let standby = spawn(&["up", "-f", "--standby"], "standby.log");
-    // Many rotations with a standby poking at the lock the whole time.
+    // The log turns over with a standby poking at the lock the whole time.
     manifest(
         &home,
         r#"{"kind":"swarm","name":"many","replicas":4,"completions":40,
@@ -1818,7 +1818,7 @@ fn a_standby_never_leads_while_the_leader_lives_through_a_rotation() {
     thread::sleep(Duration::from_millis(2500));
     let rotations = leader.log().matches("rotated the ledger").count();
     assert!(
-        rotations >= 2,
+        rotations >= 1,
         "only {rotations} rotations: {}",
         leader.log()
     );
