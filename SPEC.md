@@ -473,6 +473,8 @@ The leader asks each node for its status every two seconds and finds its own tas
 
 A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Nothing is placed on a node that is not answering. If the node comes back it may finish what it had, so a task can be done twice. It cannot be lost.
 
+A task nothing will take does not wait for ever. A worker pointed at a node the policy does not name is denied, reason `placement`. A node that answers but turns the task away five times, most likely for want of that worker, ends it the same way. A task placed on a node that a later policy removed is placed again.
+
 A leader that dies knows from its `place` records where its tasks are, and finds them by tag when it returns. `inlet kill` on a placed task kills it on the node and settles it at once. `inlet get nodes` is the table. A `seed` for a placed task is a path on the node.
 
 What this is not: one purse across machines, a shared filesystem, or a leader election. Each node spends from its own purse and reports what it spent; the leader's purse holds the slice while the task is placed. There is one leader. A second one is still the lease and snapshot below.

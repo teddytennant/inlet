@@ -89,17 +89,37 @@ pub fn oom_killed(id: &str) -> bool {
         })
 }
 
-/// Kill whatever is left in a task's group and remove it.
+/// Kill whatever is left in a task's group and remove it. The kernel may
+/// need a moment to empty the group, and the caller is the main loop, so
+/// this tries briefly and leaves the rest to the next sweep.
 pub fn release(id: &str) {
     if let Some(dir) = group(id) {
         let _ = fs::write(dir.join("cgroup.kill"), "1");
-        for _ in 0..50 {
+        for _ in 0..5 {
             if fs::remove_dir(&dir).is_ok() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// The task ids that still have a group. A daemon that crashed, or a group
+/// that was slow to empty, leaves some behind.
+pub fn groups() -> Vec<String> {
+    let Some(Some(base)) = BASE.get() else {
+        return Vec::new();
+    };
+    let Ok(dir) = fs::read_dir(base) else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name.strip_prefix("inlet-")?;
+            (id != "supervisor").then(|| id.to_string())
+        })
+        .collect()
 }
 
 fn try_cgroup(id: &str, memory_mb: u64, pids: u64) -> Option<PathBuf> {

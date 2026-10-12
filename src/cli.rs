@@ -685,6 +685,11 @@ fn down(home: &Path, keep: bool) -> Result<()> {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .ok_or_else(|| err("daemon is not up"))?;
+    // The pid file outlives a daemon that was killed, and the number in it
+    // may be someone else's by now. Only a daemon that answers gets a signal.
+    if proto::rpc(home, json!({"op":"status","brief": true})).is_err() {
+        return Err(err("daemon is not up"));
+    }
     let sig = if keep { libc::SIGTERM } else { libc::SIGINT };
     if unsafe { libc::kill(pid, sig) } != 0 {
         return Err(err("daemon is not up"));

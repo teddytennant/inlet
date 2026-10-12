@@ -169,6 +169,8 @@ struct Daemon {
     adding: HashSet<String>,
     /// What each placed task is called on its node.
     remote_ids: HashMap<String, Vec<String>>,
+    /// How many times a node has turned a placed task away.
+    refused: HashMap<String, u32>,
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -374,6 +376,7 @@ fn run(home: &Path) -> Result<()> {
         nodes: BTreeMap::new(),
         adding: HashSet::new(),
         remote_ids: HashMap::new(),
+        refused: HashMap::new(),
     };
     for (name, cfg) in &daemon.policy.cfg.nodes {
         // Unknown until it answers. Nothing is placed on a node not yet heard from.
@@ -598,6 +601,11 @@ impl Daemon {
                 }
             }
         }
+        for id in isolate::groups() {
+            if !self.state.tasks.get(&id).is_some_and(|t| t.state.is_live()) {
+                isolate::release(&id);
+            }
+        }
         for sub in ["run/cells", "run/checks", "run/live", "run/exit", "scratch"] {
             let Ok(dir) = fs::read_dir(self.home.join(sub)) else {
                 continue;
@@ -779,6 +787,7 @@ impl Daemon {
             let retain = Duration::from_millis(self.policy.cfg.retain_ms.max(1000));
             if self.last_gc.elapsed() >= GC_EVERY.min(retain) {
                 self.gc()?;
+                self.sweep();
             }
         }
         if self.last_flush.elapsed() >= SOFT_FLUSH {
@@ -1044,7 +1053,19 @@ impl Daemon {
                     .max()
                     .map(|(_, name)| name)
             });
-            if on.is_some() {
+            if let Some(want) = &on {
+                // A worker pointed at a node the policy does not have would
+                // wait for ever. Say so now.
+                let known = self
+                    .policy
+                    .cfg
+                    .nodes
+                    .keys()
+                    .any(|name| want == "nodes" || want == name);
+                if !known {
+                    self.deny(&id, "placement")?;
+                    continue;
+                }
                 if node.is_none() {
                     // No node has room, or none answers. It waits.
                     continue;
@@ -1198,15 +1219,33 @@ impl Daemon {
     /// the daemon lives.
     fn gc(&mut self) -> Result<()> {
         self.last_gc = Instant::now();
+        // A task placed on a node the policy no longer names has nobody
+        // watching it. It is placed again somewhere that exists.
+        let adrift: Vec<String> = self
+            .state
+            .placed
+            .iter()
+            .filter(|(_, (node, _))| !self.policy.cfg.nodes.contains_key(node))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in adrift {
+            self.finish_remote(&id, -1, "node", 0)?;
+        }
         let mut pruned = 0;
         if self.policy.cfg.retain_ms > 0 {
             let before = now_ms().saturating_sub(self.policy.cfg.retain_ms);
             let old = self.state.forgettable(before);
-            for id in &old {
-                let _ = fs::remove_dir_all(paths::work(&self.home, id));
-                let _ = fs::remove_file(paths::transcript(&self.home, id));
-                let _ = fs::remove_file(paths::verify_log(&self.home, id));
-            }
+            remove_later(
+                old.iter()
+                    .flat_map(|id| {
+                        [
+                            paths::work(&self.home, id),
+                            paths::transcript(&self.home, id),
+                            paths::verify_log(&self.home, id),
+                        ]
+                    })
+                    .collect(),
+            );
             pruned = old.len();
             self.state.forget(&old);
         }
@@ -1275,9 +1314,29 @@ impl Daemon {
 
     fn on_node(&mut self, msg: node::Msg) -> Result<()> {
         let (name, tasks) = match msg {
-            node::Msg::Added { id, .. } => {
+            node::Msg::Added { id, ok } => {
                 // Failed or not, the next status says whether it is there.
                 self.adding.remove(&id);
+                if ok {
+                    self.refused.remove(&id);
+                    return Ok(());
+                }
+                // A node that answers its status but will not take the task
+                // has a reason that asking again will not change: no such
+                // worker there, most likely.
+                let tries = self.refused.entry(id.clone()).or_insert(0);
+                *tries += 1;
+                let answering = self
+                    .state
+                    .placed
+                    .get(&id)
+                    .and_then(|(node, _)| self.nodes.get(node))
+                    .is_some_and(|rt| rt.1);
+                if *tries >= 5 && answering {
+                    eprintln!("inlet: a node will not take {id}");
+                    self.refused.remove(&id);
+                    self.finish_remote(&id, 1, "placement", 0)?;
+                }
                 return Ok(());
             }
             node::Msg::Status { node, tasks } => (node, tasks),
@@ -1889,11 +1948,15 @@ impl Daemon {
         // that had finished.
         let _ = fs::remove_file(paths::live_file(&self.home, id));
         let _ = fs::remove_file(paths::exit_file(&self.home, id));
-        // The cell was scaffolding. The workdir and the transcripts are the record.
-        let _ = fs::remove_dir_all(paths::cell_root(&self.home, id));
-        let _ = fs::remove_dir_all(paths::cell_root(&self.home, &format!("{id}-check")));
-        let _ = fs::remove_dir_all(paths::scratch(&self.home, id));
-        let _ = fs::remove_dir_all(self.home.join("run/checks").join(id));
+        // The cell was scaffolding. The workdir and the transcripts are the
+        // record. A scratch directory can be gigabytes, and this is the main
+        // loop, so the removing happens on a thread of its own.
+        remove_later(vec![
+            paths::cell_root(&self.home, id),
+            paths::cell_root(&self.home, &format!("{id}-check")),
+            paths::scratch(&self.home, id),
+            self.home.join("run/checks").join(id),
+        ]);
         isolate::release(id);
         Ok(())
     }
@@ -3258,6 +3321,19 @@ impl Daemon {
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
     }
+}
+
+/// Remove files and trees off the main loop.
+fn remove_later(paths: Vec<PathBuf>) {
+    thread::spawn(move || {
+        for path in paths {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    });
 }
 
 /// Bytes an unprivileged process may still write under `path`.

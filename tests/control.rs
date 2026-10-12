@@ -1648,3 +1648,47 @@ fn a_leader_that_dies_finds_its_placed_tasks_again() {
     assert_eq!(st["available"], 10000, "{st}");
     drop(east_d);
 }
+
+#[test]
+fn a_task_no_node_will_take_does_not_wait_for_ever() {
+    // The node is up but has no worker called `job`.
+    let east = node_home("east4", r#"other = { cmd = { "true" } },"#);
+    let leader = scratch("leader4");
+    node_policy(
+        &leader,
+        &[("east", &east, 4)],
+        r#"workers.lost = { on = "nowhere" }"#,
+    );
+    let east_d = start(&east);
+    let daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    inlet(
+        &leader,
+        &["add", "-w", "job", "-g", "unwanted", "--no-verify"],
+    );
+    inlet(
+        &leader,
+        &["add", "-w", "lost", "-g", "adrift", "--no-verify"],
+    );
+    let st = wait(&leader, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    for goal in ["unwanted", "adrift"] {
+        let task = tasks(&st).into_iter().find(|t| t["goal"] == goal).unwrap();
+        assert_eq!(
+            (task["state"].as_str(), task["reason"].as_str()),
+            (Some("failed"), Some("placement")),
+            "{st}"
+        );
+    }
+    assert_eq!(tasks(&st).len(), 2, "not retried: {st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    // A stale pid file is not a daemon.
+    let stale = scratch("stale");
+    fs::write(
+        stale.join("run/inlet.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    let out = run(&stale, &["down"]);
+    assert!(!out.status.success());
+    drop(east_d);
+}

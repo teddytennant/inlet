@@ -796,13 +796,27 @@ impl State {
             if !task.state.is_live() || kept.contains(&task.id) {
                 continue;
             }
-            let used = task.budget.tokens;
+            // Past its time and gone: the daemon was killing it for that when
+            // the daemon itself died. That is a timeout, with the refund a
+            // timeout gets, not a crash that keeps the slice.
+            let late = task.admit_ms.is_some_and(|start| {
+                ts >= start.saturating_add(task.budget.seconds.saturating_mul(1000))
+            });
+            let spent = self
+                .purse
+                .open
+                .get(&task.id)
+                .map(|slice| slice.used.min(task.budget.tokens));
+            let (reason, used) = match (late, spent) {
+                (true, Some(spent)) => ("timeout", spent),
+                _ => ("crash", task.budget.tokens),
+            };
             out.push(Record::Exit {
                 id: task.id.clone(),
                 code: -1,
-                reason: "crash".into(),
+                reason: reason.into(),
                 tokens_used: used,
-                refund_tokens: 0,
+                refund_tokens: task.budget.tokens - used,
                 ts,
             });
         }
@@ -820,7 +834,11 @@ impl State {
             if task.parent.as_deref().is_some_and(|p| dead.contains(p)) {
                 continue;
             }
-            if let Some(rec) = self.retry_for(&task.id, "crash", cfg, ts) {
+            let late = task.admit_ms.is_some_and(|start| {
+                ts >= start.saturating_add(task.budget.seconds.saturating_mul(1000))
+            });
+            let reason = if late { "timeout" } else { "crash" };
+            if let Some(rec) = self.retry_for(&task.id, reason, cfg, ts) {
                 out.push(rec);
             }
         }
