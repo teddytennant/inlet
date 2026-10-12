@@ -1076,6 +1076,9 @@ fn memory_is_capped_by_what_a_worker_really_uses() {
     assert_eq!(hog["state"], "failed", "{st}");
     let log = inlet(&home, &["logs", hog["id"].as_str().unwrap()]);
     assert!(log.contains("over 150 MB, stopped"), "{log}");
+    // Its own doing, not a crash: named for what it was, and not charged a slice.
+    assert_eq!(hog["reason"], "memory", "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
     let thin = all.iter().find(|t| t["worker"] == "thin").unwrap();
     assert_eq!(thin["state"], "done", "{st} {}", daemon.log());
 }
@@ -1354,5 +1357,93 @@ fn doctor_says_what_is_wrong() {
     inlet(&home, &["add", "-w", "job", "-g", "after", "--no-verify"]);
     wait(&home, &daemon, |v| {
         tasks(v).iter().any(|t| t["state"] == "done")
+    });
+}
+
+#[test]
+fn the_ledger_rotates_and_nothing_is_lost() {
+    let home = scratch("rotate");
+    policy(
+        &home,
+        r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },
+        nap = { cmd = { "/bin/sh", "-c", "sleep 4; echo hi > out" } },"#,
+        "retain = 1",
+    );
+    let boot = |home: &Path| {
+        let log_path = home.join("test-daemon.log");
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let mut child = Command::new(bin())
+            .args(["--home", home.to_str().unwrap(), "up", "-f"])
+            .env("INLET_ROTATE_BYTES", "3000")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let want = child.id().to_string();
+        for _ in 0..800 {
+            let pid = fs::read_to_string(home.join("run/inlet.pid")).unwrap_or_default();
+            if pid.trim() == want {
+                return Daemon { child, log_path };
+            }
+            assert!(child.try_wait().unwrap().is_none(), "daemon died");
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("daemon did not come up");
+    };
+    let mut daemon = boot(&home);
+    manifest(
+        &home,
+        r#"{"kind":"swarm","name":"many","replicas":4,"completions":24,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&home, &daemon, |v| swarm(v, "many")["phase"] == "done");
+    // A task still running when the log turns over.
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "nap",
+            "-g",
+            "across",
+            "--verify",
+            "test -s out",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !daemon.log().contains("rotated the ledger") {
+        assert!(Instant::now() < deadline, "no rotation: {}", daemon.log());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(home.join("ledger/log.old").exists());
+    // The swarm alone wrote several times the threshold. What is left in the
+    // live log is what came after the last turn.
+    let old = fs::metadata(home.join("ledger/log.old")).unwrap().len();
+    assert!(old >= 3000, "old log is {old} bytes");
+    // Dead and back, on the short log and the checkpoint.
+    kill9(&mut daemon);
+    let daemon = boot(&home);
+    let st = wait(&home, &daemon, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "across" && t["state"] == "done")
+            || (v["live"] == 0 && tasks(v).iter().all(|t| t["goal"] != "across"))
+    });
+    assert_eq!(swarm(&st, "many")["done"], 24, "{st}");
+    assert_eq!(swarm(&st, "many")["created"], 24, "{st}");
+    assert_eq!(st["held"], 0, "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    inlet(
+        &home,
+        &["add", "-w", "job", "-g", "after", "--verify", "test -s out"],
+    );
+    wait(&home, &daemon, |v| {
+        tasks(v)
+            .iter()
+            .any(|t| t["goal"] == "after" && t["state"] == "done")
     });
 }

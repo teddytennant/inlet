@@ -96,9 +96,12 @@ inlet does not supervise itself. Put it under whatever supervises the box:
     Restart=always
     RestartSec=1
     KillMode=process
+    Delegate=yes
 
     [Install]
     WantedBy=default.target
+
+`Delegate=yes` lets the daemon make one cgroup per worker, so the kernel enforces each worker's `memory_mb` and `pids` and a worker over its memory ends as `memory`, not as a crash. Without it workers get rlimits and a five-times-a-second check of resident memory.
 
 `KillMode=process` matters: systemd then signals the daemon alone, the workers stay up, and the restarted daemon takes them back. That goes for `systemctl stop` too, so stopping the unit leaves the work running. `inlet down` is what stops the workers; `inlet down --keep` stops only the daemon. The same file is in `contrib/inlet.service`.
 

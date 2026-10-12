@@ -8,6 +8,9 @@ Restart=always
 RestartSec=1
 # Signal the daemon alone. The workers stay up and the next daemon takes them back.
 KillMode=process
+# Lets the daemon make one cgroup per worker, so the kernel holds each to its
+# memory and pids.
+Delegate=yes
 
 [Install]
 WantedBy=default.target

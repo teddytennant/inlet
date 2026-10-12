@@ -102,6 +102,8 @@ Record kinds: `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`, `gate`, 
 
 `vote` and `moderation` are board records. See Board consensus. They are not admission.
 
+The daemon checkpoints itself: the index is rewritten when the log has grown 32MB past the last one or when `retain` forgot something, so a restart reads and replays only the tail. Past 256MB the log is rotated at a checkpoint: renamed to `log.old`, one generation kept, and a new one started. `retain` (30 days by default, 0 for never) forgets a settled task and removes its workdir and transcripts; its records stay in the log.
+
 Snapshots: `inlet snap` writes a git commit of the registry, the signed policy, and a compacted header index tagged with the log offset it covers. Restart loads that index and replays from the offset. The live log is not a commit per event. A second machine pulls snapshots. It does not tail the live log over the network.
 
 ## Isolation and budgets
@@ -122,7 +124,7 @@ Isolator, picked in config, falling back to rlimit when cgroup writes are refuse
 
 | name | what it does | when |
 |---|---|---|
-| cgroup | cgroup v2: memory, pids, cpu.max | default where the user slice is delegated |
+| cgroup | cgroup v2: memory.max with no swap, pids.max, cpu.max, one group per worker | default where the daemon's own group is delegated: a unit with `Delegate=yes` |
 | rlimit | data, nofile, nproc, cpu nice | fallback when cgroup writes are refused |
 | slurm | one job per worker, the job is the cgroup | cluster |
 
@@ -238,7 +240,7 @@ It reaches the worker every way a harness might want, so the task record never h
 
 `env` on a worker adds variables, with `env:NAME` read from the daemon's environment. `stall` on a worker stops one that has printed nothing and made no model call for that long, reason `stall`. A worker waiting on a child is not stalled.
 
-Memory is capped by what is resident. No rlimit can do it: `RLIMIT_AS` kills node at start and `RLIMIT_DATA` kills Bun, because both count what a runtime reserves and not what it touches. A kept worker's keeper adds up the resident memory of everything in its cell once a second and stops the worker past `memory_mb`, with a line in the transcript. The cgroup isolator caps it in the kernel as well. A worker that is not kept, and a verifier, still get `RLIMIT_DATA`.
+Memory is capped by what is resident. No rlimit can do it: `RLIMIT_AS` kills node at start and `RLIMIT_DATA` kills Bun, because both count what a runtime reserves and not what it touches. Under the cgroup isolator the kernel enforces it. The daemon moves itself into a leaf group, because cgroup v2 gives no controllers to the children of a group that has processes, and makes one group per worker beside it. A worker past its memory is killed whole (`memory.oom.group`) and settles as `memory`: not retried, since the same budget would end the same way, and not charged its slice. The group is killed and removed when the task settles. Without a delegated group, a kept worker's keeper adds up the resident memory of everything in its cell five times a second and stops the worker past `memory_mb`, with the same reason. A worker that is not kept, and a verifier, still get `RLIMIT_DATA`.
 
 Every cell has its own `/proc`, mounted before the old root is detached, which is the only moment the kernel allows it in a user namespace.
 

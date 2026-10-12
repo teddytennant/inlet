@@ -1005,6 +1005,7 @@ fn door_keep(args: &[String]) -> Result<()> {
             }
             let started = std::time::Instant::now();
             let mut ticks = 0u64;
+            let mut over = false;
             let mut written = 0u64;
             let mut buf = [0u8; 8192];
             let mut pump = |log: &mut fs::File| {
@@ -1022,29 +1023,33 @@ fn door_keep(args: &[String]) -> Result<()> {
                 if let Ok(Some(done)) = child.try_wait() {
                     // Once more for what it printed last.
                     pump(&mut log);
-                    break done.into_raw();
+                    break (done.into_raw(), over);
                 }
                 // With no daemon left to time it out, this is the clock.
                 if deadline > 0 && started.elapsed() > Duration::from_secs(deadline) {
                     let _ = child.kill();
                 }
-                // Resident memory of everything in the cell, once a second.
+                // Resident memory of everything in the cell, five times a second.
                 // Node, Bun, the JVM, and Go all reserve far more than they
                 // touch, so only what is resident can be a cap.
                 ticks += 1;
-                if memory_kb > 0 && ticks.is_multiple_of(50) && cell_rss_kb() > memory_kb {
+                if memory_kb > 0 && ticks.is_multiple_of(10) && cell_rss_kb() > memory_kb {
                     let _ = writeln!(log, "inlet: over {} MB, stopped", memory_kb / 1024);
                     let _ = child.kill();
+                    over = true;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
         }
         Err(e) => {
             let _ = writeln!(log, "inlet: {}: {e}", args[5]);
-            127 << 8
+            (127 << 8, false)
         }
     };
+    // The wait status, then why the keeper itself stopped the worker, if it did.
+    let (code, over) = code;
     status.write_all(&code.to_ne_bytes())?;
+    status.write_all(&i32::from(over).to_ne_bytes())?;
     status.sync_all()?;
     std::process::exit(if libc::WIFEXITED(code) {
         libc::WEXITSTATUS(code)

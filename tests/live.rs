@@ -3737,6 +3737,13 @@ fn spawn_upstream(usages: &[&str], delay_ms: u64) -> (u16, Arc<Mutex<Vec<u64>>>)
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
+            // An editor's port forwarder probes new listeners with `HEAD /`.
+            // It must not use up a scripted reply meant for the daemon.
+            let mut peeked = [0u8; 5];
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+            if conn.peek(&mut peeked).unwrap_or(0) < 5 || &peeked != b"POST " {
+                continue;
+            }
             let i = next.fetch_add(1, Ordering::Relaxed);
             let usage = usages
                 .get(i)

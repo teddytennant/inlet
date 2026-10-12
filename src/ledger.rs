@@ -109,6 +109,26 @@ impl Ledger {
         self.len == 0
     }
 
+    /// Start a new log. The old one is kept under `<name>.old`, one
+    /// generation back, and the caller has a checkpoint that covers it.
+    pub fn rotate(&mut self, path: &Path) -> Result<()> {
+        self.file.sync_all()?;
+        std::fs::rename(path, path.with_extension("old"))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        file.sync_all()?;
+        if let Some(dir) = path.parent().and_then(|d| File::open(d).ok()) {
+            let _ = dir.sync_all();
+        }
+        self.file = file;
+        self.len = 0;
+        self.lock()
+    }
+
     pub fn lock(&self) -> Result<()> {
         let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {

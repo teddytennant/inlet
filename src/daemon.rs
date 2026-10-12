@@ -36,6 +36,9 @@ const SOFT_FLUSH: Duration = Duration::from_millis(50);
 const TRANSCRIPT_CAP: u64 = 16 * 1024 * 1024;
 const VERIFY_LOG_CAP: u64 = 256 * 1024;
 const GC_EVERY: Duration = Duration::from_secs(60);
+/// Past this the log is rotated at the next checkpoint. `INLET_ROTATE_BYTES`
+/// overrides it, for tests.
+const ROTATE_BYTES: u64 = 256 * 1024 * 1024;
 const DISK_EVERY: Duration = Duration::from_secs(5);
 /// Below this much free space nothing new is admitted. The ledger must be
 /// able to record how the running tasks end.
@@ -309,6 +312,9 @@ fn run(home: &Path) -> Result<()> {
     let _ = std::os::unix::fs::symlink("../door/worker.sock", &old);
     listen_socket(&paths::operator_sock(home), cmd_tx, false)?;
     let cell_ok = cell::probe(home);
+    if policy.cfg.isolator == crate::config::Isolator::Cgroup && !isolate::prepare() {
+        eprintln!("inlet: no delegated cgroup here, workers get rlimits");
+    }
     // The binary the cells run is a copy taken now. An upgrade that replaces
     // the file on disk must not change, or break, a daemon that is running.
     let cell_bin = home
@@ -1122,11 +1128,25 @@ impl Daemon {
         // The index is a shortcut past the log. Take it when it would save a
         // long replay, or when forgetting would otherwise be undone by one.
         let grown = self.ledger.len().saturating_sub(self.snap_offset);
-        if pruned > 0 || grown >= CHECKPOINT_BYTES {
+        let rotate_at = std::env::var("INLET_ROTATE_BYTES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(ROTATE_BYTES);
+        let rotate = self.ledger.len() >= rotate_at;
+        if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate {
             self.flush_soft()?;
             let offset = self.ledger.len();
             snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;
             self.snap_offset = offset;
+            if rotate {
+                // The checkpoint holds everything the log said. A crash after
+                // the rename and before the second index finds an empty log
+                // under an index with an offset, which startup reads as this.
+                self.ledger.rotate(&paths::ledger(&self.home))?;
+                snap::store(&self.home, &snap::checkpoint(&self.state, 0))?;
+                self.snap_offset = 0;
+                eprintln!("inlet: rotated the ledger at {offset} bytes");
+            }
         }
         Ok(())
     }
@@ -1434,6 +1454,14 @@ impl Daemon {
             -1
         };
         let signalled = libc::WIFSIGNALED(status);
+        // The kernel's verdict, where a cgroup gave it one. A worker stopped
+        // for memory failed on its own terms: it keeps what it did not spend,
+        // and a retry with the same budget would end the same way.
+        let over = fs::read(paths::exit_file(&self.home, &id))
+            .is_ok_and(|bytes| bytes.get(4..8) == Some(&1i32.to_ne_bytes()[..]));
+        if !self.pending.contains_key(&id) && (over || isolate::oom_killed(&id)) {
+            self.pending.insert(id.clone(), "memory".into());
+        }
         let reason = self.pending.remove(&id);
         match reason.as_deref() {
             Some("killed") => self.finish(&id, code, "killed", true)?,
@@ -1614,6 +1642,7 @@ impl Daemon {
         let _ = fs::remove_dir_all(paths::cell_root(&self.home, &format!("{id}-check")));
         let _ = fs::remove_dir_all(paths::scratch(&self.home, id));
         let _ = fs::remove_dir_all(self.home.join("run/checks").join(id));
+        isolate::release(id);
         Ok(())
     }
 
