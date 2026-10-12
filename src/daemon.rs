@@ -813,6 +813,8 @@ impl Daemon {
         if self.soft.is_empty() {
             return Ok(());
         }
+        // Buffered records are writes too.
+        self.still_leader()?;
         let batch = std::mem::take(&mut self.soft);
         self.ledger.append_all(&batch, true)?;
         self.last_flush = Instant::now();
@@ -1331,6 +1333,8 @@ impl Daemon {
             .unwrap_or(ROTATE_BYTES);
         let rotate = self.ledger.len() >= rotate_at;
         if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate {
+            // The index and a rotation are writes a replaced leader must not make.
+            self.still_leader()?;
             self.flush_soft()?;
             let offset = self.ledger.len();
             snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;
@@ -3420,6 +3424,8 @@ impl Daemon {
     }
 
     fn take_snap(&mut self) -> Result<Value> {
+        // The index and a rotation are writes a replaced leader must not make.
+        self.still_leader()?;
         self.flush_soft()?;
         let offset = self.ledger.len();
         snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;

@@ -2036,9 +2036,9 @@ fn a_leader_that_has_been_replaced_stops_writing() {
         .trim()
         .parse()
         .unwrap();
-    let before = fs::metadata(home.join("ledger/log")).unwrap().len();
     // Storage that only pretends to lock has let another daemon in.
     fs::write(home.join("ledger/epoch"), (epoch + 1).to_string()).unwrap();
+    let before = fs::metadata(home.join("ledger/log")).unwrap().len();
     let deadline = Instant::now() + Duration::from_secs(20);
     while daemon.child.try_wait().unwrap().is_none() {
         assert!(Instant::now() < deadline, "still leading: {}", daemon.log());
