@@ -3914,12 +3914,20 @@ fn verifier_cannot_touch_the_host() {
         .find(|t| t["goal"] == "check")
         .unwrap();
     assert_eq!(task["reason"], "ok", "{st} {}", daemon.log());
+    // The draft's own check runs after the task settles. Give it a moment.
     let mut ready = false;
-    for author in fs::read_dir(home.join("drafts")).unwrap().flatten() {
-        let path = author.path().join("evil/meta.json");
-        if let Ok(text) = fs::read_to_string(path) {
-            let meta: Value = serde_json::from_str(&text).unwrap();
-            ready = meta["ready"] == true;
+    let until = Instant::now() + Duration::from_secs(20);
+    while !ready && Instant::now() < until {
+        for author in fs::read_dir(home.join("drafts")).unwrap().flatten() {
+            let path = author.path().join("evil/meta.json");
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(meta) = serde_json::from_str::<Value>(&text) {
+                    ready = meta["ready"] == true;
+                }
+            }
+        }
+        if !ready {
+            thread::sleep(Duration::from_millis(50));
         }
     }
     assert!(ready, "draft verifier did not pass {}", daemon.log());
