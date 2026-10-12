@@ -441,6 +441,9 @@ fn install_signals(tx: Sender<Incoming>) -> Result<()> {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_signal as *const () as usize;
+        // Restart what the signal interrupted. A spawn caught mid-handshake by
+        // SIGTERM once took a read error for a dead child and waited on a live one.
+        action.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());

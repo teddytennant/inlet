@@ -568,6 +568,10 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
 
     let mut byte = [0u8; 1];
     if read_full(ready_r.0, &mut byte).is_err() {
+        // Kill before waiting. A child that is alive and waiting on this
+        // process, waited on by this process, is a daemon stuck for good
+        // with the ledger locked.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = unsafe { libc::waitpid(pid, ptr::null_mut(), 0) };
         return Err(err("worker died before the user namespace was ready"));
     }
@@ -588,6 +592,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     drop(err_r);
     if n.is_ok() {
         let errno = i32::from_ne_bytes(code);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = unsafe { libc::waitpid(pid, ptr::null_mut(), 0) };
         return Err(err(format!("cell setup failed ({errno})")));
     }
@@ -1103,6 +1108,10 @@ fn read_full(fd: i32, buf: &mut [u8]) -> Result<()> {
             return Err(err("eof"));
         }
         if n < 0 {
+            // A signal landing mid-read is not the other end going away.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(err("read"));
         }
         got += n as usize;
@@ -1115,6 +1124,9 @@ fn write_full(fd: i32, buf: &[u8]) -> Result<()> {
     while put < buf.len() {
         let n = unsafe { libc::write(fd, buf[put..].as_ptr().cast(), buf.len() - put) };
         if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(err("write"));
         }
         put += n as usize;

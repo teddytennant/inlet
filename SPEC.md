@@ -538,4 +538,5 @@ Each step is usable before the next one exists.
 18. Chaos. `scripts/chaos.py` kills the daemon with SIGKILL and SIGTERM at random while two swarms run, one of them parents waiting on children, then checks that every goal is done exactly once, the purse adds up to the token, no attempt went past its limit, and no process, cell, or note is left on the host.
 19. Kernel limits and a bounded log. One cgroup per worker under a delegated group. Checkpoints, retention, rotation.
 20. Nodes. `place` in the admit's fsync, the task over stdin with a tag, status every two seconds, `node_grace`, and placing again.
+21. Chaos across nodes. `scripts/chaos-nodes.py` runs a leader and nodes on one box, kills any of them at random, and leaves a node down past `node_grace` now and then. Its first runs found a daemon that a signal could freeze mid-spawn with the ledger locked.
 
