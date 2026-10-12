@@ -80,6 +80,8 @@ human_weight = 4
 min_ev = 0
 value = 400000
 debug = 1
+unattended = false
+retry = {{ max = 0, backoff = 0 }}
 default_budget = {{ tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }}
 proxy = {{ {proxy} }}
 workers = {{
@@ -1712,13 +1714,14 @@ fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
     }
     let preamble = fs::read_to_string(&preamble_path).unwrap_or_default();
     assert!(preamble.contains(&author), "{preamble}");
+    assert!(preamble.contains("attempt 1 of 1"), "{preamble}");
     assert!(
-        preamble.contains("Do not open a private channel to a sibling"),
+        preamble.contains("Nobody is watching this run"),
         "{preamble}"
     );
-    assert!(preamble.contains("Talk on the board"), "{preamble}");
+    assert!(preamble.contains("$INLET_BIN door"), "{preamble}");
     assert!(
-        preamble.contains("Empty purse: stop and post"),
+        preamble.contains("You cannot kill, rebudget, or raise caps"),
         "{preamble}"
     );
     assert!(
@@ -1842,6 +1845,11 @@ fn fake_decision(reply: Arc<dyn Fn(&str) -> DecisionReply + Send + Sync>) -> Fak
             let raw = read_http_req(&mut conn);
             let (path, body) = split_http(&raw);
             if path.is_empty() && body.is_empty() {
+                continue;
+            }
+            // An editor's port forwarder probes new listeners with `HEAD /`.
+            // The daemon only ever posts.
+            if !raw.starts_with(b"POST ") {
                 continue;
             }
             saved.lock().unwrap().push(DecisionHit {
@@ -2427,7 +2435,14 @@ fn decision_spend_survives_kill9() {
     let daemon = start(&home);
     let st = status(&home);
     assert_eq!(st["gate_spent"].as_u64(), Some(40), "{st} {}", daemon.log());
-    assert_eq!(fake.hits.lock().unwrap().len(), 1);
+    let hits: Vec<String> = fake
+        .hits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|h| format!("{} {}", h.path, h.body))
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
     let admits = read_log(&home)
         .into_iter()
         .filter(|r| {
@@ -3046,18 +3061,28 @@ fn operator_skill_is_the_same_thin_wrapper() {
     let text = String::from_utf8(pi).unwrap();
     for line in [
         "You are on the inlet operator socket, outside the workers.",
-        "Use the inlet CLI for status, add, post, bind, kill, pin, diff, and watch.",
+        "nobody approves your steps",
+        "Say what should be true with `inlet apply`",
         "inlet watch --debug N",
         "You do not carry a message between them.",
+        "Give every task a verifier.",
+        "Use `--no-verify` only for work nothing can check.",
         "You cannot sign.",
         "edit policy.draft.lua",
-        "inlet diff",
-        "The human signs.",
-        "Use `--no-verify` only when the human asked.",
         "Do not enter a cell.",
         "The socket is the door.",
     ] {
         assert!(text.contains(line), "skill missing {line}");
+    }
+    // The skill and the spec carry the same paragraph.
+    let spec = fs::read_to_string(root.join("SPEC.md")).unwrap();
+    let body = text
+        .lines()
+        .find(|line| line.starts_with("You are on the inlet operator socket"))
+        .unwrap();
+    assert!(spec.contains(body), "skill and SPEC.md diverged");
+    for wait in ["show the human", "The human signs", "and stop."] {
+        assert!(!text.contains(wait), "skill waits on a person: {wait}");
     }
     assert!(
         !text.contains("inlet sign"),
@@ -3121,6 +3146,7 @@ fn empty_daemon_rss_when_asked() {
                 },
                 retry_of: None,
                 recipe: None,
+                plan: Default::default(),
                 ts: 1,
             });
         }
@@ -3464,6 +3490,7 @@ fn losing_fence_does_not_spend() {
                     },
                     retry_of: None,
                     recipe: None,
+                    plan: Default::default(),
                     ts: 1,
                 },
                 true,

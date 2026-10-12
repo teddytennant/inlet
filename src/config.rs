@@ -23,10 +23,14 @@ isolator     = "cgroup"
 human_weight = 4
 min_ev       = 0
 value        = 400000
-unattended   = false
+unattended   = true
 debug        = 1
 
 default_budget = { tokens = 200000, seconds = 3600, memory_mb = 1024, pids = 8 }
+
+-- a failed task is retried with what went wrong in its prompt
+retry = { max = 2, backoff = "10s", max_backoff = "10m" }
+verify_seconds = 300
 
 decision = {
   kind         = "off",
@@ -41,6 +45,7 @@ proxy = {
   key      = "env:MODEL_API_KEY",
 }
 
+-- {prompt}, {goal}, and {id} are filled into cmd. stdin = "prompt" pipes it instead.
 workers = {
   pi     = { cmd = { "pi", "--mode", "rpc" }, tags = { "code" }, net = "host", on_crash = "fail" },
   prover = { cmd = { "prover" },              tags = { "math" }, net = "none", on_crash = "requeue" },
@@ -86,7 +91,36 @@ pub struct WorkerCfg {
     pub cmd: Vec<String>,
     pub tags: Vec<String>,
     pub net: Net,
-    pub on_crash: OnCrash,
+    /// `None` follows `retry`. `Fail` never retries a crash. `Requeue` always
+    /// allows one retry, whatever `retry.max` says.
+    pub on_crash: Option<OnCrash>,
+    /// Feed the prompt on stdin.
+    pub stdin: bool,
+    pub env: Vec<(String, String)>,
+    /// Kill a worker silent for this long. 0 is off.
+    pub stall_seconds: u64,
+    pub preamble: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryCfg {
+    /// Retries after the first attempt.
+    pub max: u32,
+    pub backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl RetryCfg {
+    /// Delay before attempt `n + 1`, after `n` failures in a row.
+    pub fn delay_ms(&self, failures: u32) -> u64 {
+        if failures == 0 || self.backoff_ms == 0 {
+            return 0;
+        }
+        let shift = (failures - 1).min(20);
+        self.backoff_ms
+            .saturating_mul(1u64 << shift)
+            .min(self.max_backoff_ms.max(self.backoff_ms))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +186,10 @@ pub struct Config {
     pub proxy: ProxyCfg,
     pub workers: BTreeMap<String, WorkerCfg>,
     pub rollup: Rollup,
+    pub retry: RetryCfg,
+    pub verify_seconds: u64,
+    /// Extra host paths every cell sees read-only.
+    pub cell_ro: Vec<std::path::PathBuf>,
 }
 
 pub struct Policy {
@@ -306,6 +344,28 @@ fn read_config(lua: &Lua) -> Result<Config> {
     if let Some(table) = g.get::<Option<Table>>("caps")? {
         overlay_caps(&mut cfg.caps, &table)?;
     }
+    if let Some(table) = g.get::<Option<Table>>("retry")? {
+        if let Some(v) = table.get::<Option<i64>>("max")? {
+            cfg.retry.max = v.clamp(0, 64) as u32;
+        }
+        if table.contains_key("backoff")? {
+            cfg.retry.backoff_ms = read_span(table.get::<Value>("backoff")?)?;
+        }
+        if table.contains_key("max_backoff")? {
+            cfg.retry.max_backoff_ms = read_span(table.get::<Value>("max_backoff")?)?;
+        }
+    }
+    if let Some(v) = g.get::<Option<i64>>("verify_seconds")? {
+        cfg.verify_seconds = v.max(1) as u64;
+    }
+    if let Some(table) = g.get::<Option<Table>>("cell")? {
+        for path in table.get::<Option<Vec<String>>>("ro")?.unwrap_or_default() {
+            if !path.starts_with('/') {
+                return Err(err(format!("cell.ro wants an absolute path, got {path}")));
+            }
+            cfg.cell_ro.push(path.into());
+        }
+    }
     if let Some(table) = g.get::<Option<Table>>("default_budget")? {
         overlay_budget(&mut cfg.default_budget, &table)?;
     }
@@ -357,14 +417,40 @@ fn read_worker(spec: &Table) -> Result<WorkerCfg> {
         None => default_net(&tags),
     };
     let on_crash = match spec.get::<Option<String>>("on_crash")? {
-        Some(v) => parse_crash(&v)?,
+        Some(v) => Some(parse_crash(&v)?),
         None => default_crash(&tags),
+    };
+    let stdin = match spec.get::<Option<String>>("stdin")?.as_deref() {
+        None | Some("none") => false,
+        Some("prompt") => true,
+        Some(other) => return Err(err(format!("unknown stdin {other}"))),
+    };
+    let mut env = Vec::new();
+    if let Some(table) = spec.get::<Option<Table>>("env")? {
+        for pair in table.pairs::<String, String>() {
+            let (key, value) = pair?;
+            if let Some(value) = resolve_env(value) {
+                env.push((key, value));
+            }
+        }
+        env.sort();
+    }
+    let stall_seconds = if spec.contains_key("stall")? {
+        read_span(spec.get::<Value>("stall")?)? / 1000
+    } else {
+        0
     };
     Ok(WorkerCfg {
         cmd,
         tags,
         net,
         on_crash,
+        stdin,
+        env,
+        stall_seconds,
+        preamble: spec
+            .get::<Option<String>>("preamble")?
+            .filter(|p| !p.is_empty()),
     })
 }
 
@@ -376,11 +462,11 @@ pub fn default_net(tags: &[String]) -> Net {
     }
 }
 
-pub fn default_crash(tags: &[String]) -> OnCrash {
+pub fn default_crash(tags: &[String]) -> Option<OnCrash> {
     if tags.iter().any(|t| t == "math") && !tags.iter().any(|t| t == "code") {
-        OnCrash::Requeue
+        Some(OnCrash::Requeue)
     } else {
-        OnCrash::Fail
+        None
     }
 }
 
@@ -464,6 +550,26 @@ fn overlay_budget(budget: &mut Budget, table: &Table) -> Result<()> {
     Ok(())
 }
 
+/// A duration in milliseconds. Unlike a period, zero is allowed.
+fn read_span(value: Value) -> Result<u64> {
+    match value {
+        Value::Integer(n) => Ok((n.max(0) as u64).saturating_mul(1000)),
+        Value::Number(n) => Ok((n.max(0.0) as u64).saturating_mul(1000)),
+        Value::String(s) => {
+            let text = s.to_str().map_err(|_| err("duration is not utf-8"))?;
+            parse_span(&text)
+        }
+        _ => Err(err("expected a duration")),
+    }
+}
+
+pub fn parse_span(raw: &str) -> Result<u64> {
+    if raw.trim() == "0" {
+        return Ok(0);
+    }
+    parse_period(raw).map_err(|_| err(format!("bad duration {raw}")))
+}
+
 fn read_period(value: Value) -> Result<u64> {
     match value {
         Value::Integer(n) => Ok((n.max(1) as u64).saturating_mul(1000)),
@@ -532,7 +638,7 @@ pub fn preset(setup: &str) -> Config {
         human_weight: 4,
         min_ev: 0,
         value: 400_000,
-        unattended: false,
+        unattended: true,
         debug: 1,
         preamble: None,
         default_budget: Budget {
@@ -554,6 +660,13 @@ pub fn preset(setup: &str) -> Config {
         },
         workers: BTreeMap::new(),
         rollup: Rollup::Count,
+        retry: RetryCfg {
+            max: 2,
+            backoff_ms: 10_000,
+            max_backoff_ms: 600_000,
+        },
+        verify_seconds: 300,
+        cell_ro: Vec::new(),
     }
 }
 
@@ -572,8 +685,8 @@ mod tests {
         assert_eq!(default_net(&["code".into()]), Net::Host);
         assert_eq!(default_net(&["math".into()]), Net::None);
         assert_eq!(default_net(&["math".into(), "code".into()]), Net::Host);
-        assert_eq!(default_crash(&["math".into()]), OnCrash::Requeue);
-        assert_eq!(default_crash(&["code".into()]), OnCrash::Fail);
+        assert_eq!(default_crash(&["math".into()]), Some(OnCrash::Requeue));
+        assert_eq!(default_crash(&["code".into()]), None);
     }
 
     #[test]
@@ -593,9 +706,46 @@ mod tests {
         assert_eq!(policy.cfg.caps.max_depth, 3);
         assert_eq!(policy.cfg.caps.token_period_ms, 30 * 60 * 1000);
         assert_eq!(policy.cfg.workers["prover"].net, Net::None);
-        assert_eq!(policy.cfg.workers["prover"].on_crash, OnCrash::Requeue);
+        assert_eq!(
+            policy.cfg.workers["prover"].on_crash,
+            Some(OnCrash::Requeue)
+        );
         assert_eq!(policy.cfg.workers["pi"].net, Net::None);
-        assert_eq!(policy.cfg.workers["pi"].on_crash, OnCrash::Requeue);
+        assert_eq!(policy.cfg.workers["pi"].on_crash, Some(OnCrash::Requeue));
+    }
+
+    #[test]
+    fn retry_and_worker_knobs_are_read() {
+        let policy = Policy::parse(
+            r#"
+            retry = { max = 5, backoff = "2s", max_backoff = "1m" }
+            verify_seconds = 45
+            cell = { ro = { "/opt/tools" } }
+            workers = {
+              a = { cmd = { "agent", "-p", "{prompt}" }, stdin = "prompt", stall = "10m",
+                    env = { MODE = "batch" }, preamble = "You are {id}." },
+            }
+            "#,
+        )
+        .unwrap();
+        let retry = policy.cfg.retry;
+        assert_eq!((retry.max, retry.backoff_ms), (5, 2_000));
+        assert_eq!(retry.delay_ms(0), 0);
+        assert_eq!(retry.delay_ms(1), 2_000);
+        assert_eq!(retry.delay_ms(3), 8_000);
+        assert_eq!(retry.delay_ms(30), 60_000);
+        assert_eq!(policy.cfg.verify_seconds, 45);
+        assert_eq!(
+            policy.cfg.cell_ro,
+            vec![std::path::PathBuf::from("/opt/tools")]
+        );
+        let a = &policy.cfg.workers["a"];
+        assert!(a.stdin);
+        assert_eq!(a.stall_seconds, 600);
+        assert_eq!(a.on_crash, None);
+        assert_eq!(a.env, vec![("MODE".to_string(), "batch".to_string())]);
+        assert_eq!(a.preamble.as_deref(), Some("You are {id}."));
+        assert!(Policy::parse("cell = { ro = { \"relative\" } }").is_err());
     }
 
     #[test]

@@ -1,9 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::config::{Config, OnCrash};
+use serde::{Deserialize, Serialize};
+
+use crate::config::{Config, OnCrash, RetryCfg};
 use crate::gate::samples_key;
-use crate::model::{Budget, Record, TaskState};
+use crate::model::{Budget, Plan, Record, TaskState, Template};
 use crate::purse::Purse;
+
+/// Failures a new attempt can fix. `killed` was asked for, `purse` would
+/// run dry again on the same budget, and a deny by a cap is not transient.
+pub const RETRYABLE: [&str; 7] = [
+    "crash", "verifier", "timeout", "exit", "stall", "gate", "stopped",
+];
 
 pub const POST_RING: usize = 400;
 
@@ -23,6 +31,66 @@ pub struct TaskView {
     pub recipe: Option<String>,
     pub pid: Option<i32>,
     pub admit_ms: Option<u64>,
+    pub plan: Plan,
+}
+
+const SWARM_PACE_MS: u64 = 1_000;
+
+/// A swarm's spec and what the ledger says has come of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmView {
+    pub name: String,
+    pub replicas: u64,
+    pub completions: u64,
+    pub backoff_limit: u32,
+    pub template: Template,
+    /// Tasks stamped so far. The next one is `created + 1`.
+    pub created: u64,
+    /// Owned tasks that have not settled.
+    pub active: u64,
+    pub done: u64,
+    pub failed: u64,
+    /// Failures in a row, counted after a task's own retries ran out.
+    pub streak: u32,
+    /// No new task before this time.
+    pub next_ms: u64,
+    pub generation: u64,
+}
+
+impl SwarmView {
+    pub fn finished(&self) -> bool {
+        self.completions > 0 && self.done >= self.completions
+    }
+
+    pub fn stalled(&self) -> bool {
+        self.backoff_limit > 0 && self.streak >= self.backoff_limit
+    }
+
+    /// How many tasks to stamp now.
+    pub fn wants(&self, now: u64) -> u64 {
+        if self.finished() || self.stalled() || now < self.next_ms {
+            return 0;
+        }
+        let room = self.replicas.saturating_sub(self.active);
+        if self.completions == 0 {
+            return room;
+        }
+        room.min(
+            self.completions
+                .saturating_sub(self.done)
+                .saturating_sub(self.active),
+        )
+    }
+
+    pub fn phase(&self) -> &'static str {
+        if self.finished() {
+            "done"
+        } else if self.stalled() {
+            "stalled"
+        } else {
+            "active"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +150,14 @@ pub struct ConstraintView {
     pub id: String,
     pub text: String,
     pub tags: Vec<String>,
+    /// 0 holds until cleared.
+    pub expires: u64,
+}
+
+impl ConstraintView {
+    pub fn holds(&self, now: u64) -> bool {
+        self.expires == 0 || now < self.expires
+    }
 }
 
 #[derive(Debug)]
@@ -101,6 +177,8 @@ pub struct State {
     pub moderation: Vec<ModerationView>,
     pub posts_seen: u64,
     pub channels: BTreeMap<String, ChannelStat>,
+    pub swarms: BTreeMap<String, SwarmView>,
+    retry: RetryCfg,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +233,8 @@ impl State {
             moderation: Vec::new(),
             posts_seen: 0,
             channels: BTreeMap::new(),
+            swarms: BTreeMap::new(),
+            retry: cfg.retry,
         }
     }
 
@@ -171,10 +251,21 @@ impl State {
                 budget,
                 retry_of,
                 recipe,
+                plan,
                 ts: _,
             } => {
                 if let Some(prev) = retry_of {
                     self.retried.insert(prev.clone());
+                }
+                if let Some(swarm) = plan.owner.as_ref().and_then(|o| self.swarms.get_mut(o)) {
+                    swarm.active += 1;
+                    if retry_of.is_some() {
+                        // The failure this retries was not the chain's last word.
+                        swarm.failed = swarm.failed.saturating_sub(1);
+                        swarm.streak = swarm.streak.saturating_sub(1);
+                    } else {
+                        swarm.created += 1;
+                    }
                 }
                 self.tasks.insert(
                     id.clone(),
@@ -193,6 +284,7 @@ impl State {
                         recipe: recipe.clone(),
                         pid: None,
                         admit_ms: None,
+                        plan: plan.clone(),
                     },
                 );
                 self.queue.push_back(id.clone());
@@ -208,11 +300,16 @@ impl State {
                 ts,
             } => {
                 if *fence != self.fence {
+                    let mut lost = false;
                     if let Some(task) = self.tasks.get_mut(id) {
                         if task.state == TaskState::Queued {
                             task.state = TaskState::Failed;
                             task.reason = "fence".into();
+                            lost = true;
                         }
+                    }
+                    if lost {
+                        self.settle_owner(id, false, *ts);
                     }
                     self.queue.retain(|q| q != id);
                     self.note_parent(id);
@@ -238,10 +335,15 @@ impl State {
                     self.note_parent(id);
                 }
             }
-            Record::Deny { id, reason, .. } => {
+            Record::Deny { id, reason, ts } => {
+                let mut open = false;
                 if let Some(task) = self.tasks.get_mut(id) {
+                    open = !task.state.is_settled();
                     task.state = TaskState::Failed;
                     task.reason = reason.clone();
+                }
+                if open {
+                    self.settle_owner(id, false, *ts);
                 }
                 self.queue.retain(|q| q != id);
                 self.note_parent(id);
@@ -257,7 +359,7 @@ impl State {
                 reason,
                 tokens_used,
                 refund_tokens,
-                ..
+                ts,
             } => {
                 let parent = self.tasks.get(id).and_then(|t| t.parent.clone());
                 let worker_tags = self
@@ -269,7 +371,9 @@ impl State {
                 if let Some((worker, tags)) = worker_tags {
                     self.samples.push(samples_key(&worker, &tags), *tokens_used);
                 }
+                let mut settled = None;
                 if let Some(task) = self.tasks.get_mut(id) {
+                    let open = !task.state.is_settled();
                     task.pid = None;
                     task.reason = reason.clone();
                     task.state = if reason == "killed" {
@@ -279,6 +383,12 @@ impl State {
                     } else {
                         TaskState::Failed
                     };
+                    if open {
+                        settled = Some(task.state == TaskState::Done);
+                    }
+                }
+                if let Some(done) = settled {
+                    self.settle_owner(id, done, *ts);
                 }
                 self.note_parent(id);
             }
@@ -321,13 +431,64 @@ impl State {
             Record::Gate { tokens, .. } => {
                 self.decision_spent = self.decision_spent.saturating_add(*tokens);
             }
-            Record::Bind { id, text, tags, .. } => {
+            Record::Bind {
+                id,
+                text,
+                tags,
+                expires,
+                ..
+            } => {
                 if !self.constraints.iter().any(|c| c.id == *id) {
                     self.constraints.push(ConstraintView {
                         id: id.clone(),
                         text: text.clone(),
                         tags: tags.clone(),
+                        expires: *expires,
                     });
+                }
+            }
+            Record::Swarm {
+                name,
+                replicas,
+                completions,
+                backoff_limit,
+                template,
+                ..
+            } => {
+                let swarm = self
+                    .swarms
+                    .entry(name.clone())
+                    .or_insert_with(|| SwarmView {
+                        name: name.clone(),
+                        replicas: 0,
+                        completions: 0,
+                        backoff_limit: 0,
+                        template: template.clone(),
+                        created: 0,
+                        active: 0,
+                        done: 0,
+                        failed: 0,
+                        streak: 0,
+                        next_ms: 0,
+                        generation: 0,
+                    });
+                swarm.replicas = *replicas;
+                swarm.completions = *completions;
+                swarm.backoff_limit = *backoff_limit;
+                swarm.template = template.clone();
+                // A new spec is a new chance.
+                swarm.streak = 0;
+                swarm.next_ms = 0;
+                swarm.generation += 1;
+            }
+            Record::SwarmDelete { name, .. } => {
+                self.swarms.remove(name);
+                // Tasks still in flight outlive it. They must not settle against
+                // a later swarm that takes the same name.
+                for task in self.tasks.values_mut() {
+                    if task.plan.owner.as_deref() == Some(name.as_str()) {
+                        task.plan.owner = None;
+                    }
                 }
             }
             Record::Clear { id, .. } => {
@@ -391,6 +552,118 @@ impl State {
         }
     }
 
+    /// An owned task settled. The swarm's counts follow the ledger, not the config,
+    /// so a replay under a different policy lands on the same numbers.
+    fn settle_owner(&mut self, id: &str, done: bool, ts: u64) {
+        let Some(owner) = self.tasks.get(id).and_then(|t| t.plan.owner.clone()) else {
+            return;
+        };
+        let retry = self.retry;
+        let Some(swarm) = self.swarms.get_mut(&owner) else {
+            return;
+        };
+        swarm.active = swarm.active.saturating_sub(1);
+        // Never less than a second, whatever `retry.backoff` says: an instant
+        // task in a swarm with no end, or one that always fails, would spin the ledger.
+        if done {
+            swarm.done += 1;
+            swarm.streak = 0;
+            if swarm.completions == 0 {
+                swarm.next_ms = ts.saturating_add(retry.delay_ms(1).max(SWARM_PACE_MS));
+            }
+        } else {
+            swarm.failed += 1;
+            swarm.streak = swarm.streak.saturating_add(1);
+            swarm.next_ms = ts.saturating_add(retry.delay_ms(swarm.streak).max(SWARM_PACE_MS));
+        }
+    }
+
+    /// The next attempt at a failed task, or `None` when the chain is spent.
+    /// A retry is a new task and a new admission. The old slice stays as charged.
+    pub fn retry_for(&self, id: &str, reason: &str, cfg: &Config, ts: u64) -> Option<Record> {
+        let task = self.tasks.get(id)?;
+        if self.retried.contains(id) || !RETRYABLE.contains(&reason) {
+            return None;
+        }
+        let attempt = task.plan.attempt();
+        let mut max = task.plan.max_attempts();
+        if reason == "stopped" {
+            // The daemon was shut down under it. That is not the task's failure,
+            // so the rerun is the same attempt. A child goes down with its parent,
+            // which will hand the part off again.
+            if task.parent.is_some() {
+                return None;
+            }
+            return Some(Record::Task {
+                id: crate::id::ulid(),
+                parent: None,
+                worker: task.worker.clone(),
+                tags: task.tags.clone(),
+                goal: task.goal.clone(),
+                verifier: task.verifier.clone(),
+                value: task.value,
+                budget: task.budget.clone(),
+                retry_of: Some(task.id.clone()),
+                recipe: task.recipe.clone(),
+                plan: Plan {
+                    not_before: 0,
+                    ..task.plan.clone()
+                },
+                ts,
+            });
+        }
+        if reason == "crash" {
+            match cfg.workers.get(&task.worker).and_then(|w| w.on_crash) {
+                Some(OnCrash::Fail) => return None,
+                Some(OnCrash::Requeue) => max = max.max(2),
+                None => {}
+            }
+        }
+        if attempt >= max {
+            return None;
+        }
+        if let Some(parent) = &task.parent {
+            // Nobody is left to read the answer.
+            if !self.tasks.get(parent).is_some_and(|p| p.state.is_live()) {
+                return None;
+            }
+        }
+        Some(Record::Task {
+            id: crate::id::ulid(),
+            parent: task.parent.clone(),
+            worker: task.worker.clone(),
+            tags: task.tags.clone(),
+            goal: task.goal.clone(),
+            verifier: task.verifier.clone(),
+            value: task.value,
+            budget: task.budget.clone(),
+            retry_of: Some(task.id.clone()),
+            recipe: task.recipe.clone(),
+            plan: Plan {
+                attempt: attempt + 1,
+                max_attempts: max,
+                not_before: ts.saturating_add(cfg.retry.delay_ms(attempt)),
+                owner: task.plan.owner.clone(),
+            },
+            ts,
+        })
+    }
+
+    /// The chain a task belongs to, oldest first.
+    pub fn chain(&self, id: &str) -> Vec<String> {
+        let mut out = vec![id.to_string()];
+        let mut cursor = self.tasks.get(id).and_then(|t| t.retry_of.clone());
+        while let Some(prev) = cursor {
+            if out.len() > 64 || out.contains(&prev) {
+                break;
+            }
+            cursor = self.tasks.get(&prev).and_then(|t| t.retry_of.clone());
+            out.push(prev);
+        }
+        out.reverse();
+        out
+    }
+
     /// A live parent with a queued or live child is blocked. A settled child releases it.
     fn note_parent(&mut self, id: &str) {
         let Some(parent) = self.tasks.get(id).and_then(|t| t.parent.clone()) else {
@@ -419,7 +692,7 @@ impl State {
     }
 
     /// Admit with no exit: the process is gone. Charge the token slice.
-    /// Math workers (or `on_crash = requeue`) get a fresh task, not a refund.
+    /// A retry, when the chain allows one, is a fresh task, not a refund.
     pub fn recover(&self, cfg: &Config, ts: u64) -> Vec<Record> {
         let mut out = Vec::new();
         for task in self.tasks.values() {
@@ -435,25 +708,23 @@ impl State {
                 refund_tokens: 0,
                 ts,
             });
-            let requeue = cfg
-                .workers
-                .get(&task.worker)
-                .map(|w| w.on_crash == OnCrash::Requeue)
-                .unwrap_or(false);
-            if requeue && !self.retried.contains(&task.id) {
-                out.push(Record::Task {
-                    id: crate::id::ulid(),
-                    parent: task.parent.clone(),
-                    worker: task.worker.clone(),
-                    tags: task.tags.clone(),
-                    goal: task.goal.clone(),
-                    verifier: task.verifier.clone(),
-                    value: task.value,
-                    budget: task.budget.clone(),
-                    retry_of: Some(task.id.clone()),
-                    recipe: task.recipe.clone(),
-                    ts,
-                });
+        }
+        // Children first lose their parent, so only roots and orphan-free chains retry.
+        let dead: std::collections::HashSet<&str> = self
+            .tasks
+            .values()
+            .filter(|t| t.state.is_live())
+            .map(|t| t.id.as_str())
+            .collect();
+        for task in self.tasks.values() {
+            if !dead.contains(task.id.as_str()) {
+                continue;
+            }
+            if task.parent.as_deref().is_some_and(|p| dead.contains(p)) {
+                continue;
+            }
+            if let Some(rec) = self.retry_for(&task.id, "crash", cfg, ts) {
+                out.push(rec);
             }
         }
         out
@@ -482,6 +753,7 @@ mod tests {
             },
             retry_of: None,
             recipe: None,
+            plan: Plan::default(),
             ts: 1,
         }
     }
@@ -496,6 +768,188 @@ mod tests {
             pids: 1,
             ts: 2,
         }
+    }
+
+    fn owned(id: &str, retry_of: Option<&str>) -> Record {
+        let Record::Task {
+            worker,
+            tags,
+            goal,
+            value,
+            budget,
+            ..
+        } = task(id)
+        else {
+            unreachable!()
+        };
+        Record::Task {
+            id: id.into(),
+            parent: None,
+            worker,
+            tags,
+            goal,
+            verifier: None,
+            value,
+            budget,
+            retry_of: retry_of.map(str::to_string),
+            recipe: None,
+            plan: Plan {
+                owner: Some("s".into()),
+                ..Plan::default()
+            },
+            ts: 1,
+        }
+    }
+
+    fn exit(id: &str, ok: bool) -> Record {
+        Record::Exit {
+            id: id.into(),
+            code: if ok { 0 } else { 1 },
+            reason: if ok { "ok" } else { "verifier" }.into(),
+            tokens_used: 0,
+            refund_tokens: 50,
+            ts: 10,
+        }
+    }
+
+    #[test]
+    fn swarm_counts_follow_the_ledger() {
+        let mut state = State::new(&crate::config::preset("box"));
+        state.apply(&Record::Swarm {
+            name: "s".into(),
+            replicas: 2,
+            completions: 3,
+            backoff_limit: 2,
+            template: Template::default(),
+            ts: 1,
+        });
+        assert_eq!(state.swarms["s"].wants(5), 2);
+        state.apply(&owned("a", None));
+        state.apply(&owned("b", None));
+        assert_eq!(state.swarms["s"].wants(5), 0);
+        for id in ["a", "b"] {
+            state.apply(&admit(id, 0));
+        }
+        state.apply(&exit("a", true));
+        // One done, one in flight, three wanted: room for one more.
+        assert_eq!(state.swarms["s"].wants(20), 1);
+
+        state.apply(&exit("b", false));
+        let swarm = &state.swarms["s"];
+        assert_eq!((swarm.failed, swarm.streak, swarm.active), (1, 1, 0));
+        assert_eq!(swarm.next_ms, 10 + 10_000, "a failure backs off");
+        assert_eq!(swarm.wants(11), 0);
+        // The retry takes the failure back and holds the slot.
+        state.apply(&owned("b2", Some("b")));
+        let swarm = &state.swarms["s"];
+        assert_eq!((swarm.failed, swarm.streak, swarm.active), (0, 0, 1));
+        assert_eq!(swarm.created, 2, "a retry is not a new index");
+
+        state.apply(&admit("b2", 0));
+        state.apply(&exit("b2", false));
+        state.apply(&owned("c", None));
+        state.apply(&admit("c", 0));
+        state.apply(&exit("c", false));
+        assert!(state.swarms["s"].stalled());
+        assert_eq!(state.swarms["s"].wants(u64::MAX), 0);
+        // A new spec clears the streak and keeps the counts.
+        state.apply(&Record::Swarm {
+            name: "s".into(),
+            replicas: 5,
+            completions: 3,
+            backoff_limit: 2,
+            template: Template::default(),
+            ts: 30,
+        });
+        let swarm = &state.swarms["s"];
+        assert_eq!((swarm.generation, swarm.done, swarm.failed), (2, 1, 2));
+        assert_eq!(
+            swarm.wants(30),
+            2,
+            "completions bound the stamp, not replicas"
+        );
+
+        state.apply(&Record::SwarmDelete {
+            name: "s".into(),
+            ts: 40,
+        });
+        state.apply(&owned("late", None));
+        assert!(state.swarms.is_empty());
+
+        // The name comes back while an old task is still running. Its exit
+        // belongs to the swarm that is gone.
+        let mut state = State::new(&crate::config::preset("box"));
+        let spec = Record::Swarm {
+            name: "s".into(),
+            replicas: 1,
+            completions: 1,
+            backoff_limit: 2,
+            template: Template::default(),
+            ts: 1,
+        };
+        state.apply(&spec);
+        state.apply(&owned("old", None));
+        state.apply(&admit("old", 0));
+        state.apply(&Record::SwarmDelete {
+            name: "s".into(),
+            ts: 2,
+        });
+        state.apply(&spec);
+        state.apply(&owned("new", None));
+        state.apply(&exit("old", true));
+        let swarm = &state.swarms["s"];
+        assert_eq!((swarm.done, swarm.active, swarm.created), (0, 1, 1));
+        assert!(!swarm.finished());
+    }
+
+    #[test]
+    fn retries_follow_the_plan_and_the_worker() {
+        let mut cfg = crate::config::preset("box");
+        cfg.retry.backoff_ms = 1_000;
+        let mut state = State::new(&cfg);
+        let mut first = task("a");
+        if let Record::Task { plan, .. } = &mut first {
+            plan.max_attempts = 2;
+        }
+        state.apply(&first);
+        state.apply(&admit("a", 0));
+        assert!(state.retry_for("a", "killed", &cfg, 5).is_none());
+        assert!(state.retry_for("a", "purse", &cfg, 5).is_none());
+        let Some(Record::Task {
+            id, plan, retry_of, ..
+        }) = state.retry_for("a", "verifier", &cfg, 5)
+        else {
+            panic!("no retry");
+        };
+        assert_eq!(retry_of.as_deref(), Some("a"));
+        assert_eq!(
+            (plan.attempt, plan.max_attempts, plan.not_before),
+            (2, 2, 1_005)
+        );
+
+        let mut second = task(&id);
+        if let Record::Task {
+            plan: p, retry_of, ..
+        } = &mut second
+        {
+            *p = plan;
+            *retry_of = Some("a".into());
+        }
+        state.apply(&second);
+        assert!(
+            state.retry_for("a", "verifier", &cfg, 5).is_none(),
+            "one retry per task"
+        );
+        assert!(
+            state.retry_for(&id, "verifier", &cfg, 5).is_none(),
+            "the chain is spent"
+        );
+        assert_eq!(state.chain(&id), ["a".to_string(), id.clone()]);
+        // A daemon stop is nobody's failure. It reruns without using an attempt.
+        let Some(Record::Task { plan, .. }) = state.retry_for(&id, "stopped", &cfg, 5) else {
+            panic!("no rerun");
+        };
+        assert_eq!((plan.attempt, plan.not_before), (2, 0));
     }
 
     #[test]

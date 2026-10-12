@@ -171,6 +171,7 @@ mod tests {
             },
             retry_of: None,
             recipe: None,
+            plan: crate::model::Plan::default(),
             ts: 1,
         }
     }

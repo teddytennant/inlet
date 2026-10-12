@@ -60,3 +60,8 @@ pub fn snap_index(home: &Path) -> PathBuf {
 pub fn snap_git(home: &Path) -> PathBuf {
     home.join("snap.git")
 }
+
+/// What the verifier printed for a task.
+pub fn verify_log(home: &Path, id: &str) -> PathBuf {
+    home.join("runs").join(format!("{id}.verify.log"))
+}

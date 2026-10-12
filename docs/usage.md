@@ -24,9 +24,41 @@ Bridges are the same room from another client. The daemon is already up.
 
 Discord also reads `keys/discord.token` mode 0600. Telegram reads `TELEGRAM_BOT_TOKEN`.
 
+## a swarm
+
+Say what should be running. The supervisor keeps it running.
+
+    cat > sweep.json <<'EOF'
+    {"kind": "swarm", "name": "sweep", "replicas": 4, "completions": 200,
+     "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check", "tokens": 20000}}
+    EOF
+    inlet apply -f sweep.json
+    inlet get swarms
+    inlet get tasks
+    inlet describe <id>
+    inlet logs <id>
+    inlet scale sweep 8
+    inlet delete sweep --kill
+
+Four run at once until 200 are done. `"completions": 0` never finishes. A task that fails its verifier is tried again, in the same workdir, with the verifier's output in its prompt. `--retries N` on `add`, `"retries"` in a template, or `retry.max` in the policy says how often. Six failures in a row stall a swarm, and `inlet apply` or `inlet scale` restarts it.
+
+## a worker
+
+A worker is a command. The prompt reaches it however it reads one.
+
+    workers = {
+      agent = { cmd = { "agent", "-p", "{prompt}" } },
+      piped = { cmd = { "agent" }, stdin = "prompt" },
+      other = { cmd = { "sh", "-c", "agent < $INLET_PROMPT_FILE" }, stall = "15m" },
+    }
+
+The prompt is the preamble, the goal, the verifier that will judge it, and on a retry what the last attempt got wrong. Inside the cell a worker hands work off with `$INLET_BIN door spawn` and collects it with `$INLET_BIN door wait`. See [doc/worker-socket.md](../doc/worker-socket.md).
+
+A worker's binary has to be somewhere the cell can see: `/usr`, `/bin`, `/nix/store`, or a path listed in `cell = { ro = { ... } }`.
+
 ## operator skill
 
-A harness with a shell (Pi, Wizard, Claude Code) loads the skill and drives the CLI. It cannot sign.
+A harness with a shell (Pi, Wizard, Claude Code) loads the skill and runs the swarm. Nobody approves its steps. It cannot sign.
 
 The skill is `skills/pi/SKILL.md`. `skills/wizard/SKILL.md` is the same file.
 
@@ -34,15 +66,7 @@ The skill is `skills/pi/SKILL.md`. `skills/wizard/SKILL.md` is the same file.
     cp -a skills/pi ~/.claude/skills/inlet
     cp -a skills/wizard ~/.agents/skills/inlet
 
-Then:
-
-    inlet status
-    inlet add -w pi -g "fix the flaky test" --no-verify
-    inlet watch --debug 1
-    inlet post shipped
-    inlet diff
-
-`--no-verify` only when the human asked. Caps and workers change in `policy.draft.lua`. The human runs `inlet sign`.
+Caps, `admit`, the preamble, and worker commands are the boundary. They change in `policy.draft.lua`, and on an install with a key `inlet sign` takes the passphrase. Everything inside the boundary runs without one.
 
 ## install
 

@@ -13,6 +13,7 @@ pub mod isolate;
 pub mod ledger;
 pub mod model;
 pub mod paths;
+pub mod prompt;
 pub mod proto;
 pub mod proxy;
 pub mod purse;

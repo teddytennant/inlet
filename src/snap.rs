@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Policy};
 use crate::error::{err, Result};
-use crate::model::{Budget, Decoded, TaskState};
+use crate::model::{Budget, Decoded, Plan, TaskState};
 use crate::paths;
 use crate::purse::{OpenSlice, Purse};
 use crate::state::{
-    ChannelStat, ConstraintView, ModerationView, PostView, State, TaskView, VoteView,
+    ChannelStat, ConstraintView, ModerationView, PostView, State, SwarmView, TaskView, VoteView,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -39,6 +39,8 @@ pub(crate) struct Index {
     purse: PurseSnap,
     #[serde(default)]
     votes: Vec<VoteSnap>,
+    #[serde(default)]
+    swarms: Vec<SwarmView>,
     #[serde(default)]
     moderation: Vec<ModerationSnap>,
     #[serde(default)]
@@ -69,6 +71,8 @@ struct HeaderSnap {
     recipe: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admit_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Plan::is_default")]
+    plan: Plan,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,6 +125,8 @@ struct ConstraintSnap {
     id: String,
     text: String,
     tags: Vec<String>,
+    #[serde(default)]
+    expires: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -212,6 +218,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
             retry_of: task.retry_of.clone(),
             recipe: task.recipe.clone(),
             admit_ms: task.admit_ms,
+            plan: task.plan.clone(),
         })
         .collect();
     let posts = state
@@ -235,6 +242,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
             id: c.id.clone(),
             text: c.text.clone(),
             tags: c.tags.clone(),
+            expires: c.expires,
         })
         .collect();
     let mut retried: Vec<String> = state.retried.iter().cloned().collect();
@@ -265,6 +273,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
         constraints,
         retried,
         decision_spent: state.decision_spent,
+        swarms: state.swarms.values().cloned().collect(),
         votes: state
             .votes
             .values()
@@ -341,6 +350,7 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
                     recipe: header.recipe.clone(),
                     pid: None,
                     admit_ms: header.admit_ms,
+                    plan: header.plan.clone(),
                 },
             )
         })
@@ -368,7 +378,13 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
             id: c.id.clone(),
             text: c.text.clone(),
             tags: c.tags.clone(),
+            expires: c.expires,
         })
+        .collect();
+    state.swarms = index
+        .swarms
+        .iter()
+        .map(|swarm| (swarm.name.clone(), swarm.clone()))
         .collect();
     state.retried = index.retried.iter().cloned().collect();
     state.decision_spent = index.decision_spent;

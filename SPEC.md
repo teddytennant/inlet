@@ -4,6 +4,8 @@ One static binary, the control plane for agent work. A personal factory of a few
 
 The binary is the scheduler, the ledger, the token proxy, the board, and the TUI. Pi and Wizard are workers or operators. They are not linked in.
 
+You say what should be true and the supervisor keeps it true. A swarm is a count of tasks to keep in flight. A failed task is tried again with what went wrong in its prompt. A dead daemon comes back and picks up where the ledger stops. No step of that waits on a person. The verifier, the budget, and the caps stand where a reviewer would.
+
 ## Choices
 
 Rust for the supervisor. The hot path is spawn, account, append, and redraw. That is a systems program, and it is the program the user runs, so it is the compiled artifact. A Python supervisor would ship a runtime, a GC, and a few hundred megabytes before the first worker. One static binary, no GC on the admission path, cgroup, namespace, and Landlock calls without a framework.
@@ -52,10 +54,11 @@ A task is the work unit. An agent is a running task.
 | `spent` | tokens, seconds |
 | `state` | `queued` \| `running` \| `blocked` \| `done` \| `failed` \| `killed` |
 | `fence` | lease generation, 0 on one machine |
+| `plan` | `attempt`, `max_attempts`, `not_before`, and the owning swarm. Empty on a plain `add` with no retries |
 
-No `kind`. The worker's tags say code or math, and an ask is a record, not a task.
+No `kind`. The worker's tags say code or math. A question is a board post or a child task. There is no ask record and nothing that waits for a person to answer.
 
-`queued` waits on admission. `blocked` is admitted and alive, waiting on an ask reply or a child result. `failed` carries a reason: `verifier`, `purse`, `timeout`, `crash`.
+`queued` waits on admission. `blocked` is admitted and alive, waiting on a child result. `failed` carries a reason: `verifier`, `exit`, `timeout`, `stall`, `crash`, `stopped`, `purse`, `cell`, or the gate's deny.
 
 The verifier is a separate command. The worker does not grade itself. The supervisor runs it in a cell with no token, no proxy, and no host secrets. For code that is the test suite. For math it is the checker.
 
@@ -63,13 +66,31 @@ No verifier means the operator put it there: `inlet add --no-verify`. Operator a
 
 Ten thousand agents means ten thousand task headers. Live processes are capped by the host. The rest stay queued. A laptop does not get ten thousand cgroups.
 
+## Desired state
+
+Two loops run on every pass of the supervisor, before admission. Both are projections of the ledger. Neither keeps a store of its own.
+
+Retry. A task that fails for a reason a new attempt can fix gets one: `verifier`, `exit`, `timeout`, `stall`, `crash`, `gate`. Not `killed`, which someone asked for. Not `purse`, which would run dry again on the same budget. Not a deny by a cap. The retry is a new task with `retry_of` set, a new admission, and a new debit. It is written in the same fsync as the exit that caused it, so a failure cannot lose its retry. `plan.attempt` counts up to `plan.max_attempts`, which is `1 + retries` from the task, or `1 + retry.max` from the policy. `plan.not_before` holds it back: `retry.backoff`, doubled per failure, capped at `retry.max_backoff`.
+
+The retry keeps the workdir. The supervisor renames the old one into place, so the worker starts where the last attempt stopped. Its prompt says which attempt this is, how the last one ended, and the last lines of the verifier's output and its own. That is the whole feedback path. No human reads a failure and rewrites the goal.
+
+`stopped` is a task the daemon shut down under. It reruns on the next start as the same attempt, because the task did nothing wrong. A child does not rerun alone. It goes down with its parent, and the parent hands the part off again.
+
+Swarm. `inlet apply` writes a `swarm` record: a name, `replicas`, `completions`, `backoff_limit`, and a task template. The supervisor stamps tasks from the template until `replicas` are in flight, and stops when `completions` are done. `completions` defaults to `replicas`. `completions = 0` never finishes, and paces itself by `retry.backoff` after each task so an instant worker cannot spin the ledger. `{index}` in the goal is the number of the task in its swarm.
+
+A stamped task carries the swarm's name in `plan`. Its own retries run first. A failure counts against the swarm only when the chain is spent. Failures in a row back the swarm off like a retry, and at `backoff_limit` (default 6, 0 for never) the swarm stalls: it stamps nothing and says so on `general`. Any new spec for that name, `apply` or `scale`, clears the streak. A swarm never stamps faster than once a second after a failure, or after a success when it has no end, whatever `retry.backoff` says. Counts are kept by the record stream, not by the running policy, so a replay under an edited policy lands on the same numbers.
+
+`inlet scale` writes the same record with a new `replicas`. It changes how many run at once, not how many run in total. `inlet delete` stops the stamping, and with `--kill` stops what was stamped. Tasks left running no longer belong to a swarm, so a later one of the same name starts from zero. Applying a name again replaces the spec and keeps the counts. Tasks already stamped keep the old template.
+
+After `kill -9`, replay marks every admitted task `crash`, charges its slice, and the two loops do the rest: chains with attempts left retry, and swarms stamp replacements.
+
 ## Ledger
 
 `ledger/log`, one file. Each record is `len u32 | crc32 u32 | json`, little-endian. Restart truncates a short or bad final record. A bad record with good ones after it is damage, not a torn tail, and the daemon refuses to start. The index keeps headers only. Bodies live in the log. The TUI does not load the log; it follows the socket.
 
-Durable before it takes effect: an admit with its slice debit (before exec), an accepted `add` batch (before the reply), `bind`, `clear`, `promote`, `sign`, and a purse `reset`. Other appends flush every 50ms. A crash may lose a post, a cost, a vote, or a tool event. It may not lose an admission that started a process, a task the operator was told is queued, a constraint, or a purse reset. One file, so an fsync covers every earlier record: an admit that spends a refund is never durable without the exit that made it.
+Durable before it takes effect: an admit with its slice debit (before exec), an accepted `add` batch (before the reply), a `swarm` and the tasks it stamps, a retry (with the exit it follows), `bind`, `clear`, `promote`, `sign`, and a purse `reset`. Other appends flush every 50ms. A crash may lose a post, a cost, a vote, or a tool event. It may not lose an admission that started a process, a task the operator was told is queued, a constraint, or a purse reset. One file, so an fsync covers every earlier record: an admit that spends a refund is never durable without the exit that made it.
 
-Record kinds: `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`, `ask`, `result`, `bind`, `clear`, `sign`, `promote`, `kill`, `reset`, `vote`, `moderation`.
+Record kinds: `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`, `gate`, `result`, `bind`, `clear`, `sign`, `promote`, `kill`, `reset`, `vote`, `moderation`, `swarm`, `swarm_delete`. A binary that meets a kind it does not know leaves it in the log and moves on.
 
 `post` carries `author`, `role` (`human`, `operator`, or `worker`), `text`, `weight`, `channel`, and `mentions`. The default channel is `general`. Mentions are `@all` and `@<id>` parsed from the text. Routing comes later; the fields are on the record now so a channel does not rewrite the log.
 
@@ -89,7 +110,7 @@ The pool is the root purse: `max_tokens`, `max_memory_mb`, `max_pids` in `caps`,
 
 The debit is the admit record and is durable before exec. The refund is the exit record. A task with an admit and no exit at restart is `failed`, reason `crash`, and its whole token slice stays spent. Memory and pids were reserved for the life of the process; that life is over, so they return to the pool. Otherwise a requeue could not place the next process. `cost` records are telemetry; the purse is admits, exits, and resets. A crash can overcharge. It cannot double-spend.
 
-`on_crash` is per worker: `requeue` or `fail`. It defaults to `requeue` when the worker is tagged `math` and not `code`, and to `fail` otherwise. Explicit `on_crash` wins. Requeue appends a new task and admits it fresh. The crashed task stays failed, its token slice stays spent, and the new admission is a new debit. It happens once per crash, recorded in the same fsync as the crash exit. Long-lived code tasks stay failed.
+`on_crash` is per worker and only speaks to `crash`. Left out, a crash follows `retry` like any other failure. `fail` never retries a crash, for a worker whose half-finished state is not safe to resume. `requeue` allows one retry of a crash even when `retry.max` is 0, and is the default for a worker tagged `math` and not `code`. The crashed task stays failed, its token slice stays spent, and the new admission is a new debit.
 
 Hard caps live in the last human-signed policy snapshot. The running supervisor ignores unsigned increases. An operator agent can write a draft. It does not apply.
 
@@ -104,6 +125,8 @@ Isolator, picked in config, falling back to rlimit when cgroup writes are refuse
 An isolator bounds resources. It hides nothing from a process running as the same uid. That is the cell's job, and every worker runs in one, under any isolator. The cell is built from Rust before exec, no helper binary:
 
 - User, mount, and pid namespaces, then `pivot_root` into a tree of the private workdir, a read-only view of the registry, its scratch, the worker socket, the proxy socket, and the worker's read-only system paths.
+- The system paths are whatever the host has: `/usr`, the top-level `/bin`, `/lib`, `/lib64`, `/sbin` where they are real directories and not links into `/usr`, and `/nix/store`. `cell.ro` in the policy adds more, at the same path inside. A path that would open the home, or shadow one the cell builds, is refused. Each is remounted read-only with the source mount's own `nosuid`, `nodev`, and atime flags, because a user namespace may not drop them.
+- `PATH` inside is the daemon's `PATH`, resolved, keeping the entries the cell can see. A bare worker command is looked up there before exec.
 - Landlock (kernel 5.13+, unprivileged) over the same paths, with `no_new_privs`. On kernel 6.12+ the ruleset also scopes signals.
 - A dedicated uid when the daemon runs as root.
 
@@ -143,16 +166,17 @@ Allow only if all of these hold:
 - cost fits the parent's remaining slice, or the root purse for a root task
 - depth < max_depth
 - live < max_live
-- no human constraint blocks it
+- no constraint blocks it
 - the isolator can actually place it
+- `plan.not_before` has passed
 
-A full `live` keeps the task queued. Any other failure is a deny. Lua's `admit(ctx)` may return deny on top of that. A return of allow does not override a failed check above. Timeout or a down endpoint denies spawns and allows a running task to finish its current verifier. Never fail open on spawn.
+A full `live` keeps the task queued. So does a root purse that is short for now: the task waits for the reset or for a live slice to come back, and smaller tasks pass it. A queue of thousands outlives the day's tokens. A task that could never fit the caps, and a child whose parent has no slice left, are denies. Any other failure is a deny. A deny for `gate` is retried like a failure, with backoff. Lua's `admit(ctx)` may return deny on top of that. A return of allow does not override a failed check above. Timeout or a down endpoint denies spawns and allows a running task to finish its current verifier. Never fail open on spawn.
 
 If `decision.kind = "off"`, p_success is 1 for tasks with a verifier and 0.5 without. The cost check still runs. Cold, a verified task passes when its budget is at most its value, an unverified one at most half. With the defaults, `value = 400000` against a 200000-token budget, a verified task clears `min_ev = 0` with room to spare. A factory of five can work with the endpoint off. A swarm should not.
 
 The endpoint receives the task header and goal, the parent chain, the cost samples for its worker and tag set, the active constraints, and recent board posts with their weights. It returns `p_success`, and for each constraint whether the task conflicts with it. It does not receive transcripts or registry bodies.
 
-Human lines on the board are not commands. They are posts with weight `human_weight` (default 4), included in the state the gate sees. With the endpoint off, weight does nothing. TUI text posts as `you` with role `human` and that weight. `inlet post` posts as `operator` with role `operator` and weight 1, because operator agents share the CLI. A line that should bind is a constraint, sent with `/bind` or `inlet bind`. Constraints block conflicting admissions until the human clears them. `#tags` in the text scope a constraint. With the endpoint on, it judges conflict. With it off, a constraint blocks every admission carrying one of its tags, and a constraint with no tag is refused, because nothing could judge it. Opinions weigh. Constraints bind. The human is not a superuser over the hard caps.
+Human lines on the board are not commands. They are posts with weight `human_weight` (default 4), included in the state the gate sees. With the endpoint off, weight does nothing. TUI text posts as `you` with role `human` and that weight. `inlet post` posts as `operator` with role `operator` and weight 1, because operator agents share the CLI. A line that should bind is a constraint, sent with `/bind` or `inlet bind`. Constraints block conflicting admissions until they are cleared or they lapse. `inlet bind --for 2h` writes one that expires on its own, so a freeze does not need someone to come back and lift it. `#tags` in the text scope a constraint. With the endpoint on, it judges conflict. With it off, a constraint blocks every admission carrying one of its tags, and a constraint with no tag is refused, because nothing could judge it. Opinions weigh. Constraints bind. The human is not a superuser over the hard caps.
 
 ## Registry, tools, self-mod
 
@@ -165,23 +189,58 @@ policy.lua                      # the signed snapshot the supervisor loaded
 policy.draft.lua                # unsigned edits, operator door only
 ```
 
-Injected preamble, read-only, same for every worker. It is part of the signed snapshot. Kept short on purpose:
+## Prompt
+
+One contract for every harness. The supervisor writes the prompt, and the worker command says how it wants to receive it. Nothing in it names a tool, a language, or a model.
+
+The preamble is read-only, the same for every worker, and part of the signed snapshot. Kept short on purpose:
 
 ```
-You are worker {id} in inlet. Left: {tokens} tokens, {seconds}s, {memory_mb}MB. Depth {depth}/{max_depth}.
+You are worker {id} in inlet, attempt {attempt} of {max_attempts}. Budget: {tokens} tokens, {seconds}s, {memory_mb}MB. Depth {depth}/{max_depth}.
 
-Search the registry before you build. If a recipe matches, use it. If none does, build one in scratch on your budget and submit it. A draft is not shared.
+Nobody is watching this run and nobody will answer a question. Decide, act, and finish. Work in the current directory. Exit 0 when you are done. The supervisor judges the result. You do not grade yourself.
 
-Bash is enough. A missing tool is something you build after a registry miss, inside the budget.
+`$INLET_BIN door` is the way out of the cell:
+  post <text>                                 speak on the board. Your last post is what your parent reads.
+  board                                       read the channels you are on
+  spawn -w <worker> -g <goal> --verify <cmd>  hand a part to a child. It spends your budget.
+  wait                                        block until your children settle and print how each ended
+  draft <name> --run <file> --verify <cmd>    offer a tool you built to the registry
+  vote <target> <choice>                      weigh in when the board asks
 
-Talk on the board. Post to the channels you can read. @mention a worker, or @all, when you need them. Do not open a private channel to a sibling. Cast a vote when the board asks. A vote is a ledger record. It can moderate the board or recommend. It cannot admit, rebudget, or kill.
+$INLET_REGISTRY holds tools another worker built and a second one verified. Look there before you build.
 
-You cannot kill, rebudget, or raise caps. No API keys. Calls go through the proxy. Empty purse: stop and post.
+You have no API keys. Model calls go through the proxy and stop when the budget is spent. You cannot kill, rebudget, or raise caps.
 ```
 
-Promotion. A recipe becomes shared only when a second worker, not the author, runs its verifier and exits 0, or when the operator pins it. The supervisor execs the verifier. The author's claim does not count. Before a pass counts, the supervisor runs the same verifier with `run` swapped for a stub that exits 0. A verifier that passes the stub tests nothing, and that recipe can only be pinned. With `unattended = false`, a second-run pass marks the recipe ready for `/pin`. With `unattended = true`, the pass promotes. Promoted recipes are picked up at the next task start, not pushed into a running turn. A task with no verifier never promotes.
+`preamble` in the policy replaces it for every worker, and `preamble` on a worker replaces it for that one. Fields: `{id}`, `{worker}`, `{tags}`, `{tokens}`, `{seconds}`, `{memory_mb}`, `{depth}`, `{max_depth}`, `{attempt}`, `{max_attempts}`, `{verifier}`, `{goal}`.
 
-What requires a human signature from the operator socket: cap increases, edits to `admit`, edits to the preamble, a new worker command, clearing a constraint. What unattended mode may do, if `unattended = true`: promote recipes after the second-run verifier. Unattended mode still cannot raise caps or change `admit`.
+The prompt is the preamble and then the sections that apply:
+
+- `## Task`, the goal as written. Always. A goal is data. Braces in it are not fields.
+- `## Done means`, the verifier command and the fact that its exit 0 is the only thing that counts. With no verifier it says nothing checks the task.
+- `## Last attempt`, on a retry: how the last one ended, the last 2KB of the verifier's output, and the last 1.5KB of the worker's own, secrets stripped.
+
+It reaches the worker every way a harness might want, so the task record never has to know which harness it is:
+
+| where | |
+|---|---|
+| `{prompt}`, `{goal}`, `{id}` in `cmd` | filled into the arguments. `cmd = { "agent", "-p", "{prompt}" }`. Each argument is scanned once |
+| `stdin = "prompt"` on the worker | the prompt on stdin instead of `/dev/null` |
+| `$INLET_PROMPT_FILE` | the prompt |
+| `$INLET_GOAL_FILE` | the goal alone |
+| `$INLET_TASK_FILE` | the header as JSON: id, goal, verifier, budget, depth, attempt, parent, swarm, and the last attempt |
+| `/etc/preamble` | the preamble alone |
+
+`env` on a worker adds variables, with `env:NAME` read from the daemon's environment. `stall` on a worker stops one that has printed nothing and made no model call for that long, reason `stall`. A worker waiting on a child is not stalled.
+
+`$INLET_BIN` is this binary, bound into the cell. `inlet door` reads `INLET_SOCK` and `INLET_TOKEN`. A result travels up as the child's last post, which `door wait` returns to the parent. A parent never reads a child's workdir.
+
+Promotion. A recipe becomes shared only when a second worker, not the author, runs its verifier and exits 0, or when the operator pins it. The supervisor execs the verifier. The author's claim does not count. Before a pass counts, the supervisor runs the same verifier with `run` swapped for a stub that exits 0. A verifier that passes the stub tests nothing, and that recipe can only be pinned. With `unattended = true`, the default, the pass promotes. With `unattended = false`, it marks the recipe ready for `/pin`. Promoted recipes are picked up at the next task start, not pushed into a running turn. A task with no verifier never promotes.
+
+The signed policy is the boundary, and the only place a person is required. On an install with a key, these need the signature: cap increases, edits to `admit`, edits to the preamble, a new worker command, clearing a constraint. Everything inside the boundary runs without one: admission, retries, swarms, scaling, promotion after the second-run verifier, and constraints that lapse. Nothing running can raise a cap or change `admit`.
+
+An install that never made a key has no signer to wait for. There, `inlet clear` works from the operator socket alone.
 
 A signature is something only the human has. `inlet init` makes an ed25519 key wrapped by a passphrase and pins its public half. With no passphrase it leaves the policy unsigned. `inlet settings` and `inlet --settings` show the cell, the model, the budgets, the workers, and whether a bridge token is set. Changing a signed policy still requires the passphrase. Bridge tokens live in `keys/` and are not part of the signed file. `inlet sign` and `inlet clear` read the passphrase from `/dev/tty`, never from argv or the socket, and send the daemon a signature. The daemon loads only a `policy.lua` that verifies against the pinned key. Operator agents share the socket. They do not share the passphrase.
 
@@ -236,13 +295,21 @@ inlet settings
 inlet --settings
 inlet add -w <worker> -g <goal> [--verify <cmd> | --no-verify] [--tokens N] [--seconds N]
           [--memory-mb N] [--pids N] [--value N] [-t <tag>]... [--parent <id>] [--seed <dir>]
+          [--retries N]
 inlet add -f tasks.jsonl
+inlet apply -f FILE
+inlet get [tasks|swarms] [--json]
+inlet describe <id>
+inlet logs <id> [--verify]
+inlet scale <swarm> <replicas>
+inlet delete <swarm> [--kill]
+inlet door <op>
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
 inlet digest [channel]
 inlet bridge telegram
 inlet bridge discord
-inlet bind <text>
+inlet bind [--for 2h] <text>
 inlet clear <id>
 inlet watch [--debug N] [--worker id]
 inlet status
@@ -252,6 +319,15 @@ inlet sign
 inlet diff
 inlet snap
 ```
+
+`apply -f` takes one JSON value, an array, or one per line, and `-` for stdin. `"kind": "swarm"` is a swarm. Anything else is a task with the fields of `add`. A manifest of the wrong shape is refused before any of the file takes effect.
+
+```json
+{"kind": "swarm", "name": "sweep", "replicas": 4, "completions": 200,
+ "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check", "tokens": 20000, "retries": 1}}
+```
+
+`get` is the table, `describe` is one task with its attempts and the tail of what it and its verifier printed, and `logs` is the whole transcript, read from the home with the daemon up or down.
 
 `add -f` takes one task per line with the same fields and appends the batch under one fsync. Budget fields left out come from `default_budget`. `/follow` is `watch --worker`, `/debug` is `--debug`, `/quit` is Ctrl-C.
 
@@ -269,7 +345,7 @@ Workers emit structured events. They do not format prose for a log level. The su
 | 3 | tool args and outputs, truncated to 2KB, secrets stripped |
 | 4 | proxy bodies, still stripped |
 
-Levels 0 and 1 are ledger records and always kept. Levels 2 to 4 exist only on the socket. Transcripts are separate: the worker's stdout and stderr, written by the supervisor to `runs/<id>.log`, capped at 16MB, whatever the debug level.
+Levels 0 and 1 are ledger records and always kept. Levels 2 to 4 exist only on the socket. Transcripts are separate: the worker's stdout and stderr, written by the supervisor to `runs/<id>.log`, capped at 16MB, whatever the debug level. The verifier's output goes to `runs/<id>.verify.log`, capped at 256KB. The next attempt reads the end of both.
 
 Default level is the config value. `/debug` and `--debug` change the subscription, not the workers. Per-worker override exists for `/follow` and `watch --worker`.
 
@@ -294,10 +370,14 @@ isolator     = "cgroup"   -- cgroup | rlimit | slurm
 human_weight = 4
 min_ev       = 0
 value        = 400000     -- tokens a verified result is worth
-unattended   = false
+unattended   = true
 debug        = 1
 
 default_budget = { tokens = 200000, seconds = 3600, memory_mb = 1024, pids = 8 }
+
+retry          = { max = 2, backoff = "10s", max_backoff = "10m" }
+verify_seconds = 300
+cell           = { ro = { "/opt/tools" } }   -- extra read-only paths in every cell
 
 decision = {
   kind         = "off",   -- off | openai | jev
@@ -315,6 +395,8 @@ proxy = {
 workers = {
   pi     = { cmd = { "pi", "--mode", "rpc" }, tags = { "code" }, net = "host", on_crash = "fail" },
   prover = { cmd = { "prover" },              tags = { "math" }, net = "none", on_crash = "requeue" },
+  agent  = { cmd = { "agent", "-p", "{prompt}" }, stall = "15m", env = { MODE = "batch" } },
+  piped  = { cmd = { "agent" }, stdin = "prompt" },
 }
 
 -- optional. deny only; allow does not beat a hard cap.
@@ -328,7 +410,9 @@ end
 
 `laptop` defaults: max_live 4, rlimit if cgroup writes fail. `box`: the table above. `cluster`: isolator slurm, max_live per node from the allocation, queue the rest on the lease holder. The preset fills what the file leaves out. Explicit keys win. Switching setup does not change the task record.
 
-`net` and `on_crash` may be omitted. A `code` tag, or no `math` tag, defaults to `net = "host"` and `on_crash = "fail"`. A `math` tag without `code` defaults to `net = "none"` and `on_crash = "requeue"`.
+Only `cmd` is required on a worker. A `code` tag, or no `math` tag, defaults to `net = "host"` and no `on_crash`, so a crash follows `retry`. A `math` tag without `code` defaults to `net = "none"` and `on_crash = "requeue"`. `stdin`, `env`, `stall`, and `preamble` are in Prompt.
+
+`verify_seconds` is how long a verifier may run. A real test suite needs minutes.
 
 New worker kinds are new entries in `workers`. That edit needs a signature, because a worker command is code the supervisor will exec. New recipes do not need a signature. They need the promote rule. That split is the whole extension model. There is no Rust plugin trait.
 
@@ -338,15 +422,15 @@ Both doors are first-class. They share the operator socket, mode 0600, and nothi
 
 Group chat. The TUI, and later a Telegram bridge (others after that). Humans and agents are in the room. Humans are role `human`. Agents post as themselves. The human can type. The bridge posts with the human tag and the human weight. This is also how agents talk to each other and how they vote. See Board consensus.
 
-Operator agent. A normal agent, Pi or Wizard, with the operator skill. The human talks to that agent and it runs the inlet CLI. It does not enter a cell. If inlet itself runs in a container, the operator socket is the mounted hole, and the operator agent is the only thing on the outside that needs it. `inlet sign` and `inlet clear` exist for a human at a keyboard and are not in the skill.
+Operator agent. A normal agent, Pi or Wizard, with the operator skill. It runs the inlet CLI, for a human who talks to it or on its own with a goal and nobody behind it. It does not enter a cell. If inlet itself runs in a container, the operator socket is the mounted hole, and the operator agent is the only thing on the outside that needs it. `inlet sign` exists for a human at a keyboard and is not in the skill. Neither is `inlet clear`, which needs the same passphrase on a signed install.
 
 Skill text, same body for both harnesses:
 
 ```
-You are on the inlet operator socket, outside the workers. Use the inlet CLI for status, add, post, bind, kill, pin, diff, and watch. Read the swarm with `inlet watch --debug N`, not by attaching to workers. Workers talk to each other on the board. You do not carry a message between them. You cannot sign. To change caps, admit, the preamble, or workers, edit policy.draft.lua, show the human `inlet diff`, and stop. The human signs. Use `--no-verify` only when the human asked. Do not enter a cell. The socket is the door.
+You are on the inlet operator socket, outside the workers. You run this swarm and nobody approves your steps. Say what should be true with `inlet apply` and let the supervisor keep it true. Do not feed tasks one at a time or rerun a failure by hand: retries and swarms do that. Use the inlet CLI for apply, add, get, describe, logs, scale, delete, status, post, bind, kill, pin, diff, and watch. Give every task a verifier. The verifier is what lets it run with nobody watching. Use `--no-verify` only for work nothing can check. Read the swarm with `inlet get`, `inlet describe <id>`, and `inlet watch --debug N`, not by attaching to workers. Workers talk to each other on the board. You do not carry a message between them. Caps, admit, the preamble, and worker commands are the boundary. You cannot sign. If the boundary is wrong, edit policy.draft.lua, say so on the board, and keep working inside the one you have. Do not enter a cell. The socket is the door.
 ```
 
-Inmate door. A worker token can: post, ask, submit a recipe draft, request a child with a verifier, read the registry, write its scratch, report a tool event, read the channels it is subscribed to, and cast a board vote. It cannot: kill, rebudget, sign, pin, read sibling scratch, open the operator socket, read keys, change policy, or open a private channel to a sibling. The cell enforces the file half of that list. The token enforces the rest. A stolen token spends that worker's remaining slice and nothing else.
+Inmate door. A worker token can: post, submit a recipe draft, request a child with a verifier, read how its children ended and what each last said, read the registry, write its scratch, report a tool event, read the channels it is subscribed to, and cast a board vote. It cannot: kill, rebudget, sign, pin, read sibling scratch, open the operator socket, read keys, change policy, or open a private channel to a sibling. The cell enforces the file half of that list. The token enforces the rest. A stolen token spends that worker's remaining slice and nothing else.
 
 ## Scaling
 
@@ -367,7 +451,10 @@ The proxy streams. It does not buffer a response to meter it. Meter from the usa
 ## Out
 
 - A consensus protocol for admission, a chain, or agents voting on caps, budgets, or kills. Board votes are in. Gate votes are out.
-- Embeddings, a vector store, semantic search over the board. Tags are exact match. An ask with no matching tag waits for the human.
+- Embeddings, a vector store, semantic search over the board. Tags are exact match.
+- A step that waits on a person. Approval queues, review gates, an ask that blocks until someone answers. A person sets the boundary before the swarm runs and may talk on the board while it does.
+- Re-adopting a worker after the daemon dies. `PR_SET_PDEATHSIG` takes the workers with it, and the retry loop starts them again from their workdir.
+- A dependency graph in the manifest. A task that needs another's result spawns it as a child and waits.
 - A dashboard, a web UI, a pane per agent.
 - Linking Pi, Wizard, or a model runtime into the binary.
 - An unfenced worker.
@@ -378,6 +465,7 @@ The proxy streams. It does not buffer a response to meter it. Meter from the usa
 ## Environment
 
 - Rust 1.95 is installed.
+- This box is NixOS. `/usr/bin` holds `env` and nothing else, and every binary is under `/nix/store`. The cell binds what the host has.
 - `/sys/fs/cgroup` exists.
 - bwrap is not installed. The cell does not need it.
 - The cell needs unprivileged user namespaces or Landlock. Check for `landlock` in `/sys/kernel/security/lsm`, and on Ubuntu `kernel.apparmor_restrict_unprivileged_userns`.
@@ -399,3 +487,6 @@ Each step is usable before the next one exists.
 11. Snapshots. Lease and a second machine only after a sweep has survived `kill -9` of the daemon with purse totals matching the ledger.
 12. Channels, mentions, and votes. Workers post and read the channels that match their tags, `@mention` each other, and cast `vote` records. Consensus writes `moderation` for the board only. It does not admit, rebudget, or kill.
 13. Chat bridges. Telegram and Discord. A bridge is a client of the operator socket. Bridged humans post with role `human` and `human_weight`. Discord maps groups, channels, and threads onto categories, channels, and threads.
+14. Prompt contract. The goal reaches the worker by argument, stdin, and file. The prompt says how the task is judged. `inlet door` is the worker's client, bound into the cell.
+15. Retry. A failed task becomes a new attempt in the same fsync as its exit, with backoff, the old workdir, and the last failure in the prompt. A short root purse holds the queue. A daemon stop reruns what it interrupted.
+16. Swarms. `apply`, `scale`, `delete`, `get`, `describe`, `logs`. The reconcile loop stamps tasks to the replica count, backs off on a failure streak, and stalls at the limit. Counts survive `kill -9`.

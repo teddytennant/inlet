@@ -503,10 +503,12 @@ isolator = "cgroup"
 human_weight = 4
 min_ev = 0
 value = 400000
-unattended = false
+unattended = true
 debug = 1
 rollup = "count"
 default_budget = {{ tokens = {budget}, seconds = 3600, memory_mb = 1024, pids = 8 }}
+retry = {{ max = 2, backoff = "10s", max_backoff = "10m" }}
+verify_seconds = 300
 decision = {{
   kind = "off",
   endpoint = "env:DECISION_ENDPOINT",
@@ -2210,7 +2212,7 @@ mod tests {
         assert_eq!(policy.cfg.workers["prover"].net, config::Net::None);
         assert_eq!(
             policy.cfg.workers["prover"].on_crash,
-            config::OnCrash::Requeue
+            Some(config::OnCrash::Requeue)
         );
         assert_eq!(policy.cfg.workers["prover"].tags, vec!["math".to_string()]);
         assert_eq!(WORKER_PRESETS.len(), WORKER_CHOICES.len());

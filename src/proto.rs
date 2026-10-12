@@ -20,6 +20,19 @@ pub struct NewTask {
     pub parent: Option<String>,
     pub recipe: Option<String>,
     pub seed: Option<String>,
+    /// Retries after the first attempt. `None` is the policy's `retry.max`.
+    pub retries: Option<u32>,
+}
+
+/// A swarm manifest, as `inlet apply` sends it.
+#[derive(Debug, Clone)]
+pub struct SwarmSpec {
+    pub name: String,
+    pub replicas: u64,
+    /// `None` is one run per replica.
+    pub completions: Option<u64>,
+    pub backoff_limit: Option<u32>,
+    pub template: NewTask,
 }
 
 #[derive(Debug)]
@@ -41,11 +54,24 @@ pub enum Request {
     },
     Debug(u8),
     Pin(String),
-    Bind(String),
+    Bind {
+        text: String,
+        ttl_ms: u64,
+    },
     Clear {
         id: String,
-        sig: String,
+        sig: Option<String>,
     },
+    Apply(Box<SwarmSpec>),
+    Scale {
+        name: String,
+        replicas: u64,
+    },
+    Delete {
+        name: String,
+        kill: bool,
+    },
+    Describe(String),
     Sign(String),
     Draft(String),
     Diff,
@@ -99,11 +125,24 @@ pub fn parse_request(line: &str) -> Result<Request> {
             v.get("level").and_then(|n| n.as_u64()).unwrap_or(1).min(4) as u8,
         )),
         "pin" => Ok(Request::Pin(string(&v, "name")?)),
-        "bind" => Ok(Request::Bind(string(&v, "text")?)),
+        "bind" => Ok(Request::Bind {
+            text: string(&v, "text")?,
+            ttl_ms: num(&v, "ttl_ms").unwrap_or(0),
+        }),
         "clear" => Ok(Request::Clear {
             id: string(&v, "id")?,
-            sig: string(&v, "sig")?,
+            sig: string(&v, "sig").ok(),
         }),
+        "apply" => Ok(Request::Apply(Box::new(parse_swarm(&v)?))),
+        "scale" => Ok(Request::Scale {
+            name: string(&v, "name")?,
+            replicas: num(&v, "replicas").ok_or_else(|| err("missing replicas"))?,
+        }),
+        "delete" => Ok(Request::Delete {
+            name: string(&v, "name")?,
+            kill: v.get("kill").and_then(|b| b.as_bool()).unwrap_or(false),
+        }),
+        "describe" => Ok(Request::Describe(string(&v, "id")?)),
         "sign" => Ok(Request::Sign(string(&v, "sig")?)),
         "draft" => Ok(Request::Draft(string(&v, "text")?)),
         "diff" => Ok(Request::Diff),
@@ -177,6 +216,42 @@ pub fn parse_task(v: &Value) -> Result<NewTask> {
             .and_then(|s| s.as_str())
             .map(str::to_string)
             .filter(|s| !s.is_empty()),
+        retries: num(v, "retries").map(|n| n.min(64) as u32),
+    })
+}
+
+/// `{"kind":"swarm","name":..,"replicas":N,"completions":M,"template":{..}}`.
+/// The template takes the fields of `add`.
+pub fn parse_swarm(v: &Value) -> Result<SwarmSpec> {
+    let name = string(v, "name")?;
+    let ok = name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok {
+        return Err(err("swarm name is letters, digits, - _ . and at most 64"));
+    }
+    let template = v
+        .get("template")
+        .ok_or_else(|| err("swarm needs a template"))?;
+    let mut template = parse_task(template)?;
+    if template.parent.is_some() {
+        return Err(err("a swarm template has no parent"));
+    }
+    template.parent = None;
+    for key in ["replicas", "completions", "backoff_limit"] {
+        if v.get(key)
+            .is_some_and(|n| !n.is_null() && n.as_u64().is_none())
+        {
+            return Err(err(format!("{key} is a whole number, zero or more")));
+        }
+    }
+    Ok(SwarmSpec {
+        name,
+        replicas: num(v, "replicas").unwrap_or(1),
+        completions: num(v, "completions"),
+        backoff_limit: num(v, "backoff_limit").map(|n| n.min(u32::MAX as u64) as u32),
+        template,
     })
 }
 
@@ -223,5 +298,6 @@ pub fn task_value(task: &NewTask) -> Value {
         "parent": task.parent,
         "recipe": task.recipe,
         "seed": task.seed,
+        "retries": task.retries,
     })
 }

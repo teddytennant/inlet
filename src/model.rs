@@ -28,14 +28,78 @@ impl TaskState {
     pub fn is_live(self) -> bool {
         matches!(self, TaskState::Running | TaskState::Blocked)
     }
+
+    pub fn is_settled(self) -> bool {
+        matches!(
+            self,
+            TaskState::Done | TaskState::Failed | TaskState::Killed
+        )
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     pub tokens: u64,
     pub seconds: u64,
     pub memory_mb: u64,
     pub pids: u64,
+}
+
+/// Scheduling fields a controller sets. All zero for a plain `add`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    /// 1-based. 0 reads as 1, so old records are first attempts.
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub attempt: u32,
+    /// Attempts this chain may use. 0 is one.
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub max_attempts: u32,
+    /// Not admitted before this time. Backoff.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub not_before: u64,
+    /// The swarm that created the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl Plan {
+    pub fn is_default(&self) -> bool {
+        *self == Plan::default()
+    }
+
+    pub fn attempt(&self) -> u32 {
+        self.attempt.max(1)
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts.max(1)
+    }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero32(n: &u32) -> bool {
+    *n == 0
+}
+
+/// What a swarm stamps out. The same fields as `add`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Template {
+    pub worker: String,
+    /// `{index}` is the 1-based number of the task in its swarm.
+    pub goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    pub value: u64,
+    pub budget: Budget,
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +121,8 @@ pub enum Record {
         retry_of: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recipe: Option<String>,
+        #[serde(default, skip_serializing_if = "Plan::is_default")]
+        plan: Plan,
         ts: u64,
     },
     Admit {
@@ -131,6 +197,24 @@ pub enum Record {
         id: String,
         text: String,
         tags: Vec<String>,
+        /// The constraint lapses at this time. 0 holds until cleared.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        expires: u64,
+        ts: u64,
+    },
+    /// Desired state: keep `replicas` tasks of `template` in flight until
+    /// `completions` are done. 0 completions never finishes.
+    Swarm {
+        name: String,
+        replicas: u64,
+        completions: u64,
+        /// Consecutive failures before the swarm stalls. 0 never stalls.
+        backoff_limit: u32,
+        template: Template,
+        ts: u64,
+    },
+    SwarmDelete {
+        name: String,
         ts: u64,
     },
     Clear {
@@ -175,9 +259,8 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
         .ok_or_else(|| err("record missing kind"))?;
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
-        | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation" => {
-            Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
-        }
+        | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation"
+        | "swarm" | "swarm_delete" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
         _ => Ok(Decoded::Opaque),
     }
 }

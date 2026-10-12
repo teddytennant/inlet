@@ -189,6 +189,9 @@ fn resolve_cmd(name: &str, path: &[PathBuf]) -> Result<String> {
     Err(err(format!("worker command not found: {name}")))
 }
 
+/// The kernel's value. musl's libc crate does not export it.
+const ST_RELATIME: libc::c_ulong = 4096;
+
 fn remount_flags(path: &Path) -> libc::c_ulong {
     let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
     let Ok(c) = c_path(path) else {
@@ -204,7 +207,7 @@ fn remount_flags(path: &Path) -> libc::c_ulong {
         (libc::ST_NOEXEC, libc::MS_NOEXEC),
         (libc::ST_NOATIME, libc::MS_NOATIME),
         (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
     ] {
         if vfs.f_flag & have != 0 {
             flags |= want;
@@ -597,6 +600,14 @@ fn env_strings(req: &SpawnRequest, path: &str, pivoted: bool, exe: Option<&Path>
         env.push(format!("INLET_PROXY_SOCK={proxy}"));
         env.push(format!("INLET_SOCK={sock}"));
         env.push(format!("OPENAI_API_KEY={}", req.token));
+        env.push(format!(
+            "INLET_REGISTRY={}",
+            if pivoted {
+                "/registry".into()
+            } else {
+                show(&req.root.join("registry"))
+            }
+        ));
         if let Some(exe) = exe {
             let bin = if pivoted {
                 "/run/inlet".into()

@@ -37,8 +37,10 @@ pub fn redact(input: &str) -> String {
             i += skip;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Secrets are ASCII, so a match never starts inside a character.
+        let ch = input[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

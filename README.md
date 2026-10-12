@@ -7,18 +7,22 @@ Gastown, reimagined. Kubernetes for AI agents.
     curl -fsSL https://raw.githubusercontent.com/teddytennant/inlet/main/install.sh | sh
     inlet init
     inlet up
-    inlet add -w pi -g "fix the flaky test" --no-verify
-    inlet
+    inlet add -w pi -g "fix the flaky test" --verify "cargo test"
+    inlet apply -f sweep.json
+    inlet get swarms
 
-Group chat, or a harness with the operator skill. [docs/usage.md](docs/usage.md)
+Say what should be running. inlet keeps it running: a failed task is tried again with the verifier's output in its prompt, a swarm is topped back up to its count, and a restarted daemon picks up from the ledger. Nothing waits on a person. [docs/usage.md](docs/usage.md)
 
-- one static binary, 2.95MB
-- scheduler, ledger, token proxy, board, tui
-- 14,088 lines in src/
-- 2.2MB RSS, empty
-- 111 tests
+    {"kind": "swarm", "name": "sweep", "replicas": 4, "completions": 200,
+     "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check"}}
 
-Workers run in a cell. A spend is a ledger record.
+- one static binary, 3.13MB
+- scheduler, reconciler, ledger, token proxy, board, tui
+- 16,302 lines in src/
+- 2.5MB RSS, empty
+- 130 tests
+
+Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file.
 
 SPEC.md
 

@@ -8,6 +8,8 @@ pub enum Verdict {
     Allow,
     /// `live` is full. Stay queued. Do not deny.
     Queue,
+    /// The root purse is short for now. Stay queued and let smaller tasks pass.
+    Hold,
     Deny(&'static str),
 }
 
@@ -43,6 +45,11 @@ pub fn decide(task: &TaskView, ctx: &Ctx<'_>) -> Verdict {
         return Verdict::Deny("depth");
     }
     if !fits(task, ctx.purse) {
+        // A root task waits for the reset or for a live slice to come back.
+        // One that could never fit, or a child of a spent parent, is a deny.
+        if task.parent.is_none() && could_fit(task, ctx.purse) {
+            return Verdict::Hold;
+        }
         return Verdict::Deny("purse");
     }
     if ctx.blocked {
@@ -87,6 +94,18 @@ pub fn samples_key(worker: &str, tags: &[String]) -> String {
     tags.sort();
     tags.dedup();
     format!("{worker}|{}", tags.join(","))
+}
+
+/// A root task the purse cannot place yet but will. Checked before the
+/// decision call, so a held task does not buy a fresh answer every few seconds.
+pub fn waits_for_purse(task: &TaskView, purse: &Purse) -> bool {
+    task.parent.is_none() && !fits(task, purse) && could_fit(task, purse)
+}
+
+fn could_fit(task: &TaskView, purse: &Purse) -> bool {
+    task.budget.tokens <= purse.cap
+        && task.budget.memory_mb <= purse.memory_cap
+        && task.budget.pids <= purse.pids_cap
 }
 
 fn fits(task: &TaskView, purse: &Purse) -> bool {
@@ -138,6 +157,7 @@ mod tests {
             retry_of: None,
             pid: None,
             admit_ms: None,
+            plan: crate::model::Plan::default(),
         }
     }
 

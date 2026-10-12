@@ -15,16 +15,17 @@ use serde_json::{json, Value};
 
 use crate::board;
 use crate::cell::{self, SpawnRequest};
-use crate::config::{AdmitCtx, DecisionKind, OnCrash, Policy, Rollup};
+use crate::config::{AdmitCtx, DecisionKind, Policy, Rollup};
 use crate::decision::{self, Answer, Call, ConstraintIn, Header, PostIn};
 use crate::error::{err, Result};
 use crate::gate::{self, Verdict};
 use crate::id::{self, now_ms};
 use crate::isolate;
 use crate::ledger::{self, Ledger};
-use crate::model::{Budget, Decoded, Record, TaskState};
+use crate::model::{Budget, Decoded, Plan, Record, TaskState, Template};
 use crate::paths;
-use crate::proto::{self, NewTask, Request};
+use crate::prompt;
+use crate::proto::{self, NewTask, Request, SwarmSpec};
 use crate::proxy::{self, Hub, Note};
 use crate::registry;
 use crate::snap;
@@ -33,6 +34,9 @@ use crate::text::mentions;
 
 const SOFT_FLUSH: Duration = Duration::from_millis(50);
 const TRANSCRIPT_CAP: u64 = 16 * 1024 * 1024;
+const VERIFY_LOG_CAP: u64 = 256 * 1024;
+/// Tasks one swarm may stamp per pass. The rest come on the next one.
+const STAMP_BATCH: u64 = 64;
 
 static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -74,6 +78,8 @@ struct Worker {
     stdout: File,
     log: File,
     log_len: u64,
+    /// Last output or model call. A worker past its `stall` is stopped.
+    last_io: Instant,
 }
 
 struct Check {
@@ -81,6 +87,8 @@ struct Check {
     pid: i32,
     started: Instant,
     stdout: File,
+    log: Option<File>,
+    log_len: u64,
 }
 
 struct GateHit {
@@ -130,6 +138,8 @@ struct Daemon {
     holder: bool,
     fence: u64,
     snap_offset: u64,
+    /// Swarm generations already reported stalled.
+    told: HashSet<(String, u64)>,
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -184,8 +194,35 @@ fn daemonize(home: &Path) -> Result<()> {
     }
 }
 
+/// `cell.ro` may not open the home, or shadow a path the cell builds itself.
+fn guard_ro(home: &Path, policy: &mut Policy) {
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    policy.cfg.cell_ro.retain(|path| {
+        let real = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let reserved = [
+            "/",
+            "/etc",
+            "/run",
+            "/proc",
+            "/dev",
+            "/tmp",
+            "/work",
+            "/scratch",
+            "/registry",
+        ]
+        .iter()
+        .any(|dir| real == Path::new(dir));
+        let ok = !reserved && !home.starts_with(&real) && !real.starts_with(&home);
+        if !ok {
+            eprintln!("inlet: cell.ro {} refused", path.display());
+        }
+        ok
+    });
+}
+
 fn run(home: &Path) -> Result<()> {
-    let policy = load_signed(home)?;
+    let mut policy = load_signed(home)?;
+    guard_ro(home, &mut policy);
     let node = snap::node_id(home)?;
     let lease = snap::ensure_lease(home, &node)?;
     let mut index = snap::load(home)?;
@@ -260,6 +297,7 @@ fn run(home: &Path) -> Result<()> {
         holder: lease.node == node,
         fence: lease.gen,
         snap_offset,
+        told: HashSet::new(),
     };
     daemon.recover_and_arm()?;
     fs::write(paths::pid_file(home), format!("{}\n", std::process::id()))?;
@@ -472,6 +510,7 @@ impl Daemon {
             )?;
         }
         if !self.shutting_down {
+            self.reconcile()?;
             self.admit()?;
         }
         if self.last_flush.elapsed() >= SOFT_FLUSH {
@@ -483,6 +522,9 @@ impl Daemon {
     fn on_note(&mut self, note: Note) -> Result<()> {
         match note {
             Note::Cost { id, tokens } => {
+                if let Some(worker) = self.workers.iter_mut().find(|w| w.id == id) {
+                    worker.last_io = Instant::now();
+                }
                 self.commit(
                     &[Record::Cost {
                         id,
@@ -643,6 +685,7 @@ impl Daemon {
                 .state
                 .constraints
                 .iter()
+                .filter(|c| c.holds(now_ms()))
                 .map(|c| ConstraintIn {
                     id: c.id.clone(),
                     text: clip(&c.text, 240),
@@ -659,6 +702,7 @@ impl Daemon {
             return Ok(());
         }
         let queued: Vec<String> = self.state.queue.iter().cloned().collect();
+        let now = now_ms();
         let mut batch: Vec<Record> = Vec::new();
         let mut chosen: Vec<String> = Vec::new();
         let mut hold_tokens = 0u64;
@@ -672,20 +716,16 @@ impl Daemon {
             let Some(task) = self.state.tasks.get(&id).cloned() else {
                 continue;
             };
-            if task.state != TaskState::Queued {
+            if task.state != TaskState::Queued || task.plan.not_before > now {
+                continue;
+            }
+            if gate::waits_for_purse(&task, &self.state.purse) {
                 continue;
             }
             let (p, blocked) = match self.gate_for(&task)? {
                 GatePrep::Wait => continue,
                 GatePrep::Down => {
-                    self.commit(
-                        &[Record::Deny {
-                            id: id.clone(),
-                            reason: "gate".into(),
-                            ts: now_ms(),
-                        }],
-                        true,
-                    )?;
+                    self.deny(&id, "gate")?;
                     continue;
                 }
                 GatePrep::Off => (None, self.tag_blocked(&task)),
@@ -758,16 +798,8 @@ impl Daemon {
             }
             match verdict {
                 Verdict::Queue => break,
-                Verdict::Deny(reason) => {
-                    self.commit(
-                        &[Record::Deny {
-                            id: id.clone(),
-                            reason: reason.into(),
-                            ts: now_ms(),
-                        }],
-                        true,
-                    )?;
-                }
+                Verdict::Hold => continue,
+                Verdict::Deny(reason) => self.deny(&id, reason)?,
                 Verdict::Allow => {
                     if task.parent.is_none() {
                         hold_tokens += task.budget.tokens;
@@ -806,6 +838,89 @@ impl Daemon {
         Ok(())
     }
 
+    /// A deny settles the task. A transient one leaves a retry behind it.
+    fn deny(&mut self, id: &str, reason: &str) -> Result<()> {
+        let ts = now_ms();
+        let mut recs = vec![Record::Deny {
+            id: id.to_string(),
+            reason: reason.into(),
+            ts,
+        }];
+        recs.extend(self.state.retry_for(id, reason, &self.policy.cfg, ts));
+        self.commit(&recs, true)
+    }
+
+    /// Stamp tasks until every swarm has its replicas in flight.
+    fn reconcile(&mut self) -> Result<()> {
+        if !self.holder {
+            return Ok(());
+        }
+        let now = now_ms();
+        let mut recs = Vec::new();
+        let mut seeds = Vec::new();
+        let mut stalled = Vec::new();
+        for swarm in self.state.swarms.values() {
+            if swarm.stalled() {
+                stalled.push((swarm.name.clone(), swarm.generation, swarm.streak));
+            }
+            let want = swarm.wants(now).min(STAMP_BATCH);
+            for n in 0..want {
+                let index = swarm.created + 1 + n;
+                let template = &swarm.template;
+                let id = id::ulid();
+                if let Some(seed) = &template.seed {
+                    seeds.push((seed.clone(), id.clone()));
+                }
+                recs.push(Record::Task {
+                    id,
+                    parent: None,
+                    worker: template.worker.clone(),
+                    tags: template.tags.clone(),
+                    goal: template.goal.replace("{index}", &index.to_string()),
+                    verifier: template.verifier.clone(),
+                    value: template.value,
+                    budget: template.budget.clone(),
+                    retry_of: None,
+                    recipe: None,
+                    plan: Plan {
+                        attempt: 0,
+                        max_attempts: template.max_attempts,
+                        not_before: 0,
+                        owner: Some(swarm.name.clone()),
+                    },
+                    ts: now,
+                });
+            }
+        }
+        for (name, generation, streak) in stalled {
+            if self.told.insert((name.clone(), generation)) {
+                self.commit(
+                    &[Record::Post {
+                        id: id::ulid(),
+                        author: "swarm".into(),
+                        role: "operator".into(),
+                        text: format!(
+                            "swarm {name} stalled after {streak} failures in a row. inlet apply or inlet scale restarts it."
+                        ),
+                        weight: 1,
+                        channel: "general".into(),
+                        mentions: Vec::new(),
+                        ts: now,
+                    }],
+                    false,
+                )?;
+            }
+        }
+        if recs.is_empty() {
+            return Ok(());
+        }
+        for (seed, id) in seeds {
+            // A missing seed is the template's fault, and the verifier will say so.
+            let _ = copy_seed(Path::new(&seed), &paths::work(&self.home, &id));
+        }
+        self.commit(&recs, true)
+    }
+
     fn spawn_worker(&mut self, id: &str) -> Result<()> {
         let task = self
             .state
@@ -831,22 +946,69 @@ impl Daemon {
         }
         let token = id::token();
         let net_none = matches!(worker.net, crate::config::Net::None);
+        let work = paths::work(&self.home, id);
+        // A retry picks up where the last attempt that ran stopped. A link that
+        // was denied before it spawned left no workdir and no output.
+        let last = task.retry_of.as_ref().map(|prev| {
+            let mut links = self.state.chain(prev);
+            links.reverse();
+            if !work.exists() {
+                if let Some(from) = links
+                    .iter()
+                    .map(|link| paths::work(&self.home, link))
+                    .find(|dir| dir.exists())
+                {
+                    let _ = fs::rename(&from, &work);
+                }
+            }
+            let ran = links
+                .iter()
+                .find(|link| paths::transcript(&self.home, link).exists())
+                .unwrap_or(prev);
+            let reason = self
+                .state
+                .tasks
+                .get(ran)
+                .map(|t| t.reason.as_str())
+                .unwrap_or("");
+            prompt::Last::load(
+                ran,
+                reason,
+                &paths::verify_log(&self.home, ran),
+                &paths::transcript(&self.home, ran),
+            )
+        });
         if let Some(recipe) = &task.recipe {
-            let _ = registry::stage_run(&self.home, recipe, &paths::work(&self.home, id));
+            let _ = registry::stage_run(&self.home, recipe, &work);
         }
         let depth = depth_of(&self.state, task.parent.as_deref());
-        let preamble = registry::render_preamble(
+        let ctx = prompt::Ctx {
             id,
-            task.budget.tokens,
-            task.budget.seconds,
-            task.budget.memory_mb,
+            worker: &task.worker,
+            tags: &task.tags,
+            goal: &task.goal,
+            verifier: task.verifier.as_deref(),
+            tokens: task.budget.tokens,
+            seconds: task.budget.seconds,
+            memory_mb: task.budget.memory_mb,
             depth,
-            self.policy.cfg.caps.max_depth,
-            self.policy.cfg.preamble.as_deref(),
-        );
+            max_depth: self.policy.cfg.caps.max_depth,
+            attempt: task.plan.attempt(),
+            max_attempts: task.plan.max_attempts(),
+            parent: task.parent.as_deref(),
+            owner: task.plan.owner.as_deref(),
+            last,
+        };
+        let template = worker
+            .preamble
+            .as_deref()
+            .or(self.policy.cfg.preamble.as_deref());
+        let preamble = prompt::preamble(&ctx, template);
+        let full = prompt::compose(&ctx, template);
+        let cmd = prompt::fill(&worker.cmd, &full, &task.goal, id)?;
         let spawned = cell::spawn(&SpawnRequest {
-            cmd: worker.cmd,
-            work: paths::work(&self.home, id),
+            cmd,
+            work,
             scratch: paths::scratch(&self.home, id),
             registry: paths::registry(&self.home),
             root: paths::cell_root(&self.home, id),
@@ -861,7 +1023,14 @@ impl Daemon {
             task_id: id.to_string(),
             cgroup: placement.cgroup,
             door: true,
-            ..Default::default()
+            ro: self.policy.cfg.cell_ro.clone(),
+            env: worker.env.clone(),
+            files: vec![
+                ("goal".into(), task.goal.clone()),
+                ("task.json".into(), prompt::task_json(&ctx)),
+                ("prompt".into(), full),
+            ],
+            stdin: worker.stdin.then(|| "prompt".to_string()),
         })?;
         self.hub.insert(id, &token, task.budget.tokens);
         if let Some(parent) = &task.parent {
@@ -877,6 +1046,7 @@ impl Daemon {
             stdout: spawned.stdout,
             log,
             log_len: 0,
+            last_io: Instant::now(),
         });
         self.commit(
             &[Record::Spawn {
@@ -897,6 +1067,7 @@ impl Daemon {
                 break;
             }
             if let Some(pos) = self.checks.iter().position(|check| check.pid == pid) {
+                drain_check(&mut self.checks[pos]);
                 let id = self.checks.remove(pos).id;
                 let code = if libc::WIFEXITED(status) {
                     libc::WEXITSTATUS(status) as i32
@@ -927,7 +1098,7 @@ impl Daemon {
                 // Crash keeps the slice. A purse kill refunds whatever the proxy did not spend.
                 Some("purse") => self.finish(&id, code, "purse", true)?,
                 Some(other) => self.finish(&id, code, other, other != "crash")?,
-                None if signalled => self.crash(&id)?,
+                None if signalled => self.finish(&id, -1, "crash", false)?,
                 None if code == 0 && self.has_verifier(&id) => self.start_check(&id)?,
                 None if code == 0 => self.finish(&id, 0, "ok", true)?,
                 None => self.finish(&id, code, "exit", true)?,
@@ -971,11 +1142,12 @@ impl Daemon {
             net_none: true,
             memory_mb: memory,
             pids: task.budget.pids.max(32),
-            seconds: 20,
+            seconds: self.policy.cfg.verify_seconds,
             token: String::new(),
             task_id: id.to_string(),
             cgroup: None,
             door: false,
+            ro: self.policy.cfg.cell_ro.clone(),
             ..Default::default()
         }) {
             Ok(child) => {
@@ -984,6 +1156,9 @@ impl Daemon {
                     pid: child.pid,
                     started: Instant::now(),
                     stdout: child.stdout,
+                    // Kept so the next attempt can read what failed.
+                    log: File::create(paths::verify_log(&self.home, id)).ok(),
+                    log_len: 0,
                 });
                 Ok(())
             }
@@ -1012,40 +1187,6 @@ impl Daemon {
         self.finish_with(id, code, reason, true, extra)?;
         if let Some(name) = published {
             registry::materialize(&self.home, &name)?;
-        }
-        Ok(())
-    }
-
-    fn crash(&mut self, id: &str) -> Result<()> {
-        let task = self.state.tasks.get(id).cloned();
-        self.finish(id, -1, "crash", false)?;
-        let Some(task) = task else {
-            return Ok(());
-        };
-        let requeue = self
-            .policy
-            .cfg
-            .workers
-            .get(&task.worker)
-            .map(|w| w.on_crash == OnCrash::Requeue)
-            .unwrap_or(false);
-        if requeue && !self.state.retried.contains(id) {
-            self.commit(
-                &[Record::Task {
-                    id: id::ulid(),
-                    parent: task.parent.clone(),
-                    worker: task.worker.clone(),
-                    tags: task.tags.clone(),
-                    goal: task.goal.clone(),
-                    verifier: task.verifier.clone(),
-                    value: task.value,
-                    budget: task.budget.clone(),
-                    retry_of: Some(id.to_string()),
-                    recipe: task.recipe.clone(),
-                    ts: now_ms(),
-                }],
-                true,
-            )?;
         }
         Ok(())
     }
@@ -1102,14 +1243,19 @@ impl Daemon {
                 false,
             )?;
         }
+        let ts = now_ms();
         extra.push(Record::Exit {
             id: id.to_string(),
             code,
             reason: reason.into(),
             tokens_used,
             refund_tokens: refund,
-            ts: now_ms(),
+            ts,
         });
+        // Same fsync as the exit, so a failure never loses its retry.
+        if !(code == 0 && reason == "ok") && (!self.shutting_down || reason == "stopped") {
+            extra.extend(self.state.retry_for(id, reason, &self.policy.cfg, ts));
+        }
         self.commit(&extra, true)?;
         Ok(())
     }
@@ -1134,10 +1280,37 @@ impl Daemon {
             self.pending.insert(id.clone(), "timeout".into());
             self.signal(&id, libc::SIGKILL);
         }
+        // Silence is not the same as waiting on a child.
+        let silent: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|w| !self.pending.contains_key(&w.id))
+            .filter(|w| {
+                let Some(task) = self.state.tasks.get(&w.id) else {
+                    return false;
+                };
+                let stall = self
+                    .policy
+                    .cfg
+                    .workers
+                    .get(&task.worker)
+                    .map(|cfg| cfg.stall_seconds)
+                    .unwrap_or(0);
+                stall > 0
+                    && task.state == TaskState::Running
+                    && w.last_io.elapsed() >= Duration::from_secs(stall)
+            })
+            .map(|w| w.id.clone())
+            .collect();
+        for id in silent {
+            self.pending.insert(id.clone(), "stall".into());
+            self.signal(&id, libc::SIGKILL);
+        }
+        let limit = Duration::from_secs(self.policy.cfg.verify_seconds);
         let slow: Vec<i32> = self
             .checks
             .iter()
-            .filter(|check| check.started.elapsed() >= Duration::from_secs(20))
+            .filter(|check| check.started.elapsed() >= limit)
             .map(|check| check.pid)
             .collect();
         for pid in slow {
@@ -1170,6 +1343,7 @@ impl Daemon {
                 };
                 if n > 0 {
                     let n = n as usize;
+                    worker.last_io = Instant::now();
                     let room = TRANSCRIPT_CAP.saturating_sub(worker.log_len) as usize;
                     if room > 0 {
                         let take = n.min(room);
@@ -1182,15 +1356,7 @@ impl Daemon {
             }
         }
         for check in &mut self.checks {
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = unsafe {
-                    libc::read(check.stdout.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-                };
-                if n <= 0 {
-                    break;
-                }
-            }
+            drain_check(check);
         }
     }
 
@@ -1261,11 +1427,27 @@ impl Daemon {
                     Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
                 }
             }
-            Request::Bind(text) => match self.bind_text(&text) {
+            Request::Apply(spec) => match self.apply_swarm(&spec) {
+                Ok(body) => self.reply(id, body),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Scale { name, replicas } => match self.scale_swarm(&name, replicas) {
+                Ok(body) => self.reply(id, body),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Delete { name, kill } => match self.delete_swarm(&name, kill) {
+                Ok(body) => self.reply(id, body),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Describe(task) => match self.describe(&task) {
+                Ok(body) => self.reply(id, body),
+                Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+            },
+            Request::Bind { text, ttl_ms } => match self.bind_text(&text, ttl_ms) {
                 Ok(cid) => self.reply(id, json!({"ok": true, "id": cid})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
             },
-            Request::Clear { id: cid, sig } => match self.clear_constraint(&cid, &sig) {
+            Request::Clear { id: cid, sig } => match self.clear_constraint(&cid, sig.as_deref()) {
                 Ok(()) => self.reply(id, json!({"ok": true, "id": cid})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
             },
@@ -1311,6 +1493,7 @@ impl Daemon {
             "board" => self.worker_board(&value),
             "vote" => self.worker_vote(&value),
             "draft" => self.worker_draft(&value),
+            "children" => self.worker_children(&value),
             other => Err(err(format!("unknown op {other}"))),
         };
         match reply {
@@ -1382,6 +1565,10 @@ impl Daemon {
                 .map(str::to_string)
                 .filter(|s| !s.is_empty()),
             seed: None,
+            retries: value
+                .get("retries")
+                .and_then(|n| n.as_u64())
+                .map(|n| n.min(64) as u32),
         };
         let ids = self.enqueue(std::slice::from_ref(&task))?;
         let child = ids.first().cloned().unwrap_or_default();
@@ -1392,6 +1579,44 @@ impl Daemon {
             .filter(|task| task.state == TaskState::Failed)
             .map(|task| task.reason.clone());
         Ok(json!({"ok": true, "ids": ids, "denied": denied}))
+    }
+
+    /// How each child ended, and the last thing it said. This is how a result
+    /// travels up: a parent never reads a child's workdir.
+    fn worker_children(&self, value: &Value) -> Result<Value> {
+        let parent = self.worker_id(value)?;
+        let children: Vec<Value> = self
+            .state
+            .tasks
+            .values()
+            .filter(|t| t.parent.as_deref() == Some(parent.as_str()))
+            // A retried attempt is not the answer. Its successor is.
+            .filter(|t| !self.state.retried.contains(&t.id))
+            .map(|t| {
+                let said = self
+                    .state
+                    .chain(&t.id)
+                    .iter()
+                    .rev()
+                    .find_map(|id| self.state.posts.iter().rev().find(|p| &p.author == id))
+                    .map(|p| p.text.clone());
+                json!({
+                    "id": t.id,
+                    "state": t.state.as_str(),
+                    "reason": t.reason,
+                    "goal": clip(&t.goal, 200),
+                    "attempt": t.plan.attempt(),
+                    "last_post": said,
+                })
+            })
+            .collect();
+        let settled = children.iter().all(|c| {
+            matches!(
+                c["state"].as_str(),
+                Some("done") | Some("failed") | Some("killed")
+            )
+        });
+        Ok(json!({"ok": true, "settled": settled, "children": children}))
     }
 
     fn worker_post(&mut self, value: &Value) -> Result<Value> {
@@ -1663,7 +1888,170 @@ impl Daemon {
             budget,
             retry_of: None,
             recipe: task.recipe.clone(),
+            plan: Plan {
+                attempt: 0,
+                max_attempts: 1 + task.retries.unwrap_or(self.policy.cfg.retry.max),
+                not_before: 0,
+                owner: None,
+            },
             ts: now_ms(),
+        })
+    }
+
+    fn apply_swarm(&mut self, spec: &SwarmSpec) -> Result<Value> {
+        let Record::Task {
+            worker,
+            tags,
+            goal,
+            verifier,
+            value,
+            budget,
+            plan,
+            ..
+        } = self.task_record(&spec.template)?
+        else {
+            return Err(err("bad template"));
+        };
+        let completions = spec.completions.unwrap_or(spec.replicas);
+        self.commit(
+            &[Record::Swarm {
+                name: spec.name.clone(),
+                replicas: spec.replicas,
+                completions,
+                backoff_limit: spec.backoff_limit.unwrap_or(6),
+                template: Template {
+                    worker,
+                    goal,
+                    verifier,
+                    tags,
+                    value,
+                    budget,
+                    max_attempts: plan.max_attempts,
+                    seed: spec.template.seed.clone(),
+                },
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+        self.reconcile()?;
+        self.admit()?;
+        let generation = self
+            .state
+            .swarms
+            .get(&spec.name)
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        Ok(json!({"ok": true, "name": spec.name, "generation": generation}))
+    }
+
+    fn scale_swarm(&mut self, name: &str, replicas: u64) -> Result<Value> {
+        let swarm = self
+            .state
+            .swarms
+            .get(name)
+            .cloned()
+            .ok_or_else(|| err(format!("no swarm {name}")))?;
+        self.commit(
+            &[Record::Swarm {
+                name: swarm.name,
+                replicas,
+                completions: swarm.completions,
+                backoff_limit: swarm.backoff_limit,
+                template: swarm.template,
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+        Ok(json!({"ok": true, "name": name, "replicas": replicas}))
+    }
+
+    /// Stops the stamping. With `kill`, also stops what it stamped.
+    fn delete_swarm(&mut self, name: &str, kill: bool) -> Result<Value> {
+        if !self.state.swarms.contains_key(name) {
+            return Err(err(format!("no swarm {name}")));
+        }
+        let ts = now_ms();
+        let mut recs = vec![Record::SwarmDelete {
+            name: name.to_string(),
+            ts,
+        }];
+        let mut stopped = 0;
+        if kill {
+            let owned: Vec<(String, TaskState)> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| t.plan.owner.as_deref() == Some(name) && !t.state.is_settled())
+                .map(|t| (t.id.clone(), t.state))
+                .collect();
+            stopped = owned.len();
+            for (id, state) in owned {
+                if state == TaskState::Queued {
+                    recs.push(Record::Deny {
+                        id,
+                        reason: "deleted".into(),
+                        ts,
+                    });
+                } else {
+                    self.pending.insert(id.clone(), "killed".into());
+                    self.signal(&id, libc::SIGKILL);
+                }
+            }
+        }
+        self.commit(&recs, true)?;
+        Ok(json!({"ok": true, "name": name, "stopped": stopped}))
+    }
+
+    /// One task with its attempts and the tail of what it and its verifier printed.
+    fn describe(&self, id: &str) -> Result<Value> {
+        let task = self
+            .state
+            .tasks
+            .get(id)
+            .ok_or_else(|| err(format!("no task {id}")))?;
+        let chain: Vec<Value> = self
+            .state
+            .chain(id)
+            .iter()
+            .filter_map(|link| self.state.tasks.get(link))
+            .map(|t| json!({"id": t.id, "state": t.state.as_str(), "reason": t.reason, "attempt": t.plan.attempt()}))
+            .collect();
+        let posts: Vec<Value> = self
+            .state
+            .posts
+            .iter()
+            .filter(|post| post.author == id)
+            .map(post_json)
+            .collect();
+        Ok(json!({
+            "ok": true,
+            "task": self.task_json(task),
+            "verifier": task.verifier,
+            "chain": chain,
+            "posts": posts,
+            "output": prompt::tail(&paths::transcript(&self.home, id), 4000),
+            "verifier_output": prompt::tail(&paths::verify_log(&self.home, id), 4000),
+        }))
+    }
+
+    fn task_json(&self, t: &crate::state::TaskView) -> Value {
+        json!({
+            "id": t.id,
+            "state": t.state.as_str(),
+            "worker": t.worker,
+            "tags": t.tags,
+            "goal": t.goal,
+            "reason": t.reason,
+            "pid": t.pid,
+            "parent": t.parent,
+            "spent": t.budget.tokens,
+            "budget_tokens": t.budget.tokens,
+            "verifier": t.verifier.is_some(),
+            "retry_of": t.retry_of,
+            "attempt": t.plan.attempt(),
+            "max_attempts": t.plan.max_attempts(),
+            "not_before": t.plan.not_before,
+            "swarm": t.plan.owner,
         })
     }
 
@@ -1696,24 +2084,33 @@ impl Daemon {
 
     fn status_json(&self) -> Value {
         let purse = &self.state.purse;
+        let now = now_ms();
         let tasks: Vec<Value> = self
             .state
             .tasks
             .values()
-            .map(|t| {
+            .map(|t| self.task_json(t))
+            .collect();
+        let swarms: Vec<Value> = self
+            .state
+            .swarms
+            .values()
+            .map(|swarm| {
                 json!({
-                    "id": t.id,
-                    "state": t.state.as_str(),
-                    "worker": t.worker,
-                    "tags": t.tags,
-                    "goal": t.goal,
-                    "reason": t.reason,
-                    "pid": t.pid,
-                    "parent": t.parent,
-                    "spent": t.budget.tokens,
-                    "budget_tokens": t.budget.tokens,
-                    "verifier": t.verifier.is_some(),
-                    "retry_of": t.retry_of,
+                    "name": swarm.name,
+                    "phase": swarm.phase(),
+                    "replicas": swarm.replicas,
+                    "completions": swarm.completions,
+                    "backoff_limit": swarm.backoff_limit,
+                    "active": swarm.active,
+                    "done": swarm.done,
+                    "failed": swarm.failed,
+                    "streak": swarm.streak,
+                    "created": swarm.created,
+                    "generation": swarm.generation,
+                    "next_ms": swarm.next_ms,
+                    "worker": swarm.template.worker,
+                    "goal": swarm.template.goal,
                 })
             })
             .collect();
@@ -1731,11 +2128,14 @@ impl Daemon {
             "gate": self.policy.cfg.decision.kind.as_str(),
             "gate_spent": self.state.decision_spent,
             "gate_cap": self.policy.cfg.decision.purse_tokens,
-            "constraints": self.state.constraints.iter().map(|c| json!({
+            "constraints": self.state.constraints.iter().filter(|c| c.holds(now)).map(|c| json!({
                 "id": c.id,
                 "text": c.text,
                 "tags": c.tags,
+                "expires": c.expires,
             })).collect::<Vec<_>>(),
+            "swarms": swarms,
+            "unattended": self.policy.cfg.unattended,
             "lease": self.holder,
             "fence": self.fence,
             "posts_seen": self.state.posts_seen,
@@ -1809,15 +2209,17 @@ impl Daemon {
     }
 
     fn tag_blocked(&self, task: &crate::state::TaskView) -> bool {
+        let now = now_ms();
         self.state.constraints.iter().any(|constraint| {
-            constraint
-                .tags
-                .iter()
-                .any(|tag| task.tags.iter().any(|have| have == tag))
+            constraint.holds(now)
+                && constraint
+                    .tags
+                    .iter()
+                    .any(|tag| task.tags.iter().any(|have| have == tag))
         })
     }
 
-    fn bind_text(&mut self, text: &str) -> Result<String> {
+    fn bind_text(&mut self, text: &str, ttl_ms: u64) -> Result<String> {
         let text = text.trim();
         if text.is_empty() {
             return Err(err("empty constraint"));
@@ -1832,6 +2234,11 @@ impl Daemon {
                 id: id.clone(),
                 text: text.to_string(),
                 tags,
+                expires: if ttl_ms > 0 {
+                    now_ms().saturating_add(ttl_ms)
+                } else {
+                    0
+                },
                 ts: now_ms(),
             }],
             true,
@@ -1839,11 +2246,16 @@ impl Daemon {
         Ok(id)
     }
 
-    fn clear_constraint(&mut self, id: &str, sig_hex: &str) -> Result<()> {
-        let public = fs::read(paths::key_pub(&self.home)).map_err(|_| err("no signing key"))?;
-        let sig = crate::sign::hex_decode(sig_hex)?;
-        let msg = format!("clear\n{id}\n");
-        crate::sign::verify(&public, msg.as_bytes(), &sig)?;
+    /// With a signing key, a clear needs its signature. An install that never
+    /// made a key has nobody to ask, so the operator socket is enough.
+    fn clear_constraint(&mut self, id: &str, sig_hex: Option<&str>) -> Result<()> {
+        if paths::key_pub(&self.home).exists() {
+            let public = fs::read(paths::key_pub(&self.home)).map_err(|_| err("no signing key"))?;
+            let sig =
+                crate::sign::hex_decode(sig_hex.ok_or_else(|| err("clear needs a signature"))?)?;
+            let msg = format!("clear\n{id}\n");
+            crate::sign::verify(&public, msg.as_bytes(), &sig)?;
+        }
         if !self.state.constraints.iter().any(|c| c.id == id) {
             return Err(err("no constraint"));
         }
@@ -1863,7 +2275,8 @@ impl Daemon {
         let public = fs::read(paths::key_pub(&self.home)).map_err(|_| err("no signing key"))?;
         let sig = crate::sign::hex_decode(sig_hex)?;
         crate::sign::verify(&public, body.as_bytes(), &sig)?;
-        let parsed = Policy::parse(&body)?;
+        let mut parsed = Policy::parse(&body)?;
+        guard_ro(&self.home, &mut parsed);
         durable_write(&paths::policy_sig(&self.home), &sig)?;
         durable_write(&paths::policy(&self.home), body.as_bytes())?;
         self.raise_caps(&parsed.cfg);
@@ -1956,9 +2369,17 @@ impl Daemon {
                 1,
                 json!({"ev":"reset","grant":grant,"ts":ts,"available":self.state.purse.available,"held":self.state.purse.held()}),
             ),
-            Record::Task { id, worker, ts, .. } => {
-                (1, json!({"ev":"task","id":id,"worker":worker,"ts":ts}))
-            }
+            Record::Task {
+                id,
+                worker,
+                retry_of,
+                plan,
+                ts,
+                ..
+            } => (
+                1,
+                json!({"ev":"task","id":id,"worker":worker,"retry_of":retry_of,"attempt":plan.attempt(),"swarm":plan.owner,"ts":ts}),
+            ),
             Record::Result { id, ok, code, ts } => (
                 0,
                 json!({"ev":"result","id":id,"ok":ok,"code":code,"ts":ts}),
@@ -1966,10 +2387,29 @@ impl Daemon {
             Record::Promote { name, by, ts } => {
                 (1, json!({"ev":"promote","name":name,"by":by,"ts":ts}))
             }
-            Record::Bind { id, text, tags, ts } => (
+            Record::Bind {
+                id,
+                text,
+                tags,
+                expires,
+                ts,
+            } => (
                 0,
-                json!({"ev":"bind","id":id,"text":text,"tags":tags,"ts":ts}),
+                json!({"ev":"bind","id":id,"text":text,"tags":tags,"expires":expires,"ts":ts}),
             ),
+            Record::Swarm {
+                name,
+                replicas,
+                completions,
+                ts,
+                ..
+            } => (
+                1,
+                json!({"ev":"swarm","name":name,"replicas":replicas,"completions":completions,"ts":ts}),
+            ),
+            Record::SwarmDelete { name, ts } => {
+                (1, json!({"ev":"swarm_delete","name":name,"ts":ts}))
+            }
             Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
             Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),
             Record::Vote {
@@ -2037,14 +2477,20 @@ impl Daemon {
 
     fn shutdown(&mut self) -> Result<()> {
         self.shutting_down = true;
-        for check in &self.checks {
+        // A task whose verifier was running did its work. It reruns, it does not fail.
+        for check in std::mem::take(&mut self.checks) {
             unsafe {
                 libc::kill(check.pid, libc::SIGKILL);
+                libc::waitpid(check.pid, std::ptr::null_mut(), 0);
             }
+            self.finish(&check.id, -1, "stopped", true)?;
         }
         let ids: Vec<String> = self.workers.iter().map(|w| w.id.clone()).collect();
         for id in &ids {
-            self.pending.insert(id.clone(), "killed".into());
+            // Not `killed`: nobody asked for this task to end. It reruns on the next start.
+            self.pending
+                .entry(id.clone())
+                .or_insert_with(|| "stopped".into());
             self.signal(id, libc::SIGTERM);
         }
         thread::sleep(Duration::from_millis(50));
@@ -2061,6 +2507,24 @@ impl Daemon {
         self.flush_soft()?;
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
+    }
+}
+
+fn drain_check(check: &mut Check) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(check.stdout.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        let room = VERIFY_LOG_CAP.saturating_sub(check.log_len) as usize;
+        let take = (n as usize).min(room);
+        if take > 0 {
+            if let Some(log) = &mut check.log {
+                let _ = log.write_all(&buf[..take]);
+            }
+            check.log_len += take as u64;
+        }
     }
 }
 

@@ -16,6 +16,13 @@ use crate::tui;
 pub fn run() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let home = take_home(&mut args)?;
+    if matches!(
+        args.first().map(String::as_str),
+        Some("status" | "get" | "describe" | "logs" | "door")
+    ) {
+        // These print and exit. `inlet get | head` should end quietly, not panic.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match args.first().map(String::as_str) {
         None | Some("attach") => {
             if !paths::policy(&home).exists() {
@@ -42,6 +49,13 @@ pub fn run() -> Result<()> {
         Some("init") => crate::setup::init(&home, &args[1..]),
         Some("settings") | Some("--settings") => crate::setup::settings(&home, &args[1..]),
         Some("add") => add(&home, &args[1..]),
+        Some("apply") => apply(&home, &args[1..]),
+        Some("get") => get(&home, &args[1..]),
+        Some("describe") => describe(&home, args.get(1).map(String::as_str)),
+        Some("logs") => logs(&home, &args[1..]),
+        Some("scale") => scale(&home, &args[1..]),
+        Some("delete") => delete(&home, &args[1..]),
+        Some("door") => door(&args[1..]),
         Some("bind") => bind(&home, &args[1..]),
         Some("clear") => clear(&home, args.get(1).map(String::as_str)),
         Some("sign") => sign_policy(&home),
@@ -93,14 +107,21 @@ inlet settings           view or change setup
 inlet --settings
 inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--memory-mb N] [--pids N] [--value N] [-t TAG]... [--parent ID] [--recipe NAME]
-        [--seed DIR]
+        [--seed DIR] [--retries N]
 inlet add -f tasks.jsonl
+inlet apply -f FILE      swarms and tasks from json. - is stdin
+inlet get [tasks|swarms] [--json]
+inlet describe <id>      one task, its attempts, and what it printed
+inlet logs <id> [--verify]
+inlet scale <swarm> <replicas>
+inlet delete <swarm> [--kill]
+inlet door <op>          inside a cell: post, board, spawn, wait, children, draft, vote
 inlet post <text>
 inlet vote <target> <choice> [--channel NAME] [--human]
 inlet bridge telegram
 inlet bridge discord
 inlet digest [channel]
-inlet bind <text>
+inlet bind [--for 2h] <text>
 inlet clear <id>
 inlet sign
 inlet diff
@@ -155,16 +176,28 @@ fn vote(home: &Path, args: &[String]) -> Result<()> {
 }
 
 fn bind(home: &Path, args: &[String]) -> Result<()> {
-    let text = args.join(" ");
-    if text.trim().is_empty() {
-        return Err(err("usage: inlet bind <text>"));
+    let usage = "usage: inlet bind [--for 2h] <text>";
+    let mut ttl_ms = 0;
+    let mut words = args;
+    if words.first().map(String::as_str) == Some("--for") {
+        ttl_ms = crate::config::parse_span(words.get(1).ok_or_else(|| err(usage))?)?;
+        words = &words[2..];
     }
-    let v = proto::rpc(home, json!({"op":"bind","text": text}))?;
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        return Err(err(usage));
+    }
+    let v = proto::rpc(home, json!({"op":"bind","text": text, "ttl_ms": ttl_ms}))?;
     print_ok(&v)
 }
 
 fn clear(home: &Path, id: Option<&str>) -> Result<()> {
     let id = id.ok_or_else(|| err("usage: inlet clear <id>"))?;
+    if !paths::key_priv(home).exists() {
+        // No key was ever made, so there is nothing to sign with.
+        let v = proto::rpc(home, json!({"op":"clear","id": id}))?;
+        return print_ok(&v);
+    }
     let passphrase = crate::sign::read_passphrase("passphrase: ")?;
     let wrapped = fs::read(paths::key_priv(home)).map_err(|_| err("no signing key"))?;
     let msg = format!("clear\n{id}\n");
@@ -418,6 +451,7 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
     let mut parent = None;
     let mut recipe = None;
     let mut seed = None;
+    let mut retries = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -479,6 +513,10 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
                 seed = Some(next()?);
                 i += 2;
             }
+            "--retries" => {
+                retries = Some(parse_u64(&next()?)?.min(64) as u32);
+                i += 2;
+            }
             other if other.starts_with('-') => return Err(err(format!("unknown flag {other}"))),
             other => {
                 if goal.is_none() {
@@ -512,7 +550,373 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
         parent,
         recipe,
         seed,
+        retries,
     })
+}
+
+fn checked(v: Value, what: &str) -> Result<Value> {
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        let why = v.get("error").and_then(|e| e.as_str()).unwrap_or("failed");
+        return Err(err(format!("{what}: {why}")));
+    }
+    Ok(v)
+}
+
+/// One json value, an array of them, or one per line. `kind` picks swarm or task.
+fn read_manifests(path: &str) -> Result<Vec<Value>> {
+    let mut text = String::new();
+    if path == "-" {
+        io::stdin().read_to_string(&mut text)?;
+    } else {
+        text = fs::read_to_string(path).map_err(|e| err(format!("{path}: {e}")))?;
+    }
+    let docs = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Array(items)) => items,
+        Ok(one) => vec![one],
+        Err(_) => {
+            let mut docs = Vec::new();
+            for (n, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                docs.push(
+                    serde_json::from_str(line)
+                        .map_err(|e| err(format!("{path}:{}: {e}", n + 1)))?,
+                );
+            }
+            docs
+        }
+    };
+    if docs.is_empty() {
+        return Err(err("nothing to apply"));
+    }
+    Ok(docs)
+}
+
+fn apply(home: &Path, args: &[String]) -> Result<()> {
+    let path = flag(args, "-f")
+        .or_else(|| flag(args, "--file"))
+        .ok_or_else(|| err("usage: inlet apply -f FILE"))?;
+    let mut tasks = Vec::new();
+    let mut swarms = Vec::new();
+    for doc in read_manifests(&path)? {
+        match doc.get("kind").and_then(|k| k.as_str()).unwrap_or("task") {
+            "swarm" => {
+                // Refuse a bad manifest before any of the file takes effect.
+                proto::parse_swarm(&doc)?;
+                swarms.push(doc);
+            }
+            "task" => tasks.push(proto::task_value(&proto::parse_task(&doc)?)),
+            other => return Err(err(format!("unknown kind {other}"))),
+        }
+    }
+    for mut doc in swarms {
+        doc["op"] = json!("apply");
+        let v = checked(proto::rpc(home, doc)?, "apply")?;
+        println!(
+            "swarm {} generation {}",
+            v["name"].as_str().unwrap_or(""),
+            v["generation"].as_u64().unwrap_or(0)
+        );
+    }
+    if !tasks.is_empty() {
+        let v = checked(
+            proto::rpc(home, json!({"op": "add_batch", "tasks": tasks}))?,
+            "apply",
+        )?;
+        let n = v["ids"].as_array().map(|a| a.len()).unwrap_or(0);
+        println!("{n} queued");
+    }
+    Ok(())
+}
+
+fn get(home: &Path, args: &[String]) -> Result<()> {
+    let what = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or("tasks");
+    let key = match what {
+        "tasks" | "task" => "tasks",
+        "swarms" | "swarm" => "swarms",
+        _ => return Err(err("usage: inlet get [tasks|swarms] [--json]")),
+    };
+    let v = checked(proto::rpc(home, json!({"op":"status"}))?, "get")?;
+    let rows = v
+        .get(key)
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", Value::Array(rows));
+        return Ok(());
+    }
+    let text = |row: &Value, field: &str| row[field].as_str().unwrap_or("").to_string();
+    let num = |row: &Value, field: &str| row[field].as_u64().unwrap_or(0);
+    if key == "swarms" {
+        println!(
+            "{:<20}  {:<8}  {:>6}  {:>10}  {:>6}  {:<10}  GOAL",
+            "NAME", "PHASE", "ACTIVE", "DONE", "FAILED", "WORKER"
+        );
+        for row in &rows {
+            let done = match num(row, "completions") {
+                0 => format!("{}", num(row, "done")),
+                total => format!("{}/{total}", num(row, "done")),
+            };
+            println!(
+                "{:<20}  {:<8}  {:>6}  {:>10}  {:>6}  {:<10}  {}",
+                text(row, "name"),
+                text(row, "phase"),
+                format!("{}/{}", num(row, "active"), num(row, "replicas")),
+                done,
+                num(row, "failed"),
+                text(row, "worker"),
+                one_line(&text(row, "goal"), 60),
+            );
+        }
+        return Ok(());
+    }
+    println!(
+        "{:<26}  {:<8}  {:<5}  {:<12}  {:<10}  {:<10}  GOAL",
+        "ID", "STATE", "TRY", "SWARM", "WORKER", "REASON"
+    );
+    for row in &rows {
+        println!(
+            "{:<26}  {:<8}  {:<5}  {:<12}  {:<10}  {:<10}  {}",
+            text(row, "id"),
+            text(row, "state"),
+            format!("{}/{}", num(row, "attempt"), num(row, "max_attempts")),
+            text(row, "swarm"),
+            text(row, "worker"),
+            text(row, "reason"),
+            one_line(&text(row, "goal"), 60),
+        );
+    }
+    Ok(())
+}
+
+fn one_line(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn describe(home: &Path, id: Option<&str>) -> Result<()> {
+    let id = id.ok_or_else(|| err("usage: inlet describe <id>"))?;
+    let v = checked(
+        proto::rpc(home, json!({"op":"describe","id": id}))?,
+        "describe",
+    )?;
+    let task = &v["task"];
+    let text = |field: &str| task[field].as_str().unwrap_or("");
+    println!("id        {}", text("id"));
+    println!("state     {} {}", text("state"), text("reason"));
+    println!("worker    {}", text("worker"));
+    println!(
+        "attempt   {} of {}",
+        task["attempt"].as_u64().unwrap_or(1),
+        task["max_attempts"].as_u64().unwrap_or(1)
+    );
+    if let Some(swarm) = task["swarm"].as_str() {
+        println!("swarm     {swarm}");
+    }
+    if let Some(parent) = task["parent"].as_str() {
+        println!("parent    {parent}");
+    }
+    println!("goal      {}", text("goal"));
+    println!("verifier  {}", v["verifier"].as_str().unwrap_or("none"));
+    if let Some(chain) = v["chain"].as_array().filter(|c| c.len() > 1) {
+        println!("attempts");
+        for link in chain {
+            println!(
+                "  {}  {}  {} {}",
+                link["attempt"].as_u64().unwrap_or(1),
+                link["id"].as_str().unwrap_or(""),
+                link["state"].as_str().unwrap_or(""),
+                link["reason"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    for post in v["posts"].as_array().into_iter().flatten() {
+        println!("post      {}", post["text"].as_str().unwrap_or(""));
+    }
+    for (title, field) in [("output", "output"), ("verifier output", "verifier_output")] {
+        let body = v[field].as_str().unwrap_or("");
+        if !body.trim().is_empty() {
+            println!("{title}");
+            for line in body.trim_end().lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The transcript is a file in the home. The daemon does not have to be up.
+fn logs(home: &Path, args: &[String]) -> Result<()> {
+    let usage = "usage: inlet logs <id> [--verify]";
+    let id = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| err(usage))?;
+    if id.contains('/') || id.starts_with('.') {
+        return Err(err(usage));
+    }
+    let path = if args.iter().any(|a| a == "--verify") {
+        paths::verify_log(home, id)
+    } else {
+        paths::transcript(home, id)
+    };
+    let bytes = fs::read(&path).map_err(|_| err(format!("no log for {id}")))?;
+    io::stdout().write_all(&bytes)?;
+    Ok(())
+}
+
+fn scale(home: &Path, args: &[String]) -> Result<()> {
+    let usage = "usage: inlet scale <swarm> <replicas>";
+    let name = args.first().ok_or_else(|| err(usage))?;
+    let replicas = parse_u64(args.get(1).ok_or_else(|| err(usage))?)?;
+    let v = proto::rpc(
+        home,
+        json!({"op":"scale","name": name, "replicas": replicas}),
+    )?;
+    checked(v, "scale")?;
+    println!("swarm {name} replicas {replicas}");
+    Ok(())
+}
+
+fn delete(home: &Path, args: &[String]) -> Result<()> {
+    let name = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| err("usage: inlet delete <swarm> [--kill]"))?;
+    let kill = args.iter().any(|a| a == "--kill");
+    let v = checked(
+        proto::rpc(home, json!({"op":"delete","name": name, "kill": kill}))?,
+        "delete",
+    )?;
+    println!(
+        "swarm {name} deleted, {} stopped",
+        v["stopped"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// The worker's side of the worker socket. Reads `INLET_SOCK` and `INLET_TOKEN`.
+fn door(args: &[String]) -> Result<()> {
+    const USAGE: &str = "\
+inlet door post <text> [--channel NAME]
+inlet door board
+inlet door spawn -w W -g GOAL --verify CMD [--tokens N] [--seconds N] [--retries N] [-t TAG]...
+inlet door children
+inlet door wait [--timeout SECONDS]
+inlet door draft <name> --run FILE --verify CMD [-t TAG]...
+inlet door vote <target> <choice> [--channel NAME]";
+    let sock = std::env::var("INLET_SOCK").map_err(|_| err("INLET_SOCK is not set"))?;
+    let token = std::env::var("INLET_TOKEN").map_err(|_| err("INLET_TOKEN is not set"))?;
+    let call = |mut body: Value| -> Result<Value> {
+        body["token"] = json!(token);
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+            .map_err(|e| err(format!("worker socket: {e}")))?;
+        let mut line = serde_json::to_string(&body)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        let mut reply = String::new();
+        io::BufReader::new(stream).read_line(&mut reply)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| err("empty reply"))?;
+        checked(v, "door")
+    };
+    let rest = args.get(1..).unwrap_or(&[]);
+    let channel = flag(rest, "--channel").unwrap_or_else(|| "general".into());
+    let words = || -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] == "--channel" {
+                i += 2;
+                continue;
+            }
+            out.push(rest[i].clone());
+            i += 1;
+        }
+        out
+    };
+    match args.first().map(String::as_str) {
+        Some("post") => {
+            let text = words().join(" ");
+            let v = call(json!({"op":"post","text": text, "channel": channel}))?;
+            println!("{}", v["id"].as_str().unwrap_or("ok"));
+        }
+        Some("board") => println!("{}", call(json!({"op":"board"}))?["posts"]),
+        Some("spawn") => {
+            let task = parse_add_flags(rest)?;
+            if task.verifier.is_none() {
+                return Err(err("a child needs --verify"));
+            }
+            let mut body = proto::task_value(&task);
+            body["op"] = json!("spawn");
+            let v = call(body)?;
+            if let Some(why) = v["denied"].as_str() {
+                return Err(err(format!("denied: {why}")));
+            }
+            println!("{}", v["ids"][0].as_str().unwrap_or(""));
+        }
+        Some("children") => println!("{}", call(json!({"op":"children"}))?["children"]),
+        Some("wait") => {
+            let limit = match flag(rest, "--timeout") {
+                Some(raw) => Some(Duration::from_secs(parse_u64(&raw)?)),
+                None => None,
+            };
+            let started = std::time::Instant::now();
+            loop {
+                let v = call(json!({"op":"children"}))?;
+                if v["settled"].as_bool() == Some(true) {
+                    println!("{}", v["children"]);
+                    break;
+                }
+                if limit.is_some_and(|limit| started.elapsed() >= limit) {
+                    println!("{}", v["children"]);
+                    return Err(err("children are still running"));
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+        Some("draft") => {
+            let name = rest
+                .first()
+                .filter(|n| !n.starts_with('-'))
+                .ok_or_else(|| err(USAGE))?;
+            let run = flag(rest, "--run").ok_or_else(|| err(USAGE))?;
+            let verify = flag(rest, "--verify").ok_or_else(|| err(USAGE))?;
+            let mut tags = Vec::new();
+            for pair in rest.windows(2) {
+                if pair[0] == "-t" || pair[0] == "--tag" {
+                    tags.push(pair[1].clone());
+                }
+            }
+            let run = fs::read_to_string(&run).map_err(|e| err(format!("{run}: {e}")))?;
+            call(json!({"op":"draft","name": name, "run": run, "verifier": verify, "tags": tags}))?;
+            println!("draft {name}");
+        }
+        Some("vote") => {
+            let words = words();
+            let (Some(target), Some(choice)) = (words.first(), words.get(1)) else {
+                return Err(err(USAGE));
+            };
+            let v =
+                call(json!({"op":"vote","target": target, "choice": choice, "channel": channel}))?;
+            println!("{}", v["id"].as_str().unwrap_or("ok"));
+        }
+        _ => return Err(err(USAGE)),
+    }
+    Ok(())
 }
 
 fn status(home: &Path, json_out: bool) -> Result<()> {
