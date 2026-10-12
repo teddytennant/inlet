@@ -32,6 +32,8 @@ jobs:
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/release/inlet | grep -Eq "statically linked|static-pie linked"
+      - name: chaos
+        run: python3 scripts/chaos.py target/x86_64-unknown-linux-musl/release/inlet --tasks 200 --seconds 90 --seed 7 --retain 5
       - name: release RSS
         run: cargo test --release --test live empty_daemon_rss_when_asked -- --exact
         env:

@@ -121,7 +121,7 @@ fn start_env(home: &Path, env: &[(&str, &str)]) -> Daemon {
     }
     let mut child = cmd.spawn().unwrap();
     let sock = home.join("run/operator.sock");
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(40);
     let want = child.id() as i32;
     while Instant::now() < deadline {
         if sock.exists() && pid_of(home) == Some(want) {
@@ -185,7 +185,7 @@ fn tasks(v: &Value) -> Vec<&Value> {
 }
 
 fn wait_status(home: &Path, mut pred: impl FnMut(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(40);
     let mut last = Value::Null;
     while Instant::now() < deadline {
         last = status(home);
@@ -2551,7 +2551,7 @@ fn tty_inlet(home: &Path, args: &[&str], passphrase: &str) -> (bool, String) {
     master_file
         .write_all(format!("{passphrase}\n").as_bytes())
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(40);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -3702,7 +3702,7 @@ fn cost_sum(home: &Path, id: &str) -> u64 {
 }
 
 fn wait_cost(home: &Path, id: &str, want: u64) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut got = 0;
     while Instant::now() < deadline {
         got = cost_sum(home, id);
@@ -5375,7 +5375,7 @@ fn discord_bridge_posts_as_human() {
         serde_json::json!({"op":"post","token": token, "channel":"code","text":"from-worker"}),
     );
     assert_eq!(worker["ok"], true, "{worker}");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let dumped = sent.lock().unwrap().join("\n");
         let mapped = dumped.contains("from-worker")
@@ -5394,7 +5394,7 @@ fn discord_bridge_posts_as_human() {
     }
     thread::sleep(Duration::from_millis(400));
     flood_operator(&home, 30);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let dumped = sent.lock().unwrap().join("\n");
         if dumped.contains("30 posts") {

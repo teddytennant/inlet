@@ -309,11 +309,15 @@ fn run(home: &Path) -> Result<()> {
         .join("run/bin")
         .join(format!("inlet-{}", std::process::id()));
     fs::create_dir_all(home.join("run/bin"))?;
-    for old in fs::read_dir(home.join("run/bin"))?.flatten() {
-        // A keeper still running holds its copy open by its mount, not its name.
-        let _ = fs::remove_file(old.path());
+    // A link is the same file under a second name: instant, and it stays
+    // whole when an upgrade renames a new binary over the first name. Across
+    // filesystems there is no linking, so copy.
+    let linked = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| fs::hard_link(exe, &cell_bin).is_ok());
+    if !linked {
+        fs::copy("/proc/self/exe", &cell_bin)?;
     }
-    fs::copy("/proc/self/exe", &cell_bin)?;
     fs::set_permissions(&cell_bin, fs::Permissions::from_mode(0o755))?;
 
     let mut daemon = Daemon {
@@ -376,7 +380,10 @@ fn run(home: &Path) -> Result<()> {
                 // SIGTERM is the daemon going away: a restart, an upgrade. The
                 // work stays up and the next daemon takes it back. Ctrl-C is a
                 // person saying stop.
-                if sig == libc::SIGTERM && daemon.workers.iter().all(|w| w.kept) {
+                if sig == libc::SIGTERM
+                    && daemon.policy.cfg.adopt
+                    && daemon.workers.iter().all(|w| w.kept)
+                {
                     daemon.detach()?;
                 } else {
                     daemon.shutdown()?;
@@ -541,6 +548,17 @@ impl Daemon {
             let id = name.trim_end_matches("-check");
             self.state.tasks.get(id).is_some_and(|t| t.state.is_live())
         };
+        // An older daemon's copy of the binary may still be the path a taken-back
+        // worker was given. With none taken back, nothing needs it.
+        if self.workers.is_empty() {
+            if let Ok(dir) = fs::read_dir(self.home.join("run/bin")) {
+                for entry in dir.flatten() {
+                    if entry.path() != self.cell_bin {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
         for sub in ["run/cells", "run/checks", "run/live", "run/exit", "scratch"] {
             let Ok(dir) = fs::read_dir(self.home.join(sub)) else {
                 continue;
@@ -585,8 +603,13 @@ impl Daemon {
             let pid = note["pid"].as_i64().unwrap_or(0) as i32;
             let start = note["start"].as_u64().unwrap_or(0);
             let running = pid > 1 && proc_start(pid) == Some(start);
-            // A child without its parent has nobody to answer to.
-            let orphan = task.parent.as_ref().is_some_and(|p| !kept.contains(p));
+            // A child whose parent died with the daemon has nobody to answer
+            // to. One whose parent had already settled runs on, as it would
+            // have with no restart.
+            let orphan = task
+                .parent
+                .as_ref()
+                .is_some_and(|p| live.iter().any(|t| &t.id == p) && !kept.contains(p));
             if orphan || (running && !self.policy.cfg.adopt) {
                 if running {
                     unsafe {
@@ -637,27 +660,29 @@ impl Daemon {
             if !self.workers.iter().any(|w| w.id == task.id) {
                 continue;
             }
-            let (mut lent, mut gone) = (0u64, 0u64);
-            for child in live
+            // Lent is what children still to settle hold. Everything else
+            // the slice has used is spent: its own model calls, what settled
+            // children used, and the whole slice of any child that died.
+            let lent: u64 = live
                 .iter()
                 .filter(|c| c.parent.as_deref() == Some(task.id.as_str()))
-                .filter(|c| self.state.purse.open.contains_key(&c.id))
-            {
-                if kept.contains(&child.id) {
-                    lent += child.budget.tokens;
-                } else {
-                    gone += child.budget.tokens;
-                }
-            }
-            let cost = self
+                .filter(|c| kept.contains(&c.id) && self.state.purse.open.contains_key(&c.id))
+                .map(|c| c.budget.tokens)
+                .sum();
+            let used = self
                 .state
                 .purse
                 .open
                 .get(&task.id)
-                .map(|slice| slice.cost)
+                .map(|slice| slice.used)
                 .unwrap_or(0);
             self.hub.lend(&task.id, lent);
-            self.hub.charge(&task.id, cost.saturating_add(gone));
+            self.hub.charge(&task.id, used.saturating_sub(lent));
+            // A kill asked for before the crash still stands.
+            if self.state.killing.contains(&task.id) {
+                self.pending.insert(task.id.clone(), "killed".into());
+                self.signal(&task.id, libc::SIGKILL);
+            }
         }
         (kept, finished, recheck)
     }
@@ -1404,7 +1429,7 @@ impl Daemon {
         if self.policy.cfg.adopt {
             // If the daemon dies here, the next one runs the verifier again.
             let _ = fs::create_dir_all(self.home.join("run/live"));
-            let _ = fs::write(paths::live_file(&self.home, id), r#"{"verify":true}"#);
+            let _ = durable_write(&paths::live_file(&self.home, id), br#"{"verify":true}"#);
         }
         if let Some(task) = self.state.tasks.get_mut(id) {
             task.pid = None;
@@ -1523,14 +1548,7 @@ impl Daemon {
             self.hub.reclaim(&parent, reserved, tokens_used);
         }
         self.workers.retain(|w| w.id != id);
-        let _ = fs::remove_file(paths::live_file(&self.home, id));
-        let _ = fs::remove_file(paths::exit_file(&self.home, id));
-        // The cell was scaffolding. The workdir and the transcripts are the record.
-        let _ = fs::remove_dir_all(paths::cell_root(&self.home, id));
-        let _ = fs::remove_dir_all(paths::cell_root(&self.home, &format!("{id}-check")));
-        let _ = fs::remove_dir_all(paths::scratch(&self.home, id));
-        let _ = fs::remove_dir_all(self.home.join("run/checks").join(id));
-        if reason == "killed" {
+        if reason == "killed" && !self.state.killing.contains(id) {
             self.commit(
                 &[Record::Kill {
                     id: id.to_string(),
@@ -1553,6 +1571,16 @@ impl Daemon {
             extra.extend(self.state.retry_for(id, reason, &self.policy.cfg, ts));
         }
         self.commit(&extra, true)?;
+        // Only now, with the exit durable. Removed first, a crash in between
+        // would leave a live task with no note: a full-charge crash for work
+        // that had finished.
+        let _ = fs::remove_file(paths::live_file(&self.home, id));
+        let _ = fs::remove_file(paths::exit_file(&self.home, id));
+        // The cell was scaffolding. The workdir and the transcripts are the record.
+        let _ = fs::remove_dir_all(paths::cell_root(&self.home, id));
+        let _ = fs::remove_dir_all(paths::cell_root(&self.home, &format!("{id}-check")));
+        let _ = fs::remove_dir_all(paths::scratch(&self.home, id));
+        let _ = fs::remove_dir_all(self.home.join("run/checks").join(id));
         Ok(())
     }
 
@@ -1690,9 +1718,42 @@ impl Daemon {
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
             },
             Request::Kill(task) => {
-                self.pending.insert(task.clone(), "killed".into());
-                self.signal(&task, libc::SIGKILL);
-                self.reply(id, json!({"ok": true, "id": task}));
+                let state = self.state.tasks.get(&task).map(|t| t.state);
+                let done = match state {
+                    None => Err(err(format!("no task {task}"))),
+                    // Nothing to signal. It leaves the queue and does not retry.
+                    Some(TaskState::Queued) => self.commit(
+                        &[Record::Deny {
+                            id: task.clone(),
+                            reason: "killed".into(),
+                            ts: now_ms(),
+                        }],
+                        true,
+                    ),
+                    Some(s) if s.is_live() => {
+                        // Durable before the signal: a daemon that dies in
+                        // between must not come back and rerun it as a crash.
+                        let noted = self.commit(
+                            &[Record::Kill {
+                                id: task.clone(),
+                                ts: now_ms(),
+                            }],
+                            true,
+                        );
+                        self.pending.insert(task.clone(), "killed".into());
+                        self.signal(&task, libc::SIGKILL);
+                        // A verifier is the only process it has left.
+                        if let Some(check) = self.checks.iter().find(|c| c.id == task) {
+                            unsafe { libc::kill(check.pid, libc::SIGKILL) };
+                        }
+                        noted
+                    }
+                    Some(_) => Ok(()),
+                };
+                match done {
+                    Ok(()) => self.reply(id, json!({"ok": true, "id": task})),
+                    Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
+                }
             }
             Request::Watch { debug, worker } => {
                 if let Some(client) = self.clients.get_mut(&id) {

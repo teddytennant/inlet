@@ -312,7 +312,18 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     // key under its own name. Nothing else of the worker's request goes out.
     let mut extra = String::new();
     for line in text.split("\r\n").skip(1) {
-        if line.len() >= 10 && line[..10].eq_ignore_ascii_case("anthropic-") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        // A header and nothing more. A bare CR or LF inside one would let a
+        // worker write headers of its own into the upstream request.
+        let plain_name = name.len() > 10
+            && name[..10].eq_ignore_ascii_case("anthropic-")
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let plain_value = value
+            .bytes()
+            .all(|b| b == b'\t' || (b' '..=b'~').contains(&b));
+        if plain_name && plain_value {
             extra.push_str(line);
             extra.push_str("\r\n");
         }
@@ -335,9 +346,16 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
         Ok((bytes, usage, status)) => {
             // No usage on a success is counted from bytes, closed. An error
             // from the provider with no usage was not a completion and is free.
+            // A reply that leaves the prompt out of its usage, or leaves usage
+            // out, has the prompt counted from the request. Otherwise a worker
+            // could send megabytes, ask for one token, and pay for the one.
+            let sent_tokens = (payload.len() as u64).div_ceil(4);
             let actual = match usage {
-                Some(n) => n,
-                None if (200..300).contains(&status) => bytes.div_ceil(4),
+                Some((n, true)) => n,
+                Some((n, false)) => n.saturating_add(sent_tokens),
+                None if (200..300).contains(&status) => {
+                    sent_tokens.saturating_add(bytes.div_ceil(4))
+                }
                 None => 0,
             };
             let (charge, kill) = settle(hub, &id, planned.hold, actual);
@@ -541,7 +559,7 @@ fn forward(
     body: &[u8],
     client: &mut UnixStream,
     sent: &mut bool,
-) -> Result<(u64, Option<u64>, u16)> {
+) -> Result<(u64, Option<Usage>, u16)> {
     let origin = parse_origin(upstream)?;
     let mut stream = connect(&origin)?;
     let host = if origin.port == origin.default_port() {
@@ -585,7 +603,7 @@ fn forward(
             bytes += n as u64;
         }
     }
-    Ok((bytes, extract_usage(&tail), status))
+    Ok((bytes, usage_in(&tail), status))
 }
 
 fn copy_n(
@@ -618,7 +636,15 @@ fn push_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
+#[cfg(test)]
 fn extract_usage(buf: &[u8]) -> Option<u64> {
+    usage_in(buf).map(|(n, _)| n)
+}
+
+/// Tokens a reply reports, and whether that count includes the prompt.
+type Usage = (u64, bool);
+
+fn usage_in(buf: &[u8]) -> Option<Usage> {
     let text = String::from_utf8_lossy(buf);
     if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
         if let Some(n) = usage_of(&v) {
@@ -641,13 +667,13 @@ fn extract_usage(buf: &[u8]) -> Option<u64> {
     best
 }
 
-fn usage_of(v: &Value) -> Option<u64> {
+fn usage_of(v: &Value) -> Option<Usage> {
     v.get("usage").and_then(usage_obj)
 }
 
-fn usage_obj(v: &Value) -> Option<u64> {
+fn usage_obj(v: &Value) -> Option<Usage> {
     if let Some(t) = v.get("total_tokens").and_then(|n| n.as_u64()) {
-        return Some(t);
+        return Some((t, true));
     }
     // Anthropic counts cached input apart from the rest. It is still spend.
     let cached: u64 = ["cache_creation_input_tokens", "cache_read_input_tokens"]
@@ -665,7 +691,7 @@ fn usage_obj(v: &Value) -> Option<u64> {
         .and_then(|n| n.as_u64());
     match (prompt, completion) {
         (None, None) => None,
-        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+        (p, c) => Some((p.unwrap_or(0) + c.unwrap_or(0), p.is_some())),
     }
 }
 
@@ -729,9 +755,32 @@ fn parse_origin(raw: &str) -> Result<Origin> {
     Ok(Origin { https, host, port })
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Silence this long mid-reply is a dead upstream. A model that thinks for
+/// minutes still sends headers or keep-alive bytes well inside it.
+const UPSTREAM_IDLE: Duration = Duration::from_secs(600);
+
 fn connect(origin: &Origin) -> Result<Box<dyn Rw>> {
-    let tcp = TcpStream::connect((origin.host.as_str(), origin.port))?;
+    // An upstream that takes the connection and says nothing must not hold a
+    // worker's call, and a proxy thread, forever.
+    use std::net::ToSocketAddrs;
+    let mut last = err("upstream did not resolve");
+    let mut tcp = None;
+    for addr in (origin.host.as_str(), origin.port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(e) => last = e.into(),
+        }
+    }
+    let Some(tcp) = tcp else {
+        return Err(last);
+    };
     tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(UPSTREAM_IDLE))?;
+    tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     if !origin.https {
         return Ok(Box::new(tcp));
     }

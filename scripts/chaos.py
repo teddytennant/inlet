@@ -37,7 +37,7 @@ retain = %s
 default_budget = { tokens = 1000, seconds = 60, memory_mb = 256, pids = 32 }
 workers = {
   plain = { cmd = { "/bin/sh", "-c", "n=$(cat \\"$INLET_GOAL_FILE\\"); echo run >> runs; sleep 0.$((n %% 9))$((n %% 7)); [ $((n %% 6)) -eq 0 ] && [ $(wc -l < runs) -lt 2 ] && exit 1; echo $n > out" } },
-  lead  = { cmd = { "/bin/sh", "-c", "echo run >> runs; [ -f kid ] || \\"$INLET_BIN\\" door spawn -w kid -g part --verify 'test -f made' --tokens 100 > kid || exit 1; \\"$INLET_BIN\\" door wait --timeout 50 > kids || exit 1; grep -q done kids && touch finished" } },
+  lead  = { cmd = { "/bin/sh", "-c", "echo run >> runs; \\"$INLET_BIN\\" door spawn -w kid -g part --verify 'test -f made' --tokens 100 > kid || exit 1; \\"$INLET_BIN\\" door wait --timeout 50 > kids || exit 1; grep -q done kids && touch finished" } },
   kid   = { cmd = { "/bin/sh", "-c", "sleep 0.4; touch made; \\"$INLET_BIN\\" door post made-it" } },
 }
 """ % (CAP, '"30d"' if not args.retain else args.retain))
@@ -170,18 +170,22 @@ check(not dupes, "goals done other than once: %s" % dict(list(dupes.items())[:5]
 plain_done = len([g for g in done_by_goal if g.isdigit()])
 check(plain_done == PLAIN, "plain goals done: %d" % plain_done)
 
-# The purse adds up to the token: admitted, less refunded, is what is gone.
-debited = sum(r["tokens"] for r in records if r["kind"] == "admit" and not tasks.get(r["id"], {}).get("parent"))
-kept = {}
-for i, t in tasks.items():
-    e = exits[i]
-    if len(e) == 1 and e[0]["kind"] == "exit":
-        kept[i] = e[0]["tokens_used"]
-roots_kept = sum(n for i, n in kept.items() if not tasks[i].get("parent"))
-check(st["available"] + roots_kept == CAP, "purse: available %d + kept by roots %d != cap %d" % (st["available"], roots_kept, CAP))
-# No worker called a model, so only a crash may keep anything.
-wrong = [i for i, n in kept.items() if n and exits[i][0]["reason"] != "crash"]
-check(not wrong, "tokens kept by a task that did not crash: %s" % wrong[:3])
+# The purse adds up to the token. No worker here calls a model, so the only
+# thing that may be gone is the slice of a task that crashed: its own if it was
+# a root or its parent lived, its parent's if they went down together.
+budget = {r["id"]: r["tokens"] for r in records if r["kind"] == "admit"}
+
+
+def crashed(i):
+    e = exits.get(i, [])
+    return len(e) == 1 and e[0]["kind"] == "exit" and e[0]["reason"] == "crash"
+
+
+lost = sum(budget.get(i, 0) for i, t in tasks.items() if crashed(i) and not (t.get("parent") and crashed(t["parent"])))
+check(st["available"] + lost == CAP, "purse: available %d + lost to crashes %d != cap %d" % (st["available"], lost, CAP))
+# Every exit accounts for its whole slice, no more and no less.
+torn = [i for i, e in exits.items() if len(e) == 1 and e[0]["kind"] == "exit" and e[0]["tokens_used"] + e[0]["refund_tokens"] != budget.get(i, -1)]
+check(not torn, "exits that do not add up to their slice: %s" % torn[:3])
 
 # A worker never ran more attempts than its plan allows.
 over = [i for i, t in tasks.items() if t.get("plan", {}).get("attempt", 1) > max(t.get("plan", {}).get("max_attempts", 1), 1)]

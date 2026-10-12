@@ -194,6 +194,8 @@ pub struct State {
     pub posts_seen: u64,
     pub channels: BTreeMap<String, ChannelStat>,
     pub swarms: BTreeMap<String, SwarmView>,
+    /// Live tasks an operator asked to kill. The ask outlives a daemon crash.
+    pub killing: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -249,6 +251,7 @@ impl State {
             posts_seen: 0,
             channels: BTreeMap::new(),
             swarms: BTreeMap::new(),
+            killing: HashSet::new(),
         }
     }
 
@@ -407,6 +410,7 @@ impl State {
                 if let Some(done) = settled {
                     self.settle_owner(id, done, *ts);
                 }
+                self.killing.remove(id);
                 self.stamp(id, *ts);
                 self.note_parent(id);
             }
@@ -559,8 +563,12 @@ impl State {
                     });
                 }
             }
-            Record::Kill { .. }
-            | Record::Reset { .. }
+            Record::Kill { id, .. } => {
+                if self.tasks.get(id).is_some_and(|t| t.state.is_live()) {
+                    self.killing.insert(id.clone());
+                }
+            }
+            Record::Reset { .. }
             | Record::Result { .. }
             | Record::Promote { .. }
             | Record::Sign { .. } => {}
@@ -587,10 +595,17 @@ impl State {
             needed.extend(task.parent.as_deref());
             needed.extend(task.retry_of.as_deref());
         }
+        // A live parent still reads how its children ended.
+        let waited_on = |t: &TaskView| {
+            t.parent
+                .as_ref()
+                .and_then(|p| self.tasks.get(p))
+                .is_some_and(|p| !p.state.is_settled())
+        };
         self.tasks
             .values()
             .filter(|t| t.settled_ms > 0 && t.settled_ms < before)
-            .filter(|t| !needed.contains(t.id.as_str()))
+            .filter(|t| !needed.contains(t.id.as_str()) && !waited_on(t))
             .map(|t| t.id.clone())
             .collect()
     }

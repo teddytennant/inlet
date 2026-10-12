@@ -42,6 +42,8 @@ pub(crate) struct Index {
     #[serde(default)]
     swarms: Vec<SwarmView>,
     #[serde(default)]
+    killing: Vec<String>,
+    #[serde(default)]
     moderation: Vec<ModerationSnap>,
     #[serde(default)]
     posts_seen: u64,
@@ -284,6 +286,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
         retried,
         decision_spent: state.decision_spent,
         swarms: state.swarms.values().cloned().collect(),
+        killing: state.killing.iter().cloned().collect(),
         votes: state
             .votes
             .values()
@@ -397,6 +400,14 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
         .iter()
         .map(|swarm| (swarm.name.clone(), swarm.clone()))
         .collect();
+    state.killing = index.killing.iter().cloned().collect();
+    // An index from before tasks carried a settle time: count them from now.
+    let now = crate::id::now_ms();
+    for task in state.tasks.values_mut() {
+        if task.state.is_settled() && task.settled_ms == 0 {
+            task.settled_ms = now;
+        }
+    }
     state.retried = index.retried.iter().cloned().collect();
     state.decision_spent = index.decision_spent;
     state.posts_seen = index.posts_seen;

@@ -832,6 +832,14 @@ fn door_keep(args: &[String]) -> Result<()> {
     {
         return Err(err(usage));
     }
+    // These crossed the exec to get here and must go no further. A worker
+    // holding the status file could write its own exit code, and one holding
+    // the log could write past the cap.
+    for fd in [log_fd as i32, status_fd as i32] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(err(usage));
+        }
+    }
     let mut log = unsafe { fs::File::from_raw_fd(log_fd as i32) };
     let mut status = unsafe { fs::File::from_raw_fd(status_fd as i32) };
     let mut ends = [0i32; 2];

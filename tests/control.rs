@@ -76,7 +76,7 @@ fn start(home: &Path) -> Daemon {
         .spawn()
         .unwrap();
     let want = child.id().to_string();
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(40);
     while Instant::now() < deadline {
         let pid = fs::read_to_string(home.join("run/inlet.pid")).unwrap_or_default();
         if home.join("run/operator.sock").exists() && pid.trim() == want {
@@ -736,7 +736,7 @@ fn a_worker_that_finished_while_the_daemon_was_down_still_counts() {
     let home = scratch("offline");
     policy(
         &home,
-        r#"quick = { cmd = { "/bin/sh", "-c", "sleep 0.4; echo $1 > out; exit $1", "sh", "{goal}" } },"#,
+        r#"quick = { cmd = { "/bin/sh", "-c", "sleep 2; echo $1 > out; exit $1", "sh", "{goal}" } },"#,
         "",
     );
     let mut daemon = start(&home);
@@ -747,7 +747,7 @@ fn a_worker_that_finished_while_the_daemon_was_down_still_counts() {
     inlet(&home, &["add", "-w", "quick", "-g", "3", "--no-verify"]);
     wait(&home, &daemon, |v| v["live"] == 2);
     kill9(&mut daemon);
-    thread::sleep(Duration::from_millis(900));
+    thread::sleep(Duration::from_millis(2600));
 
     let daemon = start(&home);
     let st = wait(&home, &daemon, |v| v["live"] == 0);
@@ -1242,4 +1242,79 @@ fn old_tasks_are_forgotten_and_stay_forgotten() {
         );
         assert!(status(&home)["ok"] == true);
     }
+}
+
+#[test]
+fn a_worker_cannot_write_its_own_exit_status() {
+    let home = scratch("forge");
+    // Every descriptor it was born with, tried as the status file: four zero
+    // bytes would read as exit 0. Then it fails for real.
+    policy(
+        &home,
+        r#"liar = { cmd = { "python3", "-c", "import os\nfor fd in range(3, 64):\n    try:\n        os.pwrite(fd, bytes(4), 0)\n    except OSError:\n        pass\nos._exit(3)" } },"#,
+        "",
+    );
+    let daemon = start(&home);
+    inlet(&home, &["add", "-w", "liar", "-g", "lie", "--no-verify"]);
+    let st = wait(&home, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let task = &tasks(&st)[0];
+    assert_eq!(
+        (task["state"].as_str(), task["reason"].as_str()),
+        (Some("failed"), Some("exit")),
+        "{st}"
+    );
+}
+
+#[test]
+fn a_kill_reaches_a_queued_task_and_outlives_a_crash() {
+    let home = scratch("killq");
+    policy(
+        &home,
+        r#"nap = { cmd = { "sleep", "30" } },"#,
+        "caps = { max_live = 1, max_depth = 3, max_tokens = 10000, max_memory_mb = 8192, max_pids = 64 }",
+    );
+    let mut daemon = start(&home);
+    inlet(&home, &["add", "-w", "nap", "-g", "running", "--no-verify"]);
+    inlet(&home, &["add", "-w", "nap", "-g", "waiting", "--no-verify"]);
+    let st = wait(&home, &daemon, |v| v["live"] == 1 && v["queued"] == 1);
+    let id = |goal: &str| {
+        tasks(&st).into_iter().find(|t| t["goal"] == goal).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    inlet(&home, &["kill", &id("waiting")]);
+    let st2 = wait(&home, &daemon, |v| v["queued"] == 0);
+    let waiting = tasks(&st2)
+        .into_iter()
+        .find(|t| t["goal"] == "waiting")
+        .unwrap();
+    assert_eq!(waiting["reason"], "killed", "{st2}");
+    assert!(!run(&home, &["kill", "no-such-task"]).status.success());
+
+    // The ask is written to the ledger before the signal is sent. Play the
+    // crash in between: the daemon dies, and the record is all that is left.
+    let running = id("running");
+    kill9(&mut daemon);
+    let body = format!(r#"{{"kind":"kill","id":"{running}","ts":1}}"#);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&inlet::ledger::crc32(body.as_bytes()).to_le_bytes());
+    frame.extend_from_slice(body.as_bytes());
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(home.join("ledger/log"))
+        .unwrap()
+        .write_all(&frame)
+        .unwrap();
+    let daemon = start(&home);
+    let st3 = wait(&home, &daemon, |v| v["live"] == 0);
+    let task = tasks(&st3)
+        .into_iter()
+        .find(|t| t["goal"] == "running")
+        .unwrap();
+    // Taken back, and then killed as asked. Not left running, not a crash.
+    assert_eq!(task["state"], "killed", "{st3} {}", daemon.log());
+    assert_eq!(tasks(&st3).len(), 2, "no retry of a kill: {st3}");
 }

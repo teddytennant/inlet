@@ -782,7 +782,17 @@ unsafe fn child_entry(a: &Raw) -> ! {
     }
     // A kept worker's memory is watched by its keeper, by what it really
     // uses. An rlimit can only count what a runtime reserves.
-    set_limits(if a.keep { 0 } else { a.memory_mb }, a.pids, a.seconds);
+    // Only in a pid namespace of its own can the keeper tell the cell's
+    // memory from the host's. Without one the rlimit is what there is.
+    set_limits(
+        if a.keep && a.in_user_ns {
+            0
+        } else {
+            a.memory_mb
+        },
+        a.pids,
+        a.seconds,
+    );
     let _ = libc::chdir(if pivoted { c"/work".as_ptr() } else { a.work });
 
     let input = if pivoted { a.stdin_pivot } else { a.stdin_host };
