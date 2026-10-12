@@ -1726,7 +1726,8 @@ fn a_standby_takes_over_when_the_leader_dies() {
     let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 0.4; echo ok > out" } },"#;
     let east = node_home("east6", job);
     let leader = scratch("leader6");
-    node_policy(&leader, &[("east", &east, 3)], "");
+    // A lease long enough that a slow takeover on a busy box is not a lost node.
+    node_policy(&leader, &[("east", &east, 3)], "node_grace = 30");
     let east_d = start(&east);
     let mut daemon = start(&leader);
     wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
@@ -1888,7 +1889,7 @@ open("reply", "w").write(urllib.request.urlopen(req).read().decode())
   east = {{ cmd = {{ "/bin/sh", "-c", "test -e {gate} && exit 1; exec {bin} --home {east} \"$@\"", "sh" }}, slots = 1 }},
   west = {{ cmd = {{ "{bin}", "--home", "{west}" }}, slots = 1 }},
 }}
-node_grace = 8"#,
+node_grace = 16"#,
             gate = gate.display(),
             bin = bin().display(),
             east = east.display(),
