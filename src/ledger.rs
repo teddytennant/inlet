@@ -34,14 +34,18 @@ pub fn open_from(path: &Path, offset: u64) -> Result<Opened> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    if (buf.len() as u64) < offset {
+    let total = file.metadata()?.len();
+    if total < offset {
         return Err(err("snapshot is ahead of the log"));
     }
-    let (records, keep) = scan(&buf[offset as usize..])?;
+    // Only the tail past the checkpoint is read. The rest can be gigabytes
+    // by now, and none of it is needed to start.
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let (records, keep) = scan(&buf)?;
     let end = offset + keep;
-    if end < buf.len() as u64 {
+    if end < total {
         file.set_len(end)?;
     }
     file.seek(SeekFrom::Start(end))?;
