@@ -46,6 +46,8 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some("doctor") => doctor(&home),
+        Some("down") => down(&home, args.iter().any(|a| a == "--keep")),
         Some("init") => crate::setup::init(&home, &args[1..]),
         Some("settings") | Some("--settings") => crate::setup::settings(&home, &args[1..]),
         Some("add") => add(&home, &args[1..]),
@@ -101,6 +103,8 @@ pub fn run() -> Result<()> {
 
 const HELP: &str = "\
 inlet up [-f]            daemon. -f stays in the foreground
+inlet doctor             check the policy, the cell, the upstream, the disk, and what a crash left
+inlet down [--keep]      stop the daemon and its workers. --keep leaves the workers for the next daemon
 inlet                    attach the tui
 inlet init [--defaults] [--no-smoke]
 inlet settings           view or change setup
@@ -552,6 +556,142 @@ pub fn parse_add_flags(args: &[String]) -> Result<NewTask> {
         seed,
         retries,
     })
+}
+
+/// What an operator checks before trusting a box with work, in one place.
+/// Exit status is non-zero when a check that matters fails.
+fn doctor(home: &Path) -> Result<()> {
+    let mut bad = 0;
+    let mut line = |ok: bool, what: &str, detail: String| {
+        if !ok {
+            bad += 1;
+        }
+        println!("{}  {what:<10} {detail}", if ok { "ok  " } else { "FAIL" });
+    };
+    let policy = crate::config::Policy::load(&paths::policy(home));
+    match &policy {
+        Ok(p) => line(
+            !p.cfg.workers.is_empty(),
+            "policy",
+            format!(
+                "{} workers, max_live {}, adopt {}",
+                p.cfg.workers.len(),
+                p.cfg.caps.max_live,
+                p.cfg.adopt
+            ),
+        ),
+        Err(e) => line(false, "policy", e.to_string()),
+    }
+    line(
+        crate::cell::probe(home),
+        "cell",
+        "user, mount, and pid namespaces with Landlock".into(),
+    );
+    if let Ok(p) = &policy {
+        match &p.cfg.proxy.upstream {
+            None => line(
+                true,
+                "upstream",
+                "none set; workers cannot call a model".into(),
+            ),
+            Some(url) => {
+                let rest = url.split("://").nth(1).unwrap_or(url);
+                let host = rest.split('/').next().unwrap_or(rest);
+                let addr = if host.contains(':') {
+                    host.to_string()
+                } else {
+                    format!("{host}:{}", if url.starts_with("https") { 443 } else { 80 })
+                };
+                use std::net::ToSocketAddrs;
+                let reached = addr
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut a| a.next())
+                    .is_some_and(|a| {
+                        std::net::TcpStream::connect_timeout(&a, Duration::from_secs(5)).is_ok()
+                    });
+                line(
+                    reached,
+                    "upstream",
+                    format!(
+                        "{addr} {}",
+                        if reached {
+                            "answers"
+                        } else {
+                            "does not answer"
+                        }
+                    ),
+                );
+            }
+        }
+    }
+    let free = crate::daemon::free_bytes(home).unwrap_or(0);
+    line(
+        free >= 1024 * 1024 * 1024,
+        "disk",
+        format!("{} MB free under the home", free / (1024 * 1024)),
+    );
+    let ledger = fs::metadata(paths::ledger(home))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    match proto::rpc(home, json!({"op":"status","brief": true})) {
+        Ok(v) => {
+            let stalled = v["swarms"]
+                .as_array()
+                .map(|all| all.iter().filter(|s| s["phase"] == "stalled").count())
+                .unwrap_or(0);
+            line(
+                true,
+                "daemon",
+                format!(
+                    "up, {} live, {} queued, {} of {} tokens free, ledger {} MB, checkpoint at {} MB",
+                    v["live"],
+                    v["queued"],
+                    v["available"],
+                    v["cap"],
+                    ledger / (1024 * 1024),
+                    v["snap_offset"].as_u64().unwrap_or(0) / (1024 * 1024),
+                ),
+            );
+            line(stalled == 0, "swarms", format!("{stalled} stalled"));
+        }
+        Err(_) => {
+            // Not an error by itself. What matters is whether work is waiting on it.
+            let kept = fs::read_dir(home.join("run/live"))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            line(
+                kept == 0,
+                "daemon",
+                format!("down, {kept} workers waiting to be taken back"),
+            );
+        }
+    }
+    if bad > 0 {
+        return Err(err(format!("{bad} checks failed")));
+    }
+    Ok(())
+}
+
+/// Ctrl-C from anywhere. `--keep` is the other signal: the daemon goes, the
+/// work stays, and the next `inlet up` takes it back.
+fn down(home: &Path, keep: bool) -> Result<()> {
+    let pid: i32 = fs::read_to_string(paths::pid_file(home))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| err("daemon is not up"))?;
+    let sig = if keep { libc::SIGTERM } else { libc::SIGINT };
+    if unsafe { libc::kill(pid, sig) } != 0 {
+        return Err(err("daemon is not up"));
+    }
+    for _ in 0..600 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            println!("{}", if keep { "down, workers kept" } else { "down" });
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(err("daemon is still stopping"))
 }
 
 fn checked(v: Value, what: &str) -> Result<Value> {

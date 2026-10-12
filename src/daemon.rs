@@ -36,6 +36,10 @@ const SOFT_FLUSH: Duration = Duration::from_millis(50);
 const TRANSCRIPT_CAP: u64 = 16 * 1024 * 1024;
 const VERIFY_LOG_CAP: u64 = 256 * 1024;
 const GC_EVERY: Duration = Duration::from_secs(60);
+const DISK_EVERY: Duration = Duration::from_secs(5);
+/// Below this much free space nothing new is admitted. The ledger must be
+/// able to record how the running tasks end.
+const DISK_FLOOR: u64 = 256 * 1024 * 1024;
 /// A checkpoint is taken once the log has grown this much past the last one.
 const CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024;
 /// Tasks one swarm may stamp per pass. The rest come on the next one.
@@ -151,6 +155,8 @@ struct Daemon {
     /// Swarm generations already reported stalled.
     told: HashSet<(String, u64)>,
     last_gc: Instant,
+    /// Free space under the home, checked every few seconds.
+    disk: (Instant, bool),
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -346,6 +352,7 @@ fn run(home: &Path) -> Result<()> {
         snap_offset,
         told: HashSet::new(),
         last_gc: Instant::now(),
+        disk: (Instant::now() - DISK_EVERY, true),
     };
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
@@ -930,6 +937,29 @@ impl Daemon {
         }
         let queued: Vec<String> = self.state.queue.iter().cloned().collect();
         if queued.is_empty() {
+            return Ok(());
+        }
+        if self.disk.0.elapsed() >= DISK_EVERY {
+            let room = free_bytes(&self.home).is_none_or(|free| free >= DISK_FLOOR);
+            if !room && self.disk.1 {
+                eprintln!("inlet: disk is nearly full, holding the queue");
+                self.commit(
+                    &[Record::Post {
+                        id: id::ulid(),
+                        author: "inlet".into(),
+                        role: "operator".into(),
+                        text: "the disk under the home is nearly full. Nothing new is admitted until there is room.".into(),
+                        weight: 1,
+                        channel: "general".into(),
+                        mentions: Vec::new(),
+                        ts: now_ms(),
+                    }],
+                    false,
+                )?;
+            }
+            self.disk = (Instant::now(), room);
+        }
+        if !self.disk.1 {
             return Ok(());
         }
         let live = self.state.live();
@@ -2920,6 +2950,17 @@ impl Daemon {
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
     }
+}
+
+/// Bytes an unprivileged process may still write under `path`.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    Some((vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64))
 }
 
 /// A process's start time, in clock ticks since boot. `None` once it is gone.

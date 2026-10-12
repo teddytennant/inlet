@@ -944,8 +944,17 @@ fn sigterm_leaves_the_work_running() {
     while work(&home, &id, "up").is_empty() {
         thread::sleep(Duration::from_millis(20));
     }
-    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) };
+    // `inlet down --keep` is that signal with a name.
+    let reaper = thread::spawn({
+        let home = home.clone();
+        move || run(&home, &["down", "--keep"])
+    });
     assert!(daemon.child.wait().unwrap().success());
+    let said = reaper.join().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&said.stdout).trim(),
+        "down, workers kept"
+    );
 
     let daemon = start(&home);
     let st = wait(&home, &daemon, |v| tasks(v)[0]["state"] != "running");
@@ -1317,4 +1326,33 @@ fn a_kill_reaches_a_queued_task_and_outlives_a_crash() {
     // Taken back, and then killed as asked. Not left running, not a crash.
     assert_eq!(task["state"], "killed", "{st3} {}", daemon.log());
     assert_eq!(tasks(&st3).len(), 2, "no retry of a kill: {st3}");
+}
+
+#[test]
+fn doctor_says_what_is_wrong() {
+    let home = scratch("doctor");
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    policy(
+        &home,
+        r#"job = { cmd = { "true" } },"#,
+        &format!(r#"proxy = {{ upstream = "http://127.0.0.1:{dead}" }}"#),
+    );
+    let daemon = start(&home);
+    let out = run(&home, &["doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("ok    policy"), "{text} {}", daemon.log());
+    assert!(text.contains("ok    cell"), "{text}");
+    assert!(text.contains("FAIL  upstream"), "{text}");
+    assert!(text.contains("does not answer"), "{text}");
+    assert!(text.contains("ok    daemon     up, 0 live"), "{text}");
+    // The daemon still works after being probed.
+    inlet(&home, &["add", "-w", "job", "-g", "after", "--no-verify"]);
+    wait(&home, &daemon, |v| {
+        tasks(v).iter().any(|t| t["state"] == "done")
+    });
 }

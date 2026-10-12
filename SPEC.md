@@ -174,7 +174,7 @@ Allow only if all of these hold:
 - the isolator can actually place it
 - `plan.not_before` has passed
 
-A full `live` keeps the task queued. So does a root purse that is short for now: the task waits for the reset or for a live slice to come back, and smaller tasks pass it. A queue of thousands outlives the day's tokens. A task that could never fit the caps, and a child whose parent has no slice left, are denies. Any other failure is a deny. A deny for `gate` is retried like a failure, with backoff. Lua's `admit(ctx)` may return deny on top of that. A return of allow does not override a failed check above. Timeout or a down endpoint denies spawns and allows a running task to finish its current verifier. Never fail open on spawn.
+A full `live` keeps the task queued. So does a disk with under 256MB free under the home: nothing new is admitted, a line goes to `general`, and the ledger keeps the room it needs to record how the running tasks end. So does a root purse that is short for now: the task waits for the reset or for a live slice to come back, and smaller tasks pass it. A queue of thousands outlives the day's tokens. A task that could never fit the caps, and a child whose parent has no slice left, are denies. Any other failure is a deny. A deny for `gate` is retried like a failure, with backoff. Lua's `admit(ctx)` may return deny on top of that. A return of allow does not override a failed check above. Timeout or a down endpoint denies spawns and allows a running task to finish its current verifier. Never fail open on spawn.
 
 If `decision.kind = "off"`, p_success is 1 for tasks with a verifier and 0.5 without. The cost check still runs. Cold, a verified task passes when its budget is at most its value, an unverified one at most half. With the defaults, `value = 400000` against a 200000-token budget, a verified task clears `min_ev = 0` with room to spare. A factory of five can work with the endpoint off. A swarm should not.
 
@@ -304,6 +304,8 @@ CLI, same socket:
 
 ```
 inlet up [-f]
+inlet down [--keep]
+inlet doctor
 inlet [attach]
 inlet init [--defaults] [--no-smoke]
 inlet settings

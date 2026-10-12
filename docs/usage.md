@@ -100,7 +100,9 @@ inlet does not supervise itself. Put it under whatever supervises the box:
     [Install]
     WantedBy=default.target
 
-`KillMode=process` matters: systemd then signals the daemon alone, the workers stay up, and the restarted daemon takes them back. The same file is in `contrib/inlet.service`.
+`KillMode=process` matters: systemd then signals the daemon alone, the workers stay up, and the restarted daemon takes them back. That goes for `systemctl stop` too, so stopping the unit leaves the work running. `inlet down` is what stops the workers; `inlet down --keep` stops only the daemon. The same file is in `contrib/inlet.service`.
+
+`inlet doctor` checks the policy, the cell, the upstream, the disk, the daemon, and whether a dead daemon left workers waiting. It exits non-zero when something is wrong.
 
 To check a build before trusting it with work:
 
