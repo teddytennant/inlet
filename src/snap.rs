@@ -73,6 +73,8 @@ struct HeaderSnap {
     admit_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Plan::is_default")]
     plan: Plan,
+    #[serde(default)]
+    settled_ms: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -193,9 +195,13 @@ pub(crate) fn load(home: &Path) -> Result<Option<Index>> {
         return Ok(None);
     }
     let bytes = fs::read(&path)?;
-    Ok(Some(
-        serde_json::from_slice(&bytes).map_err(|_| err("bad snapshot index"))?,
-    ))
+    // The log is the truth and the index is a shortcut. One that will not
+    // parse is skipped, and the whole log is replayed.
+    let Ok(index) = serde_json::from_slice(&bytes) else {
+        eprintln!("inlet: snapshot index is unreadable, replaying the whole log");
+        return Ok(None);
+    };
+    Ok(Some(index))
 }
 
 pub(crate) fn store(home: &Path, index: &Index) -> Result<()> {
@@ -220,6 +226,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
             retry_of: task.retry_of.clone(),
             recipe: task.recipe.clone(),
             admit_ms: task.admit_ms,
+            settled_ms: task.settled_ms,
             plan: task.plan.clone(),
         })
         .collect();
@@ -353,6 +360,7 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
                     recipe: header.recipe.clone(),
                     pid: None,
                     admit_ms: header.admit_ms,
+                    settled_ms: header.settled_ms,
                     plan: header.plan.clone(),
                 },
             )
@@ -616,13 +624,21 @@ fn durable(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Whole or not at all: a crash halfway must leave the old file, not half of a new one.
+    let tmp = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(path)?;
+        .open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

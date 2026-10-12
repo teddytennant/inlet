@@ -35,6 +35,9 @@ use crate::text::mentions;
 const SOFT_FLUSH: Duration = Duration::from_millis(50);
 const TRANSCRIPT_CAP: u64 = 16 * 1024 * 1024;
 const VERIFY_LOG_CAP: u64 = 256 * 1024;
+const GC_EVERY: Duration = Duration::from_secs(60);
+/// A checkpoint is taken once the log has grown this much past the last one.
+const CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024;
 /// Tasks one swarm may stamp per pass. The rest come on the next one.
 const STAMP_BATCH: u64 = 64;
 
@@ -147,6 +150,7 @@ struct Daemon {
     snap_offset: u64,
     /// Swarm generations already reported stalled.
     told: HashSet<(String, u64)>,
+    last_gc: Instant,
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -337,6 +341,7 @@ fn run(home: &Path) -> Result<()> {
         fence: lease.gen,
         snap_offset,
         told: HashSet::new(),
+        last_gc: Instant::now(),
     };
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
@@ -515,6 +520,7 @@ impl Daemon {
         for id in recheck {
             self.start_check(&id)?;
         }
+        self.sweep();
         if self.state.purse.due(now_ms()) {
             self.commit(
                 &[Record::Reset {
@@ -525,6 +531,33 @@ impl Daemon {
             )?;
         }
         self.settle()
+    }
+
+    /// Remove what a dead daemon left for tasks that are no longer live: cell
+    /// roots, scratch, notes. A task that crashed with the daemon never went
+    /// through the path that cleans up after it.
+    fn sweep(&self) {
+        let live = |name: &str| {
+            let id = name.trim_end_matches("-check");
+            self.state.tasks.get(id).is_some_and(|t| t.state.is_live())
+        };
+        for sub in ["run/cells", "run/checks", "run/live", "run/exit", "scratch"] {
+            let Ok(dir) = fs::read_dir(self.home.join(sub)) else {
+                continue;
+            };
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "probe" || live(&name) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
     }
 
     /// Find the workers that outlived the last daemon. Returns the tasks that
@@ -675,6 +708,10 @@ impl Daemon {
         if !self.shutting_down {
             self.reconcile()?;
             self.admit()?;
+            let retain = Duration::from_millis(self.policy.cfg.retain_ms.max(1000));
+            if self.last_gc.elapsed() >= GC_EVERY.min(retain) {
+                self.gc()?;
+            }
         }
         if self.last_flush.elapsed() >= SOFT_FLUSH {
             self.flush_soft()?;
@@ -1003,6 +1040,35 @@ impl Daemon {
                 self.finish(&id, 127, "cell", true)?;
                 let _ = e;
             }
+        }
+        Ok(())
+    }
+
+    /// Forget what is past `retain`, and keep restart time bounded. Without
+    /// this the headers, the workdirs, and the replay all grow for as long as
+    /// the daemon lives.
+    fn gc(&mut self) -> Result<()> {
+        self.last_gc = Instant::now();
+        let mut pruned = 0;
+        if self.policy.cfg.retain_ms > 0 {
+            let before = now_ms().saturating_sub(self.policy.cfg.retain_ms);
+            let old = self.state.forgettable(before);
+            for id in &old {
+                let _ = fs::remove_dir_all(paths::work(&self.home, id));
+                let _ = fs::remove_file(paths::transcript(&self.home, id));
+                let _ = fs::remove_file(paths::verify_log(&self.home, id));
+            }
+            pruned = old.len();
+            self.state.forget(&old);
+        }
+        // The index is a shortcut past the log. Take it when it would save a
+        // long replay, or when forgetting would otherwise be undone by one.
+        let grown = self.ledger.len().saturating_sub(self.snap_offset);
+        if pruned > 0 || grown >= CHECKPOINT_BYTES {
+            self.flush_soft()?;
+            let offset = self.ledger.len();
+            snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;
+            self.snap_offset = offset;
         }
         Ok(())
     }

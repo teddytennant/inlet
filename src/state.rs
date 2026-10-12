@@ -32,6 +32,8 @@ pub struct TaskView {
     pub pid: Option<i32>,
     pub admit_ms: Option<u64>,
     pub plan: Plan,
+    /// When it reached done, failed, or killed. 0 until then.
+    pub settled_ms: u64,
 }
 
 const SWARM_PACE_MS: u64 = 1_000;
@@ -297,6 +299,7 @@ impl State {
                         pid: None,
                         admit_ms: None,
                         plan: plan.clone(),
+                        settled_ms: 0,
                     },
                 );
                 self.queue.push_back(id.clone());
@@ -323,6 +326,7 @@ impl State {
                     if lost {
                         self.settle_owner(id, false, *ts);
                     }
+                    self.stamp(id, *ts);
                     self.queue.retain(|q| q != id);
                     self.note_parent(id);
                 } else {
@@ -357,6 +361,7 @@ impl State {
                 if open {
                     self.settle_owner(id, false, *ts);
                 }
+                self.stamp(id, *ts);
                 self.queue.retain(|q| q != id);
                 self.note_parent(id);
             }
@@ -402,6 +407,7 @@ impl State {
                 if let Some(done) = settled {
                     self.settle_owner(id, done, *ts);
                 }
+                self.stamp(id, *ts);
                 self.note_parent(id);
             }
             Record::Post {
@@ -561,6 +567,38 @@ impl State {
         }
         if let Record::Reset { ts, .. } = rec {
             self.purse.apply_reset(*ts);
+        }
+    }
+
+    fn stamp(&mut self, id: &str, ts: u64) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            if task.state.is_settled() && task.settled_ms == 0 {
+                task.settled_ms = ts.max(1);
+            }
+        }
+    }
+
+    /// Settled tasks old enough to forget: nothing unsettled is their child
+    /// or their retry, so nothing will look them up again. Their records stay
+    /// in the log. Swarm counts do not depend on them.
+    pub fn forgettable(&self, before: u64) -> Vec<String> {
+        let mut needed: HashSet<&str> = HashSet::new();
+        for task in self.tasks.values().filter(|t| !t.state.is_settled()) {
+            needed.extend(task.parent.as_deref());
+            needed.extend(task.retry_of.as_deref());
+        }
+        self.tasks
+            .values()
+            .filter(|t| t.settled_ms > 0 && t.settled_ms < before)
+            .filter(|t| !needed.contains(t.id.as_str()))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    pub fn forget(&mut self, ids: &[String]) {
+        for id in ids {
+            self.tasks.remove(id);
+            self.retried.remove(id);
         }
     }
 

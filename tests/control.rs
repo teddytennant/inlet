@@ -1171,3 +1171,75 @@ open("codes", "w").write(" ".join(map(str, codes)))
         assert_eq!(st["available"], 10000, "{name}: {st}");
     }
 }
+
+#[test]
+fn old_tasks_are_forgotten_and_stay_forgotten() {
+    let home = scratch("retain");
+    policy(
+        &home,
+        r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#,
+        "retain = 2",
+    );
+    let mut daemon = start(&home);
+    manifest(
+        &home,
+        r#"{"kind":"swarm","name":"old","replicas":3,"completions":3,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    let st = wait(&home, &daemon, |v| swarm(v, "old")["phase"] == "done");
+    let ids: Vec<String> = tasks(&st)
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(home.join("work").join(&ids[0]).exists());
+    // Past retain, the headers go, and the files with them.
+    let st = wait(&home, &daemon, |v| tasks(v).is_empty());
+    assert_eq!(
+        swarm(&st, "old")["done"],
+        3,
+        "the swarm keeps its count: {st}"
+    );
+    for id in &ids {
+        assert!(!home.join("work").join(id).exists(), "workdir kept");
+        assert!(
+            !home.join("runs").join(format!("{id}.log")).exists(),
+            "transcript kept"
+        );
+    }
+    // A restart replays from the checkpoint and does not bring them back.
+    kill9(&mut daemon);
+    let daemon = start(&home);
+    let st = status(&home);
+    assert!(tasks(&st).is_empty(), "{st}");
+    assert_eq!(swarm(&st, "old")["done"], 3, "{st}");
+    assert!(st["snap_offset"].as_u64().unwrap() > 0, "{st}");
+    inlet(
+        &home,
+        &["add", "-w", "job", "-g", "after", "--verify", "test -s out"],
+    );
+    let st = wait(&home, &daemon, |v| {
+        tasks(v).iter().any(|t| t["state"] == "done")
+    });
+    assert_eq!(st["available"], 10000, "{st}");
+
+    // A half-written index is skipped, not fatal: the log is replayed whole.
+    drop(daemon);
+    let index = fs::read_dir(home.join("snap"))
+        .ok()
+        .and_then(|dir| {
+            dir.flatten()
+                .find(|e| e.file_name().to_string_lossy().contains("index"))
+        })
+        .map(|e| e.path());
+    if let Some(index) = index {
+        fs::write(&index, b"{\"offset\": 12, \"head").unwrap();
+        let daemon = start(&home);
+        assert!(
+            daemon.log().contains("snapshot index is unreadable"),
+            "{}",
+            daemon.log()
+        );
+        assert!(status(&home)["ok"] == true);
+    }
+}

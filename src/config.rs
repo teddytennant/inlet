@@ -192,6 +192,9 @@ pub struct Config {
     pub cell_ro: Vec<std::path::PathBuf>,
     /// Workers outlive a daemon that dies, and the next one takes them back.
     pub adopt: bool,
+    /// A settled task is forgotten, and its workdir and transcripts removed,
+    /// this long after it settled. 0 keeps everything.
+    pub retain_ms: u64,
 }
 
 pub struct Policy {
@@ -356,6 +359,9 @@ fn read_config(lua: &Lua) -> Result<Config> {
         if table.contains_key("max_backoff")? {
             cfg.retry.max_backoff_ms = read_span(table.get::<Value>("max_backoff")?)?;
         }
+    }
+    if g.contains_key("retain")? {
+        cfg.retain_ms = read_span(g.get::<Value>("retain")?)?;
     }
     if let Some(v) = g.get::<Option<bool>>("adopt")? {
         cfg.adopt = v;
@@ -673,6 +679,7 @@ pub fn preset(setup: &str) -> Config {
         verify_seconds: 300,
         cell_ro: Vec::new(),
         adopt: true,
+        retain_ms: 30 * 86_400_000,
     }
 }
 
