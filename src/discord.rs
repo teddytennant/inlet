@@ -178,6 +178,26 @@ fn flush_loop(queue: Arc<Mutex<Vec<Note>>>, api: HttpApi, guild: String, token: 
     };
     loop {
         thread::sleep(Duration::from_millis(300));
+        let waiting = || {
+            queue
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len()
+        };
+        let mut seen = waiting();
+        if seen == 0 {
+            continue;
+        }
+        // A burst still arriving is one digest, not two. Wait for it to stop
+        // growing, but not for more than a second.
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(100));
+            let now = waiting();
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
         let batch = {
             let mut queue = queue.lock().unwrap_or_else(|poison| poison.into_inner());
             std::mem::take(&mut *queue)

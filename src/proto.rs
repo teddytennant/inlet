@@ -37,7 +37,10 @@ pub struct SwarmSpec {
 
 #[derive(Debug)]
 pub enum Request {
-    Status,
+    /// `brief` leaves out the task list, which grows with history.
+    Status {
+        brief: bool,
+    },
     Add(Box<NewTask>),
     AddBatch(Vec<NewTask>),
     Post {
@@ -92,7 +95,9 @@ pub fn parse_request(line: &str) -> Result<Request> {
     }
     let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
     match op {
-        "status" => Ok(Request::Status),
+        "status" => Ok(Request::Status {
+            brief: v.get("brief").and_then(|b| b.as_bool()).unwrap_or(false),
+        }),
         "add" => Ok(Request::Add(Box::new(parse_task(&v)?))),
         "add_batch" => {
             let tasks = v

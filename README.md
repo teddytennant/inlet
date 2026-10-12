@@ -24,7 +24,7 @@ Say what should be running. inlet keeps it running: a failed task is tried again
 
 Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file, and `inlet door run` gives it the metered proxy as a base URL.
 
-A 10,000-task swarm with one failure in ten and a `kill -9` halfway: all done, nothing held, 15MB RSS. Twelve Pi agents in cells with no network, daemon killed mid-run: four taken back, twelve done.
+A 10,000-task swarm with one failure in ten and a `kill -9` halfway: all done, nothing held, 15MB RSS, 65 tasks a second from first to last. Twelve Pi agents in cells with no network, daemon killed mid-run: four taken back, twelve done.
 
 SPEC.md
 

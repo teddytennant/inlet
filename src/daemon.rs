@@ -1578,7 +1578,7 @@ impl Daemon {
             }
         };
         match req {
-            Request::Status => self.reply(id, self.status_json()),
+            Request::Status { brief } => self.reply(id, self.status_json(brief)),
             Request::Add(task) => match self.enqueue(std::slice::from_ref(task.as_ref())) {
                 Ok(ids) => self.reply(id, json!({"ok": true, "ids": ids})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),
@@ -1603,7 +1603,7 @@ impl Daemon {
                     client.watch = true;
                 }
                 self.hub.set_debug(self.max_debug());
-                self.reply(id, self.status_json());
+                self.reply(id, self.status_json(false));
             }
             Request::Hello { debug } => {
                 if let Some(client) = self.clients.get_mut(&id) {
@@ -1611,7 +1611,7 @@ impl Daemon {
                     client.watch = true;
                 }
                 self.hub.set_debug(self.max_debug());
-                self.reply(id, self.status_json());
+                self.reply(id, self.status_json(false));
             }
             Request::Digest(channel) => match self.digest_channel(&channel) {
                 Ok(body) => self.reply(id, body),
@@ -2316,15 +2316,19 @@ impl Daemon {
         Ok(id)
     }
 
-    fn status_json(&self) -> Value {
+    fn status_json(&self, brief: bool) -> Value {
         let purse = &self.state.purse;
         let now = now_ms();
-        let tasks: Vec<Value> = self
-            .state
-            .tasks
-            .values()
-            .map(|t| self.task_json(t))
-            .collect();
+        // Every header, every time, is what a poller should not have to pay for.
+        let tasks: Vec<Value> = if brief {
+            Vec::new()
+        } else {
+            self.state
+                .tasks
+                .values()
+                .map(|t| self.task_json(t))
+                .collect()
+        };
         let swarms: Vec<Value> = self
             .state
             .swarms

@@ -641,7 +641,10 @@ fn get(home: &Path, args: &[String]) -> Result<()> {
         "swarms" | "swarm" => "swarms",
         _ => return Err(err("usage: inlet get [tasks|swarms] [--json]")),
     };
-    let v = checked(proto::rpc(home, json!({"op":"status"}))?, "get")?;
+    let v = checked(
+        proto::rpc(home, json!({"op":"status","brief": key == "swarms"}))?,
+        "get",
+    )?;
     let rows = v
         .get(key)
         .and_then(|r| r.as_array())

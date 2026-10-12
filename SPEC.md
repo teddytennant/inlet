@@ -340,7 +340,7 @@ inlet snap
  "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check", "tokens": 20000, "retries": 1}}
 ```
 
-`get` is the table, `describe` is one task with its attempts and the tail of what it and its verifier printed, and `logs` is the whole transcript, read from the home with the daemon up or down.
+`get swarms` asks for a status with no task list, so a poller pays the same on the ten-thousandth task as on the first. `get` is the table, `describe` is one task with its attempts and the tail of what it and its verifier printed, and `logs` is the whole transcript, read from the home with the daemon up or down.
 
 `add -f` takes one task per line with the same fields and appends the batch under one fsync. Budget fields left out come from `default_budget`. `/follow` is `watch --worker`, `/debug` is `--debug`, `/quit` is Ctrl-C.
 
