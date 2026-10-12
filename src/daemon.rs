@@ -171,8 +171,15 @@ struct Daemon {
     remote_ids: HashMap<String, Vec<String>>,
     /// How many times a node has turned a placed task away.
     refused: HashMap<String, u32>,
-    /// On a node: when a leader last asked how its tasks were doing.
-    last_leader: Instant,
+    /// On a node: when each leader last asked how its tasks were doing.
+    leaders: HashMap<String, Instant>,
+    /// When the daemon came up, which is as far back as any lease can count.
+    born: Instant,
+    last_pump: Instant,
+    /// Remote tasks this leader has asked a node to stop, and when.
+    stale_asked: HashMap<String, Instant>,
+    /// This daemon's name as a leader.
+    me: String,
 }
 
 pub fn serve(home: &Path, foreground: bool, standby: bool) -> Result<()> {
@@ -269,67 +276,51 @@ fn guard_ro(home: &Path, policy: &mut Policy) {
 }
 
 fn run(home: &Path, standby: bool) -> Result<()> {
+    // The lock first, and nothing read until it is held. A standby waits
+    // here for the leader's process to go, which is when the kernel lets the
+    // lock go. Only then are the policy, the index, and the log looked at,
+    // so what is replayed is everything the leader wrote and nothing it was
+    // still writing.
+    let log_path = paths::ledger(home);
     let mut waiting = false;
-    // A standby runs this loop until the ledger's lock comes free, which is
-    // the moment the leader's process is gone. Everything is read afresh
-    // then: the policy, the index, and the log the leader left.
-    let (policy, lease, index, snap_offset, opened) = loop {
-        let mut policy = load_signed(home)?;
-        guard_ro(home, &mut policy);
-        let node = snap::node_id(home)?;
-        let lease = snap::ensure_lease(home, &node)?;
-        let mut index = snap::load(home)?;
-        let log_path = paths::ledger(home);
-        let log_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-        if let Some(saved) = &index {
-            if log_len == 0 && saved.offset > 0 {
-                let mut adopted = saved.clone();
-                adopted.offset = 0;
-                if !standby {
-                    snap::store(home, &adopted)?;
-                }
-                index = Some(adopted);
-            } else if log_len < saved.offset {
-                if standby {
-                    // The leader is between a rotation's rename and its index.
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-                return Err(err("snapshot is ahead of the log"));
-            }
-        }
-        let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
-        let opened = if snap_offset > 0 {
-            ledger::open_from(&log_path, snap_offset)
-        } else {
-            ledger::open(&log_path)
-        };
-        let opened = match opened {
-            Ok(opened) => opened,
-            // A log read while the leader is writing it can look torn or damaged.
-            Err(_) if standby && waiting => {
-                thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        match opened.ledger.lock() {
-            Ok(()) => {
+    let file = loop {
+        match ledger::try_lock(&log_path, !standby || !waiting && !log_path.exists())? {
+            Some(file) => {
                 if waiting {
                     eprintln!("inlet: the leader is gone, taking over");
                 }
-                break (policy, lease, index, snap_offset, opened);
+                break file;
             }
-            Err(_) if standby => {
+            None if standby => {
                 if !waiting {
                     eprintln!("inlet: standing by");
                 }
                 waiting = true;
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(250));
             }
-            Err(e) => return Err(e),
+            None => return Err(err("another inlet is holding the ledger")),
         }
     };
+    let mut policy = load_signed(home)?;
+    guard_ro(home, &mut policy);
+    let node = snap::node_id(home)?;
+    let lease = snap::ensure_lease(home, &node)?;
+    let mut index = snap::load(home)?;
+    let log_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if let Some(saved) = &index {
+        if log_len == 0 && saved.offset > 0 {
+            // A rotation that got as far as the new log and not as far as
+            // the new index. The index covers everything; the log is new.
+            let mut adopted = saved.clone();
+            adopted.offset = 0;
+            snap::store(home, &adopted)?;
+            index = Some(adopted);
+        } else if log_len < saved.offset {
+            return Err(err("snapshot is ahead of the log"));
+        }
+    }
+    let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
+    let opened = ledger::open_file(file, snap_offset)?;
     let node = snap::node_id(home)?;
     let mut state = State::new(&policy.cfg);
     state.fence = lease.gen;
@@ -417,18 +408,13 @@ fn run(home: &Path, standby: bool) -> Result<()> {
         adding: HashSet::new(),
         remote_ids: HashMap::new(),
         refused: HashMap::new(),
-        last_leader: Instant::now(),
+        leaders: HashMap::new(),
+        born: Instant::now(),
+        last_pump: Instant::now(),
+        stale_asked: HashMap::new(),
+        me: node.clone(),
     };
-    for (name, cfg) in &daemon.policy.cfg.nodes {
-        // Unknown until it answers. Nothing is placed on a node not yet heard from.
-        daemon.nodes.insert(name.clone(), (Instant::now(), false));
-        node::watch(
-            name.clone(),
-            cfg.cmd.clone(),
-            daemon.node_tx.clone(),
-            daemon.policy.cfg.node_grace_ms,
-        );
-    }
+    daemon.sync_nodes();
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
         .state
@@ -806,6 +792,16 @@ impl Daemon {
     }
 
     fn pump(&mut self) -> Result<()> {
+        // If this loop itself stood still, on a slow fsync say, a leader's
+        // calls were queueing unanswered. That silence is not the leader's.
+        let gap = self.last_pump.elapsed();
+        if gap >= Duration::from_millis(500) {
+            self.born += gap;
+            for heard in self.leaders.values_mut() {
+                *heard += gap;
+            }
+        }
+        self.last_pump = Instant::now();
         while let Ok(note) = self.notes.try_recv() {
             self.on_note(note)?;
         }
@@ -1321,6 +1317,25 @@ impl Daemon {
         Ok(())
     }
 
+    /// Start watching any node the policy names that is not watched yet.
+    /// Called at startup and when a signed policy is installed.
+    fn sync_nodes(&mut self) {
+        for (name, cfg) in &self.policy.cfg.nodes {
+            if self.nodes.contains_key(name) {
+                continue;
+            }
+            // Unknown until it answers. Nothing is placed on a node not yet heard from.
+            self.nodes.insert(name.clone(), (Instant::now(), false));
+            node::watch(
+                name.clone(),
+                cfg.cmd.clone(),
+                self.node_tx.clone(),
+                self.policy.cfg.node_grace_ms,
+                self.me.clone(),
+            );
+        }
+    }
+
     /// Ask the node to run a placed task. The tag makes the ask safe to
     /// repeat: the leader looks for it before asking again.
     fn send_add(&mut self, id: &str) {
@@ -1339,7 +1354,11 @@ impl Daemon {
             .collect();
         tags.push(node::tag(id));
         // Milliseconds, and half of what the leader itself waits.
-        tags.push(format!("lease:{}", self.policy.cfg.node_grace_ms / 2));
+        tags.push(format!(
+            "lease:{}:{}",
+            self.policy.cfg.node_grace_ms / 2,
+            self.me
+        ));
         let verifier = task.verifier.clone().filter(|v| !v.is_empty());
         let spec = json!({
             "worker": task.worker,
@@ -1362,7 +1381,7 @@ impl Daemon {
 
     fn on_node(&mut self, msg: node::Msg) -> Result<()> {
         let (name, tasks) = match msg {
-            node::Msg::Added { id, ok } => {
+            node::Msg::Added { id, ok, answered } => {
                 // Failed or not, the next status says whether it is there.
                 self.adding.remove(&id);
                 if ok {
@@ -1372,6 +1391,10 @@ impl Daemon {
                 // A node that answers its status but will not take the task
                 // has a reason that asking again will not change: no such
                 // worker there, most likely.
+                if !answered {
+                    // A link that dropped or hung is not a node saying no.
+                    return Ok(());
+                }
                 let tries = self.refused.entry(id.clone()).or_insert(0);
                 *tries += 1;
                 let answering = self
@@ -1436,8 +1459,22 @@ impl Daemon {
             })
             .map(|t| t.id.clone())
             .collect();
+        // Asked once, and again only if it is still there ten seconds on.
+        self.stale_asked
+            .retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        let stale: Vec<String> = stale
+            .into_iter()
+            .filter(|id| {
+                self.stale_asked
+                    .get(id)
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+            })
+            .collect();
         if !stale.is_empty() {
             if let Some(cfg) = self.policy.cfg.nodes.get(&name) {
+                for id in &stale {
+                    self.stale_asked.insert(id.clone(), Instant::now());
+                }
                 node::kill(cfg.cmd.clone(), stale);
             }
         }
@@ -1512,6 +1549,7 @@ impl Daemon {
         }
         self.adding.remove(id);
         self.remote_ids.remove(id);
+        self.refused.remove(id);
         self.commit(&recs, true)
     }
 
@@ -1582,6 +1620,7 @@ impl Daemon {
                         not_before: 0,
                         owner: Some(swarm.name.clone()),
                         seed: template.seed.clone().filter(|_| remote),
+                        moves: 0,
                     },
                     ts: now,
                 });
@@ -2055,7 +2094,18 @@ impl Daemon {
         // soon, and will place its tasks somewhere else. Stop them here first,
         // so no goal is worked on twice. The lease in the tag is half the
         // leader's patience: this side always lets go before that side moves.
-        let quiet = self.last_leader.elapsed();
+        let born = self.born;
+        let leaders = &self.leaders;
+        // `lease:<ms>:<leader>`. Each leader's silence is its own.
+        let lapsed = |tag: &str| -> Option<bool> {
+            let mut parts = tag.strip_prefix("lease:")?.splitn(2, ':');
+            let lease = parts.next()?.parse::<u64>().ok()?;
+            let heard = leaders
+                .get(parts.next().unwrap_or(""))
+                .copied()
+                .unwrap_or(born);
+            Some(heard.elapsed() >= Duration::from_millis(lease))
+        };
         let fenced: Vec<String> = self
             .workers
             .iter()
@@ -2064,12 +2114,7 @@ impl Daemon {
             .chain(self.state.queue.iter())
             .filter_map(|id| self.state.tasks.get(id))
             .filter(|t| !t.state.is_settled())
-            .filter(|t| {
-                t.tags
-                    .iter()
-                    .find_map(|tag| tag.strip_prefix("lease:")?.parse::<u64>().ok())
-                    .is_some_and(|lease| quiet >= Duration::from_millis(lease))
-            })
+            .filter(|t| t.tags.iter().find_map(|tag| lapsed(tag)) == Some(true))
             .map(|t| t.id.clone())
             .collect();
         for id in fenced {
@@ -2190,8 +2235,8 @@ impl Daemon {
         };
         match req {
             Request::Status { brief, leader } => {
-                if leader {
-                    self.last_leader = Instant::now();
+                if let Some(leader) = leader {
+                    self.leaders.insert(leader, Instant::now());
                 }
                 self.reply(id, self.status_json(brief))
             }
@@ -2428,6 +2473,26 @@ impl Daemon {
                 .and_then(|n| n.as_u64())
                 .map(|n| n.min(64) as u32),
         };
+        // The same ask again is the same child.
+        let mut task = task;
+        let key = value
+            .get("key")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.is_empty() && k.len() <= 64)
+            .map(|k| format!("req:{k}"));
+        if let Some(key) = &key {
+            let parent = task.parent.clone();
+            if let Some(first) = self
+                .state
+                .tasks
+                .values()
+                .find(|t| t.parent == parent && t.tags.contains(key))
+            {
+                let denied = (first.state == TaskState::Failed).then(|| first.reason.clone());
+                return Ok(json!({"ok": true, "ids": [first.id], "denied": denied}));
+            }
+            task.tags.push(key.clone());
+        }
         let ids = self.enqueue(std::slice::from_ref(&task))?;
         let child = ids.first().cloned().unwrap_or_default();
         let denied = self
@@ -2684,6 +2749,16 @@ impl Daemon {
     }
 
     fn enqueue(&mut self, tasks: &[NewTask]) -> Result<Vec<String>> {
+        // A leader's hand-off carries the leader's id in a tag, and a leader
+        // that is unsure whether an add arrived sends it again. The second
+        // one finds the first and is that task, not another.
+        if let [task] = tasks {
+            if let Some(tag) = task.tags.iter().find(|t| t.starts_with("inlet:")) {
+                if let Some(first) = self.state.tasks.values().find(|t| t.tags.contains(tag)) {
+                    return Ok(vec![first.id.clone()]);
+                }
+            }
+        }
         let mut recs = Vec::with_capacity(tasks.len());
         for task in tasks {
             recs.push(self.task_record(task)?);
@@ -2787,6 +2862,7 @@ impl Daemon {
                 not_before: 0,
                 owner: None,
                 seed: task.seed.clone().filter(|_| worker.on.is_some()),
+                moves: 0,
             },
             ts: now_ms(),
         })
@@ -3189,6 +3265,7 @@ impl Daemon {
         durable_write(&paths::policy(&self.home), body.as_bytes())?;
         self.raise_caps(&parsed.cfg);
         self.policy = parsed;
+        self.sync_nodes();
         self.commit(&[Record::Sign { ts: now_ms() }], true)?;
         Ok(())
     }
@@ -3419,7 +3496,15 @@ impl Daemon {
                 .or_insert_with(|| "stopped".into());
             self.signal(id, libc::SIGTERM);
         }
-        thread::sleep(Duration::from_millis(50));
+        // Two seconds to put things down. A harness mid-write gets to finish
+        // the write. Then there is no more asking.
+        for _ in 0..100 {
+            self.reap()?;
+            if self.workers.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         for id in &ids {
             self.signal(id, libc::SIGKILL);
         }

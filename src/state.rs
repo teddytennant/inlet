@@ -39,6 +39,8 @@ pub struct TaskView {
 }
 
 const SWARM_PACE_MS: u64 = 1_000;
+/// How many nodes a task may lose before it stops being placed again.
+const MAX_MOVES: u32 = 5;
 
 /// A swarm's spec and what the ledger says has come of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -664,6 +666,11 @@ impl State {
         let mut max = task.plan.max_attempts();
         if reason == "node" {
             // The node went dark, not the task. Placed again, same attempt.
+            // But not for ever: a task that takes down every node it lands
+            // on is the task's doing after all.
+            if task.plan.moves >= MAX_MOVES {
+                return None;
+            }
             return Some(Record::Task {
                 id: crate::id::ulid(),
                 parent: task.parent.clone(),
@@ -677,6 +684,7 @@ impl State {
                 recipe: task.recipe.clone(),
                 plan: Plan {
                     not_before: 0,
+                    moves: task.plan.moves + 1,
                     ..task.plan.clone()
                 },
                 ts,
@@ -740,6 +748,7 @@ impl State {
                 not_before: ts.saturating_add(cfg.retry.delay_ms(attempt)),
                 owner: task.plan.owner.clone(),
                 seed: task.plan.seed.clone(),
+                moves: task.plan.moves,
             },
             ts,
         })

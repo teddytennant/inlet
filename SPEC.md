@@ -33,7 +33,7 @@ inlet supervisor
           +-- may request a child, which gets a slice of the parent
 ```
 
-Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. SIGTERM is the daemon going away, not the work: it fsyncs and exits, and the workers stay up for the next one. A daemon that dies without that chance leaves its workers running, and the next one takes them back. See Desired state.
+Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. Workers get SIGTERM and two seconds before SIGKILL; the keeper passes the first on, since as pid 1 of its cell it would not otherwise see it. SIGTERM is the daemon going away, not the work: it fsyncs and exits, and the workers stay up for the next one. A daemon that dies without that chance leaves its workers running, and the next one takes them back. See Desired state.
 
 There are two first-class ways in. The group chat (the TUI, and later a bridge) is where humans and agents talk. The operator agent (Pi or Wizard with the skill) is how a human drives the CLI without living in that room. Both speak the operator socket. Neither is linked into the binary.
 
@@ -102,7 +102,7 @@ Record kinds: `place`, `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`,
 
 `vote` and `moderation` are board records. See Board consensus. They are not admission.
 
-The daemon checkpoints itself: the index is rewritten when the log has grown 32MB past the last one or when `retain` forgot something, so a restart reads and replays only the tail. Past 256MB the log is rotated at a checkpoint: renamed to `log.old`, one generation kept, and a new one started. `retain` (30 days by default, 0 for never) forgets a settled task and removes its workdir and transcripts; its records stay in the log.
+The daemon checkpoints itself: the index is rewritten when the log has grown 32MB past the last one or when `retain` forgot something, so a restart reads and replays only the tail. Past 256MB the log is rotated at a checkpoint. The new file is locked before it has the name and takes the name in one rename, with the old one linked to `log.old` first, one generation kept: there is no moment when the name is free or unlocked. After a rotation the history before it is in the index and nowhere else, so a daemon that finds the index unreadable and a `log.old` beside it refuses to start. `retain` (30 days by default, 0 for never) forgets a settled task and removes its workdir and transcripts; its records stay in the log.
 
 Snapshots: `inlet snap` writes a git commit of the registry, the signed policy, and a compacted header index tagged with the log offset it covers. Restart loads that index and replays from the offset. The live log is not a commit per event. A second machine pulls snapshots. It does not tail the live log over the network.
 
@@ -248,7 +248,7 @@ A harness that wants a base URL and not a unix socket runs under `$INLET_BIN doo
 
 When a task settles its cell root and scratch are removed. The workdir and the transcripts are the record.
 
-`$INLET_BIN` is this binary, bound into the cell. It is a copy the daemon takes of itself at startup, so replacing the file on disk neither changes nor breaks a daemon that is running. `inlet door` reads `INLET_SOCK` and `INLET_TOKEN`. A result travels up as the child's last post, which `door wait` returns to the parent. A parent never reads a child's workdir.
+`$INLET_BIN` is this binary, bound into the cell. It is a copy the daemon takes of itself at startup, so replacing the file on disk neither changes nor breaks a daemon that is running. `inlet door` reads `INLET_SOCK` and `INLET_TOKEN`. A call that is refused, cut off mid-answer, or made before a restarted daemon has taken the worker back is asked again for a minute, and a `spawn` carries a key so that asking twice makes one child. A result travels up as the child's last post, which `door wait` returns to the parent. A parent never reads a child's workdir.
 
 Promotion. A recipe becomes shared only when a second worker, not the author, runs its verifier and exits 0, or when the operator pins it. The supervisor execs the verifier. The author's claim does not count. Before a pass counts, the supervisor runs the same verifier with `run` swapped for a stub that exits 0. A verifier that passes the stub tests nothing, and that recipe can only be pinned. With `unattended = true`, the default, the pass promotes. With `unattended = false`, it marks the recipe ready for `/pin`. Promoted recipes are picked up at the next task start, not pushed into a running turn. A task with no verifier never promotes.
 
@@ -469,11 +469,11 @@ A worker with `on` runs on a node and is defined there; the leader's entry needs
 
 The node does the rest, and everything this document says about one machine holds there: the cell, the verifier, retries with the workdir and the verifier's output, adoption. The leader passes its remaining attempts down and does not retry on top of them.
 
-The leader asks each node for its status every two seconds and finds its own tasks by their tag. When every task with a tag has settled, the leader settles its own: done if one is done, else failed with the node's last reason, with the tokens the node metered. If the tag is not there five seconds after placing, the add was lost and is sent again; the tag is what makes that safe.
+The leader asks each node for its status every two seconds and finds its own tasks by their tag. When every task with a tag has settled, the leader settles its own: done if one is done, else failed with the node's last reason, with the tokens the node metered. If the tag is not there five seconds after placing, the add was lost and is sent again. The node makes that safe: an add whose tag it already has is that task, not another.
 
-A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Nothing is placed on a node that is not answering.
+A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Five times at most. A task that loses five nodes is the task's doing. Nothing is placed on a node that is not answering.
 
-The node lets go first. Every placed task carries a lease in its tags, half of `node_grace`, and the leader's status call says it is the leader. A node that has not heard from its leader for the lease stops the leader's tasks itself, reason `fenced`, before the leader would place them anywhere else. So a partition does not leave the same goal being worked on in two places. When the leader hears from the node again it reads `fenced` as the node's failure, and it kills anything of its own still running there that it has since moved. Each call to a node is cut off at a quarter of the grace, so one that hangs costs a poll and not the lease.
+The node lets go first. Every placed task carries a lease in its tags, half of `node_grace`, with the leader's name, and the leader's status call says which leader it is. Each leader's silence is counted on its own, and a stall of the node's own loop is not counted as anyone's. A node that has not heard from its leader for the lease stops the leader's tasks itself, reason `fenced`, before the leader would place them anywhere else. So a partition does not leave the same goal being worked on in two places. When the leader hears from the node again it reads `fenced` as the node's failure, and it kills anything of its own still running there that it has since moved. Each call to a node is cut off at a quarter of the grace, so one that hangs costs a poll and not the lease.
 
 What remains is the window nothing can close without both sides agreeing: a node that finishes a task while cut off, inside its lease, has done work the leader will not hear of in time and will place again. A goal can be done twice. It cannot be lost, and the leader counts it once.
 
@@ -483,7 +483,7 @@ A leader that dies knows from its `place` records where its tasks are, and finds
 
 The leader's purse is the budget for everything it places: it holds each task's slice while the task is out and keeps what the node reports as spent. A node's own purse is that machine's limit, on top.
 
-A second leader is a standby. `inlet up -f --standby` on the same home waits for the lock on the ledger, which the kernel releases the instant the leader's process is gone, then reads the policy, the index, and the log afresh and carries on: the swarms from their counts, the placed tasks by their tags. On one machine that is a second unit. Across machines it needs the home on storage both can reach and that honours `flock`. There is no consensus protocol here and no split brain to arbitrate: the lock is the election.
+A second leader is a standby. `inlet up -f --standby` on the same home waits for the lock on the ledger, which the kernel releases the instant the leader's process is gone. It reads nothing until it holds the lock, so it replays everything the leader wrote and nothing it was still writing, and it checks that the file it locked is still the one with the name, because a rotation swaps the log under it. Then it reads the policy, the index, and the log and carries on: the swarms from their counts, the placed tasks by their tags. On one machine that is a second unit. Across machines it needs the home on storage both can reach and that honours `flock`. There is no consensus protocol here and no split brain to arbitrate: the lock is the election.
 
 ## Scaling
 

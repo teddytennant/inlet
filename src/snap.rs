@@ -204,6 +204,14 @@ pub(crate) fn load(home: &Path) -> Result<Option<Index>> {
     // The log is the truth and the index is a shortcut. One that will not
     // parse is skipped, and the whole log is replayed.
     let Ok(index) = serde_json::from_slice(&bytes) else {
+        // After a rotation the log no longer holds the whole history: what
+        // came before is in the index and nowhere else. Starting without it
+        // would be starting nearly empty and then saving that.
+        if paths::ledger(home).with_extension("old").exists() {
+            return Err(err(
+                "the snapshot index is unreadable and the log has been rotated; restore snap/index.json, do not start without it",
+            ));
+        }
         eprintln!("inlet: snapshot index is unreadable, replaying the whole log");
         return Ok(None);
     };

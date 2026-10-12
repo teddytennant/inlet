@@ -1762,6 +1762,11 @@ fn a_standby_takes_over_when_the_leader_dies() {
         assert!(Instant::now() < deadline, "standby never took over");
         thread::sleep(Duration::from_millis(50));
     }
+    // It has the lock. Give it a moment to replay and open its sockets.
+    while !run(&leader, &["status", "--json"]).status.success() {
+        assert!(Instant::now() < deadline, "standby never answered");
+        thread::sleep(Duration::from_millis(50));
+    }
     // The same home, a different daemon, the swarm where it was.
     let st = wait(&leader, &standby, |v| swarm(v, "far")["phase"] == "done");
     assert_eq!(swarm(&st, "far")["done"], 12, "{st}");
@@ -1772,4 +1777,75 @@ fn a_standby_takes_over_when_the_leader_dies() {
     );
     assert_eq!(st["available"], 10000, "{st}");
     drop(east_d);
+}
+
+#[test]
+fn a_standby_never_leads_while_the_leader_lives_through_a_rotation() {
+    let home = scratch("standrot");
+    policy(
+        &home,
+        r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#,
+        "retain = 1",
+    );
+    let spawn = |args: &[&str], log: &str| {
+        let log_path = home.join(log);
+        let file = File::create(&log_path).unwrap();
+        let child = Command::new(bin())
+            .arg("--home")
+            .arg(&home)
+            .args(args)
+            .env("INLET_ROTATE_BYTES", "2000")
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        Daemon { child, log_path }
+    };
+    let mut leader = spawn(&["up", "-f"], "leader.log");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !run(&home, &["status", "--json"]).status.success() {
+        assert!(Instant::now() < deadline, "leader never answered");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let standby = spawn(&["up", "-f", "--standby"], "standby.log");
+    // Many rotations with a standby poking at the lock the whole time.
+    manifest(
+        &home,
+        r#"{"kind":"swarm","name":"many","replicas":4,"completions":40,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&home, &leader, |v| swarm(v, "many")["phase"] == "done");
+    thread::sleep(Duration::from_millis(2500));
+    let rotations = leader.log().matches("rotated the ledger").count();
+    assert!(
+        rotations >= 2,
+        "only {rotations} rotations: {}",
+        leader.log()
+    );
+    assert!(
+        !standby.log().contains("taking over"),
+        "two leaders: {}",
+        standby.log()
+    );
+    assert!(
+        leader.child.try_wait().unwrap().is_none(),
+        "leader died: {}",
+        leader.log()
+    );
+    // And when the leader really goes, the standby has all of it.
+    kill9(&mut leader);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !standby.log().contains("taking over")
+        || !run(&home, &["status", "--json"]).status.success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "standby never took over: {}",
+            standby.log()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let st = status(&home);
+    assert_eq!(swarm(&st, "many")["done"], 40, "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
 }

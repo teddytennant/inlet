@@ -28,12 +28,52 @@ pub fn open_from(path: &Path, offset: u64) -> Result<Opened> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)?;
+    open_file(file, offset)
+}
+
+/// Take the lock on the log before reading a byte of it. `None` when
+/// another daemon holds it. A daemon that read first and locked second
+/// would replay a log its predecessor was still writing, and a torn tail
+/// it trimmed would be a hole in a live file.
+///
+/// `create` is for a daemon starting on its own. One standing by must not
+/// make the file: a leader mid-rotation is about to put one there.
+pub fn try_lock(path: &Path, create: bool) -> Result<Option<File>> {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = match OpenOptions::new()
+        .create(create)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(None);
+    }
+    // The lock is on a file, and the name may have moved to another one
+    // while this waited: a rotation swaps the log under the same name.
+    let same = std::fs::metadata(path).is_ok_and(|now| {
+        file.metadata()
+            .is_ok_and(|held| held.ino() == now.ino() && held.dev() == now.dev())
+    });
+    Ok(same.then_some(file))
+}
+
+/// Read a log this process already holds the lock on.
+pub fn open_file(mut file: File, offset: u64) -> Result<Opened> {
     let total = file.metadata()?.len();
     if total < offset {
         return Err(err("snapshot is ahead of the log"));
@@ -111,22 +151,41 @@ impl Ledger {
 
     /// Start a new log. The old one is kept under `<name>.old`, one
     /// generation back, and the caller has a checkpoint that covers it.
+    ///
+    /// The new file is locked before it has the name, and takes the name in
+    /// one rename, so there is no moment when the name is free or unlocked
+    /// for a standby to step into. A failure before the rename changes nothing.
     pub fn rotate(&mut self, path: &Path) -> Result<()> {
         self.file.sync_all()?;
-        std::fs::rename(path, path.with_extension("old"))?;
+        let fresh = path.with_extension("new");
+        let old = path.with_extension("old");
+        let _ = std::fs::remove_file(&fresh);
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
-            .truncate(false)
-            .open(path)?;
-        file.sync_all()?;
+            .open(&fresh)?;
+        let swap = || -> Result<()> {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(err("could not lock the new log"));
+            }
+            file.sync_all()?;
+            let _ = std::fs::remove_file(&old);
+            std::fs::hard_link(path, &old)?;
+            std::fs::rename(&fresh, path)?;
+            Ok(())
+        };
+        if let Err(e) = swap() {
+            let _ = std::fs::remove_file(&fresh);
+            return Err(e);
+        }
         if let Some(dir) = path.parent().and_then(|d| File::open(d).ok()) {
             let _ = dir.sync_all();
         }
+        // The old file's lock goes with its descriptor, here.
         self.file = file;
         self.len = 0;
-        self.lock()
+        Ok(())
     }
 
     pub fn lock(&self) -> Result<()> {

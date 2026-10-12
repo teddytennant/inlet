@@ -63,6 +63,9 @@ pub struct Plan {
     /// A seed directory on the node, for a task that runs on one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<String>,
+    /// Times it has been placed again after losing its node.
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub moves: u32,
 }
 
 impl Plan {

@@ -73,7 +73,7 @@ pub fn run() -> Result<()> {
         Some("status") => status(
             &home,
             args.iter().any(|a| a == "--json"),
-            args.iter().any(|a| a == "--leader"),
+            flag(&args, "--leader"),
         ),
         Some("bridge") => bridge_cmd(&home, &args[1..]),
         Some("post") => {
@@ -1041,13 +1041,23 @@ fn door_keep(args: &[String]) -> Result<()> {
                 let flags = libc::fcntl(ends[0], libc::F_GETFL);
                 libc::fcntl(ends[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
+            // As pid 1 of the cell a signal with no handler never arrives, so
+            // a polite stop from the daemon would be lost. Take it and pass it on.
+            unsafe {
+                libc::signal(libc::SIGTERM, note_term as *const () as libc::sighandler_t);
+            }
             let started = std::time::Instant::now();
             let mut ticks = 0u64;
             let mut over = false;
             let mut written = 0u64;
             let mut buf = [0u8; 8192];
             let mut pump = |log: &mut fs::File| {
-                while let Ok(n) = read.read(&mut buf) {
+                // A bounded gulp. A worker that never stops printing must not
+                // keep the keeper from its clock and its memory check.
+                for _ in 0..256 {
+                    let Ok(n) = read.read(&mut buf) else {
+                        break;
+                    };
                     if n == 0 {
                         break;
                     }
@@ -1062,6 +1072,9 @@ fn door_keep(args: &[String]) -> Result<()> {
                     // Once more for what it printed last.
                     pump(&mut log);
                     break (done.into_raw(), over);
+                }
+                if TERM.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
                 }
                 // With no daemon left to time it out, this is the clock.
                 if deadline > 0 && started.elapsed() > Duration::from_secs(deadline) {
@@ -1096,6 +1109,12 @@ fn door_keep(args: &[String]) -> Result<()> {
     });
 }
 
+static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn note_term(_sig: i32) {
+    TERM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Resident memory of every process this one can see. As pid 1 of a cell that
 /// is the cell. Outside one it would be the whole host, so it reports nothing.
 fn cell_rss_kb() -> u64 {
@@ -1116,7 +1135,14 @@ fn cell_rss_kb() -> u64 {
                 .all(|b| b.is_ascii_digit())
         })
         .filter_map(|entry| fs::read_to_string(entry.path().join("statm")).ok())
-        .filter_map(|statm| statm.split(' ').nth(1)?.parse::<u64>().ok())
+        // Resident less shared: pages a preforking worker's children all map
+        // are counted once per child otherwise, and that is a false kill.
+        .filter_map(|statm| {
+            let mut fields = statm.split(' ').skip(1);
+            let resident = fields.next()?.parse::<u64>().ok()?;
+            let shared = fields.next()?.parse::<u64>().ok()?;
+            Some(resident.saturating_sub(shared))
+        })
         .sum::<u64>()
         .saturating_mul(page_kb)
 }
@@ -1232,24 +1258,30 @@ inlet door run [--port N] -- CMD...   run CMD with the proxy on a local port, OP
     let token = std::env::var("INLET_TOKEN").map_err(|_| err("INLET_TOKEN is not set"))?;
     let call = |mut body: Value| -> Result<Value> {
         body["token"] = json!(token);
-        // A refusal means the daemon is restarting. Its workers wait for it.
+        let mut line = serde_json::to_string(&body)?;
+        line.push('\n');
+        // A refused connection, a dropped one, or a daemon that does not know
+        // this token yet all mean the same thing: the daemon is restarting,
+        // and it takes its workers back. Ask again, for a minute.
         let started = std::time::Instant::now();
-        let mut stream = loop {
-            match std::os::unix::net::UnixStream::connect(&sock) {
-                Ok(stream) => break stream,
+        loop {
+            let once = || -> Result<Value> {
+                let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+                stream.write_all(line.as_bytes())?;
+                let mut reply = String::new();
+                io::BufReader::new(stream).read_line(&mut reply)?;
+                serde_json::from_str(&reply).map_err(|_| err("the daemon went away mid-answer"))
+            };
+            let settling =
+                |v: &Value| v["error"] == "token" && started.elapsed() < Duration::from_secs(15);
+            match once() {
+                Ok(v) if !settling(&v) => return checked(v, "door"),
                 Err(e) if started.elapsed() > Duration::from_secs(60) => {
                     return Err(err(format!("worker socket: {e}")));
                 }
-                Err(_) => thread::sleep(Duration::from_millis(250)),
+                _ => thread::sleep(Duration::from_millis(250)),
             }
-        };
-        let mut line = serde_json::to_string(&body)?;
-        line.push('\n');
-        stream.write_all(line.as_bytes())?;
-        let mut reply = String::new();
-        io::BufReader::new(stream).read_line(&mut reply)?;
-        let v: Value = serde_json::from_str(&reply).map_err(|_| err("empty reply"))?;
-        checked(v, "door")
+        }
     };
     let rest = args.get(1..).unwrap_or(&[]);
     let channel = flag(rest, "--channel").unwrap_or_else(|| "general".into());
@@ -1280,6 +1312,13 @@ inlet door run [--port N] -- CMD...   run CMD with the proxy on a local port, OP
             }
             let mut body = proto::task_value(&task);
             body["op"] = json!("spawn");
+            // Asked twice, because the first answer was lost, it must be one
+            // child and not two. The key says they are the same ask.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            body["key"] = json!(format!("{:x}-{:x}", std::process::id(), nanos));
             let v = call(body)?;
             if let Some(why) = v["denied"].as_str() {
                 return Err(err(format!("denied: {why}")));
@@ -1337,7 +1376,7 @@ inlet door run [--port N] -- CMD...   run CMD with the proxy on a local port, OP
     Ok(())
 }
 
-fn status(home: &Path, json_out: bool, leader: bool) -> Result<()> {
+fn status(home: &Path, json_out: bool, leader: Option<String>) -> Result<()> {
     let v = proto::rpc(home, json!({"op":"status","leader": leader}))?;
     if json_out {
         println!("{v}");

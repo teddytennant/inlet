@@ -40,6 +40,8 @@ pub enum Msg {
     Added {
         id: String,
         ok: bool,
+        /// The node replied. Not ok and answered is a no; not answered is a bad link.
+        answered: bool,
     },
 }
 
@@ -65,8 +67,13 @@ pub fn call(
         .spawn()
         .ok()?;
     if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        use std::io::Write;
-        let _ = stdin.write_all(bytes);
+        // On a thread: a link that has stopped reading would block the write,
+        // and the timeout below is what has to end that.
+        let bytes = bytes.to_vec();
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
     }
     let mut stdout = child.stdout.take()?;
     let reader = thread::spawn(move || {
@@ -91,7 +98,7 @@ pub fn call(
 }
 
 /// Ask a node, forever, what it is running for this leader.
-pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64) {
+pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64, me: String) {
     // Often enough that a healthy node hears from its leader several times
     // inside the lease, which is half the grace.
     let every = Duration::from_millis((grace_ms / 8).clamp(200, POLL_EVERY.as_millis() as u64));
@@ -103,7 +110,12 @@ pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64) {
         // stops hearing it lets go of what the leader placed.
         let raw = call(
             &cmd,
-            &["status".into(), "--json".into(), "--leader".into()],
+            &[
+                "status".into(),
+                "--json".into(),
+                "--leader".into(),
+                me.clone(),
+            ],
             None,
             limit,
         );
@@ -153,9 +165,20 @@ pub fn add(cmd: Vec<String>, task: Value, id: String, tx: Sender<Msg>) {
         let mut line = task.to_string();
         line.push('\n');
         let args = ["add".to_string(), "-f".to_string(), "-".to_string()];
-        let ok = call(&cmd, &args, Some(line.as_bytes()), CALL_TIMEOUT)
-            .is_some_and(|out| out.contains("queued"));
-        let _ = tx.send(Msg::Added { id, ok });
+        let out = call(&cmd, &args, Some(line.as_bytes()), CALL_TIMEOUT);
+        let ok = out.as_ref().is_some_and(|out| out.contains("queued"));
+        // The CLI prints an error and nothing on stdout when the daemon says
+        // no, and prints nothing at all when it was never reached. Ask the
+        // node which: a status that answers means the no was the node's.
+        let answered = ok
+            || call(
+                &cmd,
+                &["status".into(), "--json".into()],
+                None,
+                CALL_TIMEOUT,
+            )
+            .is_some_and(|out| out.contains("\"ok\":true"));
+        let _ = tx.send(Msg::Added { id, ok, answered });
     });
 }
 
