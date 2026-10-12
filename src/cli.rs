@@ -35,12 +35,18 @@ pub fn run() -> Result<()> {
         }
         Some("up") => {
             let foreground = args.iter().any(|a| a == "-f" || a == "--foreground");
+            let standby = args.iter().any(|a| a == "--standby");
+            if standby && !foreground {
+                return Err(err(
+                    "--standby runs in the foreground: inlet up -f --standby",
+                ));
+            }
             if foreground {
-                daemon::serve(&home, true)?;
+                daemon::serve(&home, true, standby)?;
             } else {
                 {
                     let _hold = crate::spin::Hold::start(&crate::spin::UP)?;
-                    daemon::serve(&home, false)?;
+                    daemon::serve(&home, false, false)?;
                 }
                 println!("inlet up");
             }
@@ -64,7 +70,11 @@ pub fn run() -> Result<()> {
         Some("diff") => diff_policy(&home),
         Some("draft") => draft_policy(&home),
         Some("snap") => snap(&home),
-        Some("status") => status(&home, args.iter().any(|a| a == "--json")),
+        Some("status") => status(
+            &home,
+            args.iter().any(|a| a == "--json"),
+            args.iter().any(|a| a == "--leader"),
+        ),
         Some("bridge") => bridge_cmd(&home, &args[1..]),
         Some("post") => {
             let text = args[1..].join(" ");
@@ -103,6 +113,7 @@ pub fn run() -> Result<()> {
 
 const HELP: &str = "\
 inlet up [-f]            daemon. -f stays in the foreground
+inlet up -f --standby    wait for the leader on this home to go, then take over
 inlet doctor             check the policy, the cell, the upstream, the disk, and what a crash left
 inlet down [--keep]      stop the daemon and its workers. --keep leaves the workers for the next daemon
 inlet                    attach the tui
@@ -1326,8 +1337,8 @@ inlet door run [--port N] -- CMD...   run CMD with the proxy on a local port, OP
     Ok(())
 }
 
-fn status(home: &Path, json_out: bool) -> Result<()> {
-    let v = proto::rpc(home, json!({"op":"status"}))?;
+fn status(home: &Path, json_out: bool, leader: bool) -> Result<()> {
+    let v = proto::rpc(home, json!({"op":"status","leader": leader}))?;
     if json_out {
         println!("{v}");
         return Ok(());

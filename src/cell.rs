@@ -110,6 +110,8 @@ struct Raw {
     ack_r: i32,
     err_w: i32,
     out_w: i32,
+    /// The parent's ends of the four pipes, which the child got copies of.
+    theirs: [i32; 4],
     net_none: bool,
     newroot: *const libc::c_char,
     work: *const libc::c_char,
@@ -502,6 +504,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         ack_r: ack_r.0,
         err_w: err_w.0,
         out_w: out_w.0,
+        theirs: [ready_r.0, ack_w.0, err_r.0, out_r.0],
         net_none: req.net_none,
         newroot: newroot.as_ptr(),
         work: work.as_ptr(),
@@ -751,12 +754,19 @@ extern "C" fn trampoline(arg: *mut libc::c_void) -> libc::c_int {
 
 /// Child side. Never returns to Rust.
 unsafe fn child_entry(a: &Raw) -> ! {
-    if !a.keep {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        // pid 1 of a new pid namespace sees getppid() == 0. The fallback fork does not.
-        if !a.in_user_ns && libc::getppid() != a.parent {
-            libc::raise(libc::SIGKILL);
-        }
+    // Until it execs, this child is a copy of the daemon: it holds the lock on
+    // the ledger and every socket. If the daemon dies now, it must go too, or
+    // no daemon can start again. A kept worker drops this just before its exec.
+    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    // pid 1 of a new pid namespace sees getppid() == 0. The fallback fork does not.
+    if !a.in_user_ns && libc::getppid() != a.parent {
+        libc::raise(libc::SIGKILL);
+    }
+    // And the belt to that brace: with the parent's ends of the pipes closed
+    // here, a dead parent is an end of file on the handshake, not a wait
+    // that never ends.
+    for fd in a.theirs {
+        libc::close(fd);
     }
     if !a.in_user_ns && libc::unshare(libc::CLONE_NEWUSER) != 0 {
         fail(a.err_w, errno());
@@ -836,6 +846,8 @@ unsafe fn child_entry(a: &Raw) -> ! {
         // The two numbers go in as the last arguments before `--`.
         write_fd(a.keep_log_arg, log);
         write_fd(a.keep_status_arg, status);
+        // From here it is the keeper, which is meant to outlive the daemon.
+        libc::prctl(libc::PR_SET_PDEATHSIG, 0);
         let argv = if pivoted {
             a.argv_keep_pivot
         } else {

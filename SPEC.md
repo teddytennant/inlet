@@ -471,13 +471,19 @@ The node does the rest, and everything this document says about one machine hold
 
 The leader asks each node for its status every two seconds and finds its own tasks by their tag. When every task with a tag has settled, the leader settles its own: done if one is done, else failed with the node's last reason, with the tokens the node metered. If the tag is not there five seconds after placing, the add was lost and is sent again; the tag is what makes that safe.
 
-A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Nothing is placed on a node that is not answering. If the node comes back it may finish what it had, so a task can be done twice. It cannot be lost.
+A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Nothing is placed on a node that is not answering.
+
+The node lets go first. Every placed task carries a lease in its tags, half of `node_grace`, and the leader's status call says it is the leader. A node that has not heard from its leader for the lease stops the leader's tasks itself, reason `fenced`, before the leader would place them anywhere else. So a partition does not leave the same goal being worked on in two places. When the leader hears from the node again it reads `fenced` as the node's failure, and it kills anything of its own still running there that it has since moved. Each call to a node is cut off at a quarter of the grace, so one that hangs costs a poll and not the lease.
+
+What remains is the window nothing can close without both sides agreeing: a node that finishes a task while cut off, inside its lease, has done work the leader will not hear of in time and will place again. A goal can be done twice. It cannot be lost, and the leader counts it once.
 
 A task nothing will take does not wait for ever. A worker pointed at a node the policy does not name is denied, reason `placement`. A node that answers but turns the task away five times, most likely for want of that worker, ends it the same way. A task placed on a node that a later policy removed is placed again.
 
 A leader that dies knows from its `place` records where its tasks are, and finds them by tag when it returns. `inlet kill` on a placed task kills it on the node and settles it at once. `inlet get nodes` is the table. A `seed` for a placed task is a path on the node.
 
-What this is not: one purse across machines, a shared filesystem, or a leader election. Each node spends from its own purse and reports what it spent; the leader's purse holds the slice while the task is placed. There is one leader. A second one is still the lease and snapshot below.
+The leader's purse is the budget for everything it places: it holds each task's slice while the task is out and keeps what the node reports as spent. A node's own purse is that machine's limit, on top.
+
+A second leader is a standby. `inlet up -f --standby` on the same home waits for the lock on the ledger, which the kernel releases the instant the leader's process is gone, then reads the policy, the index, and the log afresh and carries on: the swarms from their counts, the placed tasks by their tags. On one machine that is a second unit. Across machines it needs the home on storage both can reach and that honours `flock`. There is no consensus protocol here and no split brain to arbitrate: the lock is the election.
 
 ## Scaling
 
@@ -541,4 +547,5 @@ Each step is usable before the next one exists.
 19. Kernel limits and a bounded log. One cgroup per worker under a delegated group. Checkpoints, retention, rotation.
 20. Nodes. `place` in the admit's fsync, the task over stdin with a tag, status every two seconds, `node_grace`, and placing again.
 21. Chaos across nodes. `scripts/chaos-nodes.py` runs a leader and nodes on one box, kills any of them at random, and leaves a node down past `node_grace` now and then. Its first runs found a daemon that a signal could freeze mid-spawn with the ledger locked.
+22. Leases and a standby. A node stops a leader's tasks when the leader goes quiet for half the grace. `inlet up -f --standby` takes over a home when its leader dies. `chaos-nodes.py --flaky --standby` runs both over a link that drops and hangs.
 

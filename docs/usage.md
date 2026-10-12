@@ -92,6 +92,8 @@ A node is another machine running `inlet up` with its own policy. The leader nee
     }
     workers = { pi = { on = "nodes" } }
 
+A second leader waits its turn: `inlet up -f --standby` on the same home takes over the moment the first one's process is gone.
+
 The worker `pi` is defined in east's policy. Tasks for it are placed on the node with the most room, run there in cells, and are retried there. `inlet get nodes` shows who is answering. A node silent for `node_grace` (a minute by default) loses its tasks to another.
 
 ## keeping the daemon up

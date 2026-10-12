@@ -4,6 +4,7 @@ each a daemon of its own. Leader and nodes are killed at random, and a node
 is sometimes left down long enough to be given up on.
 
     scripts/chaos-nodes.py path/to/inlet [--nodes 3] [--tasks 300] [--seconds 180] [--seed 1]
+                           [--flaky] [--standby]
 
 Checked at the end: the swarm finished, every goal is done exactly once as
 the leader sees it, the leader's purse is whole, each node's purse is short
@@ -18,6 +19,8 @@ ap.add_argument("--tasks", type=int, default=300)
 ap.add_argument("--seconds", type=int, default=180)
 ap.add_argument("--seed", type=int, default=int(time.time()))
 ap.add_argument("--home", default="")
+ap.add_argument("--flaky", action="store_true", help="the leader reaches its nodes through a link that drops, delays, and hangs")
+ap.add_argument("--standby", action="store_true", help="a standby leader takes over when the leader is killed")
 args = ap.parse_args()
 rng = random.Random(args.seed)
 binary = os.path.abspath(args.inlet)
@@ -42,9 +45,26 @@ workers = {
   plain = { cmd = { "/bin/sh", "-c", "n=$(cat \\"$INLET_GOAL_FILE\\"); echo run >> runs; sleep 0.$((n % 9))$((n % 7)); [ $((n % 6)) -eq 0 ] && [ $(wc -l < runs) -lt 2 ] && exit 1; echo $n > out" } },
 }
 """)
+# A bad link, for --flaky: one call in six never arrives, one in twenty hangs
+# past the leader's own timeout, and the rest are late by up to a third of a
+# second.
+link = os.path.join(root, "link.py")
+open(link, "w").write("""#!/usr/bin/env python3
+import os, random, sys, time
+roll = random.random()
+if roll < 0.16:
+    sys.exit(1)
+if roll < 0.21:
+    time.sleep(25)
+    sys.exit(1)
+time.sleep(random.random() * 0.3)
+os.execv(sys.argv[1], sys.argv[1:])
+""")
+os.chmod(link, 0o755)
+via = '"%s", "%s"' % (link, binary) if args.flaky else '"%s"' % binary
 open(homes["leader"] + "/policy.lua", "w").write(COMMON + "node_grace = %d\nnodes = {\n%s}\nworkers = { plain = { on = \"nodes\" } }\n" % (
     GRACE,
-    "".join('  %s = { cmd = { "%s", "--home", "%s" }, slots = 6 },\n' % (n, binary, homes[n]) for n in names),
+    "".join('  %s = { cmd = { %s, "--home", "%s" }, slots = 6 },\n' % (n, via, homes[n]) for n in names),
 ))
 
 
@@ -76,8 +96,18 @@ def pid(home):
         return 0
 
 
+standbys = []
+
+
+def stand_by():
+    log = open(os.path.join(root, "standby.log"), "a")
+    standbys.append(subprocess.Popen([binary, "--home", homes["leader"], "up", "-f", "--standby"], stdout=log, stderr=log))
+
+
 for home in homes.values():
     up(home)
+if args.standby:
+    stand_by()
 manifest = os.path.join(root, "m.json")
 json.dump({"kind": "swarm", "name": "plain", "replicas": 6 * args.nodes, "completions": args.tasks,
            "template": {"worker": "plain", "goal": "{index}", "verify": "test -s out", "retries": 3}}, open(manifest, "w"))
@@ -108,7 +138,13 @@ while time.time() - started < args.seconds:
     deadline = time.time() + 10
     while os.path.exists("/proc/%d" % victim) and time.time() < deadline:
         time.sleep(0.02)
-    up(homes[who])
+    if who == "leader" and args.standby:
+        # Nobody starts it again. The one standing by takes the home, and a
+        # new one lines up behind it.
+        status(homes["leader"])
+        stand_by()
+    else:
+        up(homes[who])
 
 deadline = time.time() + 240
 while time.time() < deadline:
@@ -179,11 +215,21 @@ for name in names:
 
 check(reported <= node_lost, "leader was charged %d, nodes only lost %d to crashes" % (reported, node_lost))
 
+# Standbys first, and wait for them: one still waiting would take the home
+# the moment the leader below lets go of it.
+lead = pid(homes["leader"])
+for proc in standbys:
+    if proc.poll() is None and proc.pid != lead:
+        proc.kill()
+        proc.wait()
 for home in homes.values():
     victim = pid(home)
     if victim:
         os.kill(victim, signal.SIGINT)
 time.sleep(2)
+for proc in standbys:
+    if proc.poll() is None:
+        proc.wait(timeout=10)
 left = [p for p in subprocess.run(["pgrep", "-f", root + "/"], capture_output=True, text=True).stdout.split() if p != str(os.getpid())]
 check(not left, "processes left: %s" % left[:5])
 for name, home in homes.items():
@@ -193,6 +239,9 @@ for name, home in homes.items():
         check(n == 0, "%s %s not empty: %d left" % (name, sub, n))
 
 print("seed %d  kills %s  finished under fire: %s" % (args.seed, dict(kills), finished))
+if args.standby:
+    took = open(os.path.join(root, "standby.log")).read().count("taking over")
+    print("standby takeovers %d" % took)
 print("leader tasks %d  placed again after a lost node %d  goals a node finished more than once %d" % (
     len(tasks), moved, sum(1 for n in twice.values() if n > 1)))
 if problems:

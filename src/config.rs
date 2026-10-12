@@ -385,7 +385,8 @@ fn read_config(lua: &Lua) -> Result<Config> {
         }
     }
     if g.contains_key("node_grace")? {
-        cfg.node_grace_ms = read_span(g.get::<Value>("node_grace")?)?.max(1000);
+        // Shorter than this and one slow ssh would look like a dead node.
+        cfg.node_grace_ms = read_span(g.get::<Value>("node_grace")?)?.max(3000);
     }
     if g.contains_key("retain")? {
         cfg.retain_ms = read_span(g.get::<Value>("retain")?)?;

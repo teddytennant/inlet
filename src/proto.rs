@@ -40,6 +40,8 @@ pub enum Request {
     /// `brief` leaves out the task list, which grows with history.
     Status {
         brief: bool,
+        /// The caller is a leader checking on what it placed here.
+        leader: bool,
     },
     Add(Box<NewTask>),
     AddBatch(Vec<NewTask>),
@@ -97,6 +99,7 @@ pub fn parse_request(line: &str) -> Result<Request> {
     match op {
         "status" => Ok(Request::Status {
             brief: v.get("brief").and_then(|b| b.as_bool()).unwrap_or(false),
+            leader: v.get("leader").and_then(|b| b.as_bool()).unwrap_or(false),
         }),
         "add" => Ok(Request::Add(Box::new(parse_task(&v)?))),
         "add_batch" => {

@@ -171,9 +171,11 @@ struct Daemon {
     remote_ids: HashMap<String, Vec<String>>,
     /// How many times a node has turned a placed task away.
     refused: HashMap<String, u32>,
+    /// On a node: when a leader last asked how its tasks were doing.
+    last_leader: Instant,
 }
 
-pub fn serve(home: &Path, foreground: bool) -> Result<()> {
+pub fn serve(home: &Path, foreground: bool, standby: bool) -> Result<()> {
     fs::create_dir_all(home.join("run"))?;
     fs::create_dir_all(home.join("proxy"))?;
     fs::create_dir_all(home.join("work"))?;
@@ -181,7 +183,7 @@ pub fn serve(home: &Path, foreground: bool) -> Result<()> {
     if !foreground {
         return daemonize(home);
     }
-    run(home)
+    run(home, standby)
 }
 
 fn daemonize(home: &Path) -> Result<()> {
@@ -227,7 +229,7 @@ fn daemonize(home: &Path) -> Result<()> {
             libc::close(devnull);
         }
     }
-    match run(home) {
+    match run(home, false) {
         Ok(()) => unsafe { libc::_exit(0) },
         Err(e) => {
             eprintln!("inlet: {e}");
@@ -266,31 +268,69 @@ fn guard_ro(home: &Path, policy: &mut Policy) {
     });
 }
 
-fn run(home: &Path) -> Result<()> {
-    let mut policy = load_signed(home)?;
-    guard_ro(home, &mut policy);
-    let node = snap::node_id(home)?;
-    let lease = snap::ensure_lease(home, &node)?;
-    let mut index = snap::load(home)?;
-    let log_path = paths::ledger(home);
-    let log_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-    if let Some(saved) = &index {
-        if log_len == 0 && saved.offset > 0 {
-            let mut adopted = saved.clone();
-            adopted.offset = 0;
-            snap::store(home, &adopted)?;
-            index = Some(adopted);
-        } else if log_len < saved.offset {
-            return Err(err("snapshot is ahead of the log"));
+fn run(home: &Path, standby: bool) -> Result<()> {
+    let mut waiting = false;
+    // A standby runs this loop until the ledger's lock comes free, which is
+    // the moment the leader's process is gone. Everything is read afresh
+    // then: the policy, the index, and the log the leader left.
+    let (policy, lease, index, snap_offset, opened) = loop {
+        let mut policy = load_signed(home)?;
+        guard_ro(home, &mut policy);
+        let node = snap::node_id(home)?;
+        let lease = snap::ensure_lease(home, &node)?;
+        let mut index = snap::load(home)?;
+        let log_path = paths::ledger(home);
+        let log_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        if let Some(saved) = &index {
+            if log_len == 0 && saved.offset > 0 {
+                let mut adopted = saved.clone();
+                adopted.offset = 0;
+                if !standby {
+                    snap::store(home, &adopted)?;
+                }
+                index = Some(adopted);
+            } else if log_len < saved.offset {
+                if standby {
+                    // The leader is between a rotation's rename and its index.
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                return Err(err("snapshot is ahead of the log"));
+            }
         }
-    }
-    let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
-    let opened = if snap_offset > 0 {
-        ledger::open_from(&log_path, snap_offset)?
-    } else {
-        ledger::open(&log_path)?
+        let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
+        let opened = if snap_offset > 0 {
+            ledger::open_from(&log_path, snap_offset)
+        } else {
+            ledger::open(&log_path)
+        };
+        let opened = match opened {
+            Ok(opened) => opened,
+            // A log read while the leader is writing it can look torn or damaged.
+            Err(_) if standby && waiting => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match opened.ledger.lock() {
+            Ok(()) => {
+                if waiting {
+                    eprintln!("inlet: the leader is gone, taking over");
+                }
+                break (policy, lease, index, snap_offset, opened);
+            }
+            Err(_) if standby => {
+                if !waiting {
+                    eprintln!("inlet: standing by");
+                }
+                waiting = true;
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => return Err(e),
+        }
     };
-    opened.ledger.lock()?;
+    let node = snap::node_id(home)?;
     let mut state = State::new(&policy.cfg);
     state.fence = lease.gen;
     if let Some(saved) = &index {
@@ -377,11 +417,17 @@ fn run(home: &Path) -> Result<()> {
         adding: HashSet::new(),
         remote_ids: HashMap::new(),
         refused: HashMap::new(),
+        last_leader: Instant::now(),
     };
     for (name, cfg) in &daemon.policy.cfg.nodes {
         // Unknown until it answers. Nothing is placed on a node not yet heard from.
         daemon.nodes.insert(name.clone(), (Instant::now(), false));
-        node::watch(name.clone(), cfg.cmd.clone(), daemon.node_tx.clone());
+        node::watch(
+            name.clone(),
+            cfg.cmd.clone(),
+            daemon.node_tx.clone(),
+            daemon.policy.cfg.node_grace_ms,
+        );
     }
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
@@ -1292,6 +1338,8 @@ impl Daemon {
             .cloned()
             .collect();
         tags.push(node::tag(id));
+        // Milliseconds, and half of what the leader itself waits.
+        tags.push(format!("lease:{}", self.policy.cfg.node_grace_ms / 2));
         let verifier = task.verifier.clone().filter(|v| !v.is_empty());
         let spec = json!({
             "worker": task.worker,
@@ -1373,6 +1421,26 @@ impl Daemon {
             }
             *rt = (Instant::now(), true);
         }
+        // What it still runs for this leader that this leader has moved on
+        // from: placed again elsewhere, or killed. Stop it.
+        let stale: Vec<String> = tasks
+            .iter()
+            .filter(|t| !matches!(t.state.as_str(), "done" | "failed" | "killed"))
+            // Only what is known to be this leader's. Another may share the node.
+            .filter(|t| self.state.tasks.contains_key(&t.leader))
+            .filter(|t| {
+                self.state
+                    .placed
+                    .get(&t.leader)
+                    .is_none_or(|(node, _)| *node != name)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        if !stale.is_empty() {
+            if let Some(cfg) = self.policy.cfg.nodes.get(&name) {
+                node::kill(cfg.cmd.clone(), stale);
+            }
+        }
         let now = now_ms();
         for (id, placed_at) in mine {
             let there: Vec<&node::Remote> = tasks.iter().filter(|t| t.leader == id).collect();
@@ -1393,6 +1461,9 @@ impl Daemon {
             let used: u64 = there.iter().map(|t| t.used).sum();
             if there.iter().any(|t| t.state == "done") {
                 self.finish_remote(&id, 0, "ok", used)?;
+            } else if there.iter().any(|t| t.reason == "fenced") {
+                // The node let go of it while this leader was out of reach.
+                self.finish_remote(&id, -1, "node", used)?;
             } else {
                 // The node's chain is spent. Its last word is the reason.
                 let last = there
@@ -1980,6 +2051,43 @@ impl Daemon {
             self.pending.insert(id.clone(), "timeout".into());
             self.signal(&id, libc::SIGKILL);
         }
+        // A leader that has stopped asking has given this node up, or will
+        // soon, and will place its tasks somewhere else. Stop them here first,
+        // so no goal is worked on twice. The lease in the tag is half the
+        // leader's patience: this side always lets go before that side moves.
+        let quiet = self.last_leader.elapsed();
+        let fenced: Vec<String> = self
+            .workers
+            .iter()
+            .map(|w| &w.id)
+            .chain(self.checks.iter().map(|c| &c.id))
+            .chain(self.state.queue.iter())
+            .filter_map(|id| self.state.tasks.get(id))
+            .filter(|t| !t.state.is_settled())
+            .filter(|t| {
+                t.tags
+                    .iter()
+                    .find_map(|tag| tag.strip_prefix("lease:")?.parse::<u64>().ok())
+                    .is_some_and(|lease| quiet >= Duration::from_millis(lease))
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in fenced {
+            if self
+                .state
+                .tasks
+                .get(&id)
+                .is_some_and(|t| t.state == TaskState::Queued)
+            {
+                self.deny(&id, "fenced")?;
+            } else if !self.pending.contains_key(&id) {
+                self.pending.insert(id.clone(), "fenced".into());
+                self.signal(&id, libc::SIGKILL);
+                if let Some(check) = self.checks.iter().find(|c| c.id == id) {
+                    unsafe { libc::kill(check.pid, libc::SIGKILL) };
+                }
+            }
+        }
         // Silence is not the same as waiting on a child.
         let silent: Vec<String> = self
             .workers
@@ -2081,7 +2189,12 @@ impl Daemon {
             }
         };
         match req {
-            Request::Status { brief } => self.reply(id, self.status_json(brief)),
+            Request::Status { brief, leader } => {
+                if leader {
+                    self.last_leader = Instant::now();
+                }
+                self.reply(id, self.status_json(brief))
+            }
             Request::Add(task) => match self.enqueue(std::slice::from_ref(task.as_ref())) {
                 Ok(ids) => self.reply(id, json!({"ok": true, "ids": ids})),
                 Err(e) => self.reply(id, json!({"ok": false, "error": e.to_string()})),

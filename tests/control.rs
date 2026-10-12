@@ -1470,7 +1470,7 @@ fn node_policy(leader: &Path, nodes: &[(&str, &Path, usize)], extra: &str) {
     policy(
         leader,
         r#"job = { on = "nodes" }, here = { cmd = { "/bin/sh", "-c", "echo local > out" } },"#,
-        &format!("nodes = {{ {list} }}\nnode_grace = 3\n{extra}"),
+        &format!("nodes = {{ {list} }}\nnode_grace = 8\n{extra}"),
     );
 }
 
@@ -1690,5 +1690,86 @@ fn a_task_no_node_will_take_does_not_wait_for_ever() {
     .unwrap();
     let out = run(&stale, &["down"]);
     assert!(!out.status.success());
+    drop(east_d);
+}
+
+#[test]
+fn a_node_lets_go_of_work_when_its_leader_goes_quiet() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 30; echo ok > out" } },"#;
+    let east = node_home("east5", job);
+    let leader = scratch("leader5");
+    node_policy(&leader, &[("east", &east, 4)], "node_grace = 4");
+    let east_d = start(&east);
+    let mut daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    for goal in ["a", "b"] {
+        inlet(&leader, &["add", "-w", "job", "-g", goal, "--no-verify"]);
+    }
+    wait(&east, &east_d, |v| v["live"] == 2);
+    // The leader vanishes. Half its patience later the node has stopped the
+    // work on its own, before any leader would place it somewhere else.
+    kill9(&mut daemon);
+    let st = wait(&east, &east_d, |v| v["live"] == 0);
+    assert!(tasks(&st).iter().all(|t| t["reason"] == "fenced"), "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    // Back again, the leader reads that as the node's failure and places anew.
+    let daemon = start(&leader);
+    let st = wait(&leader, &daemon, |v| {
+        tasks(v).iter().filter(|t| t["reason"] == "node").count() == 2
+    });
+    assert_eq!(tasks(&st).len(), 4, "each placed once more: {st}");
+    drop(east_d);
+}
+
+#[test]
+fn a_standby_takes_over_when_the_leader_dies() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 0.4; echo ok > out" } },"#;
+    let east = node_home("east6", job);
+    let leader = scratch("leader6");
+    node_policy(&leader, &[("east", &east, 3)], "");
+    let east_d = start(&east);
+    let mut daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    // A second daemon on the same home. It can do nothing but wait.
+    let log_path = leader.join("standby.log");
+    let log = File::create(&log_path).unwrap();
+    let standby = Command::new(bin())
+        .args(["--home", leader.to_str().unwrap(), "up", "-f", "--standby"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    let standby = Daemon {
+        child: standby,
+        log_path,
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !standby.log().contains("standing by") {
+        assert!(Instant::now() < deadline, "standby never stood by");
+        thread::sleep(Duration::from_millis(50));
+    }
+    manifest(
+        &leader,
+        r#"{"kind":"swarm","name":"far","replicas":3,"completions":12,
+            "template":{"worker":"job","goal":"g {index}","verify":"grep -q ok out"}}"#,
+    );
+    wait(&leader, &daemon, |v| {
+        swarm(v, "far")["done"].as_u64().unwrap_or(0) >= 3
+    });
+    kill9(&mut daemon);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !standby.log().contains("taking over") {
+        assert!(Instant::now() < deadline, "standby never took over");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The same home, a different daemon, the swarm where it was.
+    let st = wait(&leader, &standby, |v| swarm(v, "far")["phase"] == "done");
+    assert_eq!(swarm(&st, "far")["done"], 12, "{st}");
+    assert_eq!(
+        swarm(&st, "far")["created"],
+        12,
+        "nothing placed twice: {st}"
+    );
+    assert_eq!(st["available"], 10000, "{st}");
     drop(east_d);
 }

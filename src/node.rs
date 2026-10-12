@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// How long one remote command may take.
-const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one remote command may take, at most.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 
 /// The tag a placed task carries on its node, so it can be found again by
@@ -45,7 +45,12 @@ pub enum Msg {
 
 /// Run the node's CLI with `args` and return what it printed. `None` when it
 /// could not be started or hung.
-pub fn call(cmd: &[String], args: &[String], input: Option<&[u8]>) -> Option<String> {
+pub fn call(
+    cmd: &[String],
+    args: &[String],
+    input: Option<&[u8]>,
+    limit: Duration,
+) -> Option<String> {
     let (program, rest) = cmd.split_first()?;
     let mut child = Command::new(program)
         .args(rest)
@@ -74,7 +79,7 @@ pub fn call(cmd: &[String], args: &[String], input: Option<&[u8]>) -> Option<Str
     // the output to end, and let the caller judge by what was printed.
     let started = Instant::now();
     while !reader.is_finished() {
-        if started.elapsed() >= CALL_TIMEOUT {
+        if started.elapsed() >= limit {
             let _ = child.kill();
             let _ = child.wait();
             return None;
@@ -86,9 +91,22 @@ pub fn call(cmd: &[String], args: &[String], input: Option<&[u8]>) -> Option<Str
 }
 
 /// Ask a node, forever, what it is running for this leader.
-pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>) {
+pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64) {
+    // Often enough that a healthy node hears from its leader several times
+    // inside the lease, which is half the grace.
+    let every = Duration::from_millis((grace_ms / 8).clamp(200, POLL_EVERY.as_millis() as u64));
+    // One call that hangs must not use up the whole grace. A quarter of it,
+    // and the next poll gets its chance.
+    let limit = Duration::from_millis(grace_ms / 4).clamp(Duration::from_secs(1), CALL_TIMEOUT);
     thread::spawn(move || loop {
-        let raw = call(&cmd, &["status".into(), "--json".into()], None);
+        // `--leader` tells the node this leader is still here. A node that
+        // stops hearing it lets go of what the leader placed.
+        let raw = call(
+            &cmd,
+            &["status".into(), "--json".into(), "--leader".into()],
+            None,
+            limit,
+        );
         let tasks = raw.and_then(|out| parse(&out));
         if tx
             .send(Msg::Status {
@@ -99,7 +117,7 @@ pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>) {
         {
             return;
         }
-        thread::sleep(POLL_EVERY);
+        thread::sleep(every);
     });
 }
 
@@ -135,7 +153,8 @@ pub fn add(cmd: Vec<String>, task: Value, id: String, tx: Sender<Msg>) {
         let mut line = task.to_string();
         line.push('\n');
         let args = ["add".to_string(), "-f".to_string(), "-".to_string()];
-        let ok = call(&cmd, &args, Some(line.as_bytes())).is_some_and(|out| out.contains("queued"));
+        let ok = call(&cmd, &args, Some(line.as_bytes()), CALL_TIMEOUT)
+            .is_some_and(|out| out.contains("queued"));
         let _ = tx.send(Msg::Added { id, ok });
     });
 }
@@ -144,7 +163,7 @@ pub fn add(cmd: Vec<String>, task: Value, id: String, tx: Sender<Msg>) {
 pub fn kill(cmd: Vec<String>, remote: Vec<String>) {
     thread::spawn(move || {
         for id in remote {
-            let _ = call(&cmd, &["kill".into(), id], None);
+            let _ = call(&cmd, &["kill".into(), id], None, CALL_TIMEOUT);
         }
     });
 }
@@ -164,14 +183,17 @@ mod tests {
         assert_eq!((got[0].leader.as_str(), got[0].used), ("L1", 7));
         assert_eq!(got[1].reason, "verifier");
         assert!(parse("not json").is_none());
-        assert_eq!(call(&["false".into()], &[], None).as_deref(), Some(""));
-        assert!(call(&["/nonexistent/inlet".into()], &[], None).is_none());
         assert_eq!(
-            call(&["echo".into()], &["hi".into()], None).as_deref(),
+            call(&["false".into()], &[], None, CALL_TIMEOUT).as_deref(),
+            Some("")
+        );
+        assert!(call(&["/nonexistent/inlet".into()], &[], None, CALL_TIMEOUT).is_none());
+        assert_eq!(
+            call(&["echo".into()], &["hi".into()], None, CALL_TIMEOUT).as_deref(),
             Some("hi\n")
         );
         assert_eq!(
-            call(&["cat".into()], &[], Some(b"in")).as_deref(),
+            call(&["cat".into()], &[], Some(b"in"), CALL_TIMEOUT).as_deref(),
             Some("in")
         );
     }
