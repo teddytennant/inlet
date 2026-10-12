@@ -535,6 +535,9 @@ impl Daemon {
             self.start_check(&id)?;
         }
         self.sweep();
+        // Now, not a minute from now: a daemon that is restarted often would
+        // otherwise never get round to forgetting anything.
+        self.gc()?;
         if self.state.purse.due(now_ms()) {
             self.commit(
                 &[Record::Reset {
