@@ -190,10 +190,19 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     let mut parts = request.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    // Routed on the path alone. The query, if any, goes upstream as it came.
+    let full = path;
+    let path = path.split('?').next().unwrap_or("");
     if method == "GET" && path.trim_end_matches('/') == "/v1/models" {
         return models(&mut client, hub, &text, path);
     }
-    if method != "POST" || (path != "/v1/chat/completions" && path != "/v1/responses") {
+    // The three shapes a harness speaks: OpenAI chat, OpenAI responses, Anthropic messages.
+    if method != "POST"
+        || !matches!(
+            path,
+            "/v1/chat/completions" | "/v1/responses" | "/v1/messages"
+        )
+    {
         return write_json(
             &mut client,
             404,
@@ -299,7 +308,28 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
         let msg = msg.chars().take(2048).collect::<String>();
         hub.note(Note::Debug { level: 4, msg });
     }
-    match forward(&upstream, key.as_deref(), path, &payload, &mut client) {
+    // An Anthropic upstream wants its version and beta headers back, and the
+    // key under its own name. Nothing else of the worker's request goes out.
+    let mut extra = String::new();
+    for line in text.split("\r\n").skip(1) {
+        if line.len() >= 10 && line[..10].eq_ignore_ascii_case("anthropic-") {
+            extra.push_str(line);
+            extra.push_str("\r\n");
+        }
+    }
+    if path == "/v1/messages" {
+        if let Some(k) = &key {
+            extra.push_str(&format!("x-api-key: {k}\r\n"));
+        }
+    }
+    match forward(
+        &upstream,
+        key.as_deref(),
+        full,
+        &extra,
+        &payload,
+        &mut client,
+    ) {
         Ok((bytes, usage)) => {
             let actual = usage.unwrap_or(bytes.div_ceil(4));
             let (charge, kill) = settle(hub, &id, planned.hold, actual);
@@ -491,6 +521,7 @@ fn forward(
     upstream: &str,
     key: Option<&str>,
     path: &str,
+    extra: &str,
     body: &[u8],
     client: &mut UnixStream,
 ) -> Result<(u64, Option<u64>)> {
@@ -506,7 +537,7 @@ fn forward(
         None => String::new(),
     };
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(req.as_bytes())?;
@@ -595,10 +626,16 @@ fn usage_obj(v: &Value) -> Option<u64> {
     if let Some(t) = v.get("total_tokens").and_then(|n| n.as_u64()) {
         return Some(t);
     }
+    // Anthropic counts cached input apart from the rest. It is still spend.
+    let cached: u64 = ["cache_creation_input_tokens", "cache_read_input_tokens"]
+        .iter()
+        .filter_map(|key| v.get(*key).and_then(|n| n.as_u64()))
+        .sum();
     let prompt = v
         .get("prompt_tokens")
         .or_else(|| v.get("input_tokens"))
-        .and_then(|n| n.as_u64());
+        .and_then(|n| n.as_u64())
+        .map(|n| n.saturating_add(cached));
     let completion = v
         .get("completion_tokens")
         .or_else(|| v.get("output_tokens"))
@@ -730,6 +767,10 @@ fn bearer(header: &str) -> Option<String> {
             if !token.is_empty() {
                 return Some(token.to_string());
             }
+        }
+        // Anthropic clients send the key here.
+        if k.eq_ignore_ascii_case("x-api-key") && !v.trim().is_empty() {
+            return Some(v.trim().to_string());
         }
     }
     None

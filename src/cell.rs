@@ -461,12 +461,13 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         None => None,
     };
 
-    // `inlet door keep <log fd> <status fd> <cap> <deadline> -- cmd...`. The
+    // `inlet door keep <log fd> <status fd> <cap> <deadline> <memory mb> -- cmd...`. The
     // child fills in the two descriptor numbers once it knows them.
     let mut fd_args = ([0u8; 12], [0u8; 12]);
     let keep_tail = c_strings(&[
         req.keep.as_ref().map_or(0, |k| k.cap).to_string(),
         req.keep.as_ref().map_or(0, |k| k.deadline).to_string(),
+        req.memory_mb.to_string(),
         "--".to_string(),
     ])?;
     let keep_head = c_strings(&["door".to_string(), "keep".to_string()])?;
@@ -777,7 +778,9 @@ unsafe fn child_entry(a: &Raw) -> ! {
     if locked != 0 {
         fail(a.err_w, locked);
     }
-    set_limits(a.memory_mb, a.pids, a.seconds);
+    // A kept worker's memory is watched by its keeper, by what it really
+    // uses. An rlimit can only count what a runtime reserves.
+    set_limits(if a.keep { 0 } else { a.memory_mb }, a.pids, a.seconds);
     let _ = libc::chdir(if pivoted { c"/work".as_ptr() } else { a.work });
 
     let input = if pivoted { a.stdin_pivot } else { a.stdin_host };
@@ -891,17 +894,21 @@ unsafe fn pivot(a: &Raw) -> i32 {
     if libc::chdir(c"/".as_ptr()) != 0 {
         return errno();
     }
-    if libc::umount2(c"/old".as_ptr(), libc::MNT_DETACH) != 0 {
-        return errno();
-    }
-    let _ = libc::rmdir(c"/old".as_ptr());
+    // Before the old root goes. The kernel lets a user namespace mount a new
+    // proc only while it can still see a whole one, and the host's is under
+    // /old. Mounted after, it is refused, and a cell with no /proc is one
+    // where Bun aborts and the JVM cannot count its processors.
     let _ = libc::mount(
         c"proc".as_ptr(),
         c"/proc".as_ptr(),
         c"proc".as_ptr(),
-        0,
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         ptr::null(),
     );
+    if libc::umount2(c"/old".as_ptr(), libc::MNT_DETACH) != 0 {
+        return errno();
+    }
+    let _ = libc::rmdir(c"/old".as_ptr());
     let _ = libc::mount(
         c"tmpfs".as_ptr(),
         c"/tmp".as_ptr(),
@@ -985,12 +992,14 @@ unsafe fn set_limits(memory_mb: u64, pids: u64, seconds: u64) {
     // gigabytes they never touch, and a cap on address space kills them at start.
     // Below 64MB the cap is a lie, so floor it.
     // RLIMIT_NPROC is per uid, not per worker. The cgroup pids controller is the real cap.
-    let mem = memory_mb.saturating_mul(1024 * 1024).max(64 * 1024 * 1024);
-    let data_lim = libc::rlimit {
-        rlim_cur: mem,
-        rlim_max: mem,
-    };
-    libc::setrlimit(libc::RLIMIT_DATA, &data_lim);
+    if memory_mb > 0 {
+        let mem = memory_mb.saturating_mul(1024 * 1024).max(64 * 1024 * 1024);
+        let data_lim = libc::rlimit {
+            rlim_cur: mem,
+            rlim_max: mem,
+        };
+        libc::setrlimit(libc::RLIMIT_DATA, &data_lim);
+    }
     let nofile = libc::rlimit {
         rlim_cur: 1024,
         rlim_max: 1024,

@@ -992,3 +992,80 @@ fn a_single_file_in_cell_ro_can_be_run() {
     });
     assert_eq!(tasks(&st)[0]["state"], "done", "{st} {}", daemon.log());
 }
+
+#[test]
+fn a_cell_has_its_own_proc() {
+    let home = scratch("proc");
+    policy(
+        &home,
+        r#"look = { cmd = { "/bin/sh", "-c", "cat /proc/self/maps > /dev/null && ls /proc | grep -c '^[0-9]' > count && grep -c . /proc/1/cmdline > init" } },"#,
+        "",
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "look",
+            "-g",
+            "look",
+            "--verify",
+            "test -s init",
+        ],
+    );
+    let st = wait(&home, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let task = &tasks(&st)[0];
+    assert_eq!(task["state"], "done", "{st} {}", daemon.log());
+    // Its own pid namespace: the keeper, the shell, and what the shell ran. Not the host.
+    let count: u32 = work(&home, &task["id"], "count").trim().parse().unwrap();
+    assert!((2..=6).contains(&count), "{count} processes visible");
+}
+
+#[test]
+fn memory_is_capped_by_what_a_worker_really_uses() {
+    let home = scratch("rss");
+    policy(
+        &home,
+        r#"hog = { cmd = { "python3", "-c", "import time; x = b'x' * (400 * 1024 * 1024); time.sleep(30)" } },
+        thin = { cmd = { "python3", "-c", "import mmap; m = mmap.mmap(-1, 8 * 1024 * 1024 * 1024); open('out', 'w').write('ok')" } },"#,
+        "",
+    );
+    let daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "hog",
+            "-g",
+            "eat",
+            "--no-verify",
+            "--memory-mb",
+            "150",
+        ],
+    );
+    // Eight gigabytes reserved and never touched is not eight gigabytes used.
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "thin",
+            "-g",
+            "reserve",
+            "--verify",
+            "grep -q ok out",
+            "--memory-mb",
+            "150",
+        ],
+    );
+    let st = wait(&home, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let all = tasks(&st);
+    let hog = all.iter().find(|t| t["worker"] == "hog").unwrap();
+    assert_eq!(hog["state"], "failed", "{st}");
+    let log = inlet(&home, &["logs", hog["id"].as_str().unwrap()]);
+    assert!(log.contains("over 150 MB, stopped"), "{log}");
+    let thin = all.iter().find(|t| t["worker"] == "thin").unwrap();
+    assert_eq!(thin["state"], "done", "{st} {}", daemon.log());
+}

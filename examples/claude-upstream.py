@@ -13,6 +13,10 @@ A harness that sends `tools` gets tool calls back: the tool list goes into the
 system prompt and a reply that is a JSON tool call is turned into one. That is
 enough to drive a real coding harness. `stream: true` is answered as one
 server-sent event stream.
+
+It speaks both shapes: OpenAI chat completions at /v1/chat/completions and
+Anthropic messages at /v1/messages. A request that names a sonnet, opus, or
+haiku model gets that one; anything else gets $CLAUDE_MODEL.
 """
 import json
 import os
@@ -75,8 +79,38 @@ def render(messages, tools):
     return system, "\n\n".join(lines) + "\n\n[assistant]\n"
 
 
-def tool_calls_in(text):
+INVOKE = re.compile(r'<invoke name="([^"]+)">(.*?)</invoke>', re.S)
+PARAM = re.compile(r'<parameter name="([^"]+)">(.*?)</parameter>', re.S)
+
+
+def native_calls_in(text, schemas):
+    """A model that knows a harness's own call syntax sometimes writes that
+    instead of the JSON it was asked for. Read it, and drop whatever it went
+    on to imagine after the calls."""
+    calls = []
+    for name, inner in INVOKE.findall(text):
+        props = schemas.get(name, {}).get("properties", {})
+        args = {}
+        for key, value in PARAM.findall(inner):
+            if props.get(key, {}).get("type") in ("integer", "number", "boolean", "array", "object"):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            args[key] = value
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
+def tool_calls_in(text, schemas=None):
     """The reply as tool calls, or None when it is prose."""
+    native = native_calls_in(text, schemas or {})
+    if native:
+        return [
+            {"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
+             "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+            for c in native
+        ]
     body = text.strip()
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", body, re.S)
     if fenced:
@@ -100,6 +134,92 @@ def tool_calls_in(text):
         for c in calls
         if isinstance(c, dict)
     ]
+
+
+def model_for(name):
+    name = (name or "").lower()
+    for family, model in (("sonnet", "claude-sonnet-5-5"), ("opus", "claude-opus-5-5"), ("haiku", "claude-haiku-5-5")):
+        if family in name:
+            return model
+    return MODEL
+
+
+def run_claude(system, text, model):
+    """One model call. Returns the reply text and (prompt, completion) tokens."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+    cmd = ["claude", "-p", "--model", model, "--output-format", "json", "--tools", "",
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    if system:
+        cmd += ["--system-prompt", system]
+    run = subprocess.run(cmd, input=text, capture_output=True, text=True, cwd=CWD, env=env, timeout=600)
+    out = json.loads(run.stdout)
+    if out.get("is_error"):
+        raise RuntimeError(out.get("result", "claude failed"))
+    usage = out.get("usage", {})
+    prompt = sum(usage.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    return out["result"], prompt, usage.get("output_tokens", 0)
+
+
+def anthropic_text(content):
+    """Anthropic content, a string or a list of blocks, as the text the model reads."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content or []:
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(block.get("text", ""))
+        elif kind == "tool_use":
+            parts.append(json.dumps({"tool_calls": [{"name": block.get("name"), "arguments": block.get("input", {})}]}))
+        elif kind == "tool_result":
+            parts.append("[tool result]\n" + anthropic_text(block.get("content")))
+    return "\n".join(parts)
+
+
+def complete_anthropic(body):
+    system = anthropic_text(body.get("system"))
+    tools = body.get("tools") or []
+    if tools:
+        system += TOOL_RULES % json.dumps(
+            [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+             for t in tools if "name" in t],
+            indent=1,
+        )
+    text = "\n\n".join("[%s]\n%s" % (m["role"], anthropic_text(m.get("content"))) for m in body.get("messages", []))
+    reply, prompt, done = run_claude(system, text + "\n\n[assistant]\n", model_for(body.get("model")))
+    schemas = {t["name"]: t.get("input_schema", {}) for t in tools if "name" in t}
+    calls = tool_calls_in(reply, schemas) if tools else None
+    if calls:
+        content = [
+            {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:16], "name": c["function"]["name"],
+             "input": json.loads(c["function"]["arguments"])}
+            for c in calls
+        ]
+    else:
+        content = [{"type": "text", "text": reply}]
+    return content, {"input_tokens": prompt, "output_tokens": done}
+
+
+def anthropic_events(body, content, usage):
+    """The reply as the event stream an Anthropic client expects."""
+    stop = "tool_use" if content[0]["type"] == "tool_use" else "end_turn"
+    head = {"id": "msg_" + uuid.uuid4().hex[:16], "type": "message", "role": "assistant",
+            "model": body.get("model", MODEL), "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": usage["input_tokens"], "output_tokens": 0}}
+    events = [("message_start", {"type": "message_start", "message": head})]
+    for i, block in enumerate(content):
+        if block["type"] == "text":
+            start = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": block["text"]}
+        else:
+            start = dict(block, input={})
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+        events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": start}))
+        events.append(("content_block_delta", {"type": "content_block_delta", "index": i, "delta": delta}))
+        events.append(("content_block_stop", {"type": "content_block_stop", "index": i}))
+    events.append(("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": usage}))
+    events.append(("message_stop", {"type": "message_stop"}))
+    return "".join("event: %s\ndata: %s\n\n" % (name, json.dumps(data)) for name, data in events), stop
 
 
 def complete(body):
@@ -127,6 +247,18 @@ def complete(body):
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        if self.path.split("?")[0].rstrip("/").endswith("/messages"):
+            try:
+                content, usage = complete_anthropic(body)
+            except Exception as e:
+                return self.send(502, "application/json", json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)[:300]}}))
+            stream, stop = anthropic_events(body, content, usage)
+            if body.get("stream"):
+                return self.send(200, "text/event-stream", stream)
+            reply = {"id": "msg_" + uuid.uuid4().hex[:16], "type": "message", "role": "assistant",
+                     "model": body.get("model", MODEL), "content": content, "stop_reason": stop,
+                     "stop_sequence": None, "usage": usage}
+            return self.send(200, "application/json", json.dumps(reply))
         try:
             message, usage = complete(body)
         except Exception as e:  # the worker gets the reason, not a hung socket

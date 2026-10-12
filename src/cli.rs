@@ -823,6 +823,8 @@ fn door_keep(args: &[String]) -> Result<()> {
     let usage = "inlet door keep is run by the cell";
     let num = |i: usize| -> Result<u64> { parse_u64(args.get(i).ok_or_else(|| err(usage))?) };
     let (log_fd, status_fd, cap, deadline) = (num(0)?, num(1)?, num(2)?, num(3)?);
+    let memory_kb = num(4)?.saturating_mul(1024);
+    let args = &[&args[..4], &args[5..]].concat()[..];
     if args.get(4).map(String::as_str) != Some("--")
         || args.len() < 6
         || log_fd < 3
@@ -854,6 +856,7 @@ fn door_keep(args: &[String]) -> Result<()> {
                 libc::fcntl(ends[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
             let started = std::time::Instant::now();
+            let mut ticks = 0u64;
             let mut written = 0u64;
             let mut buf = [0u8; 8192];
             let mut pump = |log: &mut fs::File| {
@@ -877,6 +880,14 @@ fn door_keep(args: &[String]) -> Result<()> {
                 if deadline > 0 && started.elapsed() > Duration::from_secs(deadline) {
                     let _ = child.kill();
                 }
+                // Resident memory of everything in the cell, once a second.
+                // Node, Bun, the JVM, and Go all reserve far more than they
+                // touch, so only what is resident can be a cap.
+                ticks += 1;
+                if memory_kb > 0 && ticks.is_multiple_of(50) && cell_rss_kb() > memory_kb {
+                    let _ = writeln!(log, "inlet: over {} MB, stopped", memory_kb / 1024);
+                    let _ = child.kill();
+                }
                 thread::sleep(Duration::from_millis(20));
             }
         }
@@ -892,6 +903,31 @@ fn door_keep(args: &[String]) -> Result<()> {
     } else {
         128 + libc::WTERMSIG(code)
     });
+}
+
+/// Resident memory of every process this one can see. As pid 1 of a cell that
+/// is the cell. Outside one it would be the whole host, so it reports nothing.
+fn cell_rss_kb() -> u64 {
+    if std::process::id() != 1 {
+        return 0;
+    }
+    let page_kb = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64) / 1024;
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return 0;
+    };
+    procs
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter_map(|entry| fs::read_to_string(entry.path().join("statm")).ok())
+        .filter_map(|statm| statm.split(' ').nth(1)?.parse::<u64>().ok())
+        .sum::<u64>()
+        .saturating_mul(page_kb)
 }
 
 /// Most harnesses want a base URL, not a unix socket. This puts the proxy on
@@ -956,6 +992,7 @@ fn door_run(args: &[String]) -> Result<()> {
         .env("INLET_PROXY_URL", &base)
         .env("OPENAI_BASE_URL", format!("{base}/v1"))
         .env("OPENAI_API_BASE", format!("{base}/v1"))
+        .env("ANTHROPIC_BASE_URL", &base)
         .status()
         .map_err(|e| err(format!("{program}: {e}")))?;
     std::process::exit(
