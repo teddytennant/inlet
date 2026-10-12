@@ -841,10 +841,13 @@ fn fake_upstream() -> u16 {
                     }
                 }
             }
-            if !raw.starts_with(b"POST ") {
+            let body = if raw.starts_with(b"GET /v1/models ") {
+                r#"{"object":"list","data":[{"id":"model-from-upstream"}]}"#
+            } else if raw.starts_with(b"POST ") {
+                r#"{"choices":[{"message":{"role":"assistant","content":"from-upstream"}}],"usage":{"total_tokens":22}}"#
+            } else {
                 continue;
-            }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"from-upstream"}}],"usage":{"total_tokens":22}}"#;
+            };
             let _ = write!(
                 conn,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -871,6 +874,11 @@ req = urllib.request.Request(
     headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"], "Content-Type": "application/json"},
 )
 open("reply", "w").write(urllib.request.urlopen(req).read().decode())
+listing = urllib.request.Request(
+    os.environ["OPENAI_BASE_URL"] + "/models",
+    headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
+)
+open("models", "w").write(urllib.request.urlopen(listing).read().decode())
 "#,
     )
     .unwrap();
@@ -893,7 +901,7 @@ open("reply", "w").write(urllib.request.urlopen(req).read().decode())
                 "--seed",
                 seed.to_str().unwrap(),
                 "--verify",
-                "grep -q from-upstream reply",
+                "grep -q from-upstream reply && grep -q model-from-upstream models",
             ],
         );
     }
@@ -943,4 +951,44 @@ fn sigterm_leaves_the_work_running() {
     assert_eq!(tasks(&st).len(), 1, "{st}");
     assert_eq!(tasks(&st)[0]["state"], "done", "{st} {}", daemon.log());
     assert_eq!(st["available"], 10000, "{st}");
+}
+
+#[test]
+fn a_single_file_in_cell_ro_can_be_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = scratch("rofile");
+    // Outside /tmp, which a cell covers with its own.
+    let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/ro-file-test.sh");
+    fs::write(&tool, "#!/bin/sh\necho ran > out\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let tool = tool.to_str().unwrap();
+    policy(
+        &home,
+        &format!(r#"tool = {{ cmd = {{ "{tool}" }} }},"#),
+        &format!(r#"cell = {{ ro = {{ "{tool}", "/tmp/hidden-by-the-cell" }} }}"#),
+    );
+    let daemon = start(&home);
+    assert!(
+        daemon
+            .log()
+            .contains("cell.ro /tmp/hidden-by-the-cell refused"),
+        "{}",
+        daemon.log()
+    );
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "tool",
+            "-g",
+            "run",
+            "--verify",
+            "grep -q ran out",
+        ],
+    );
+    let st = wait(&home, &daemon, |v| {
+        tasks(v)[0]["state"] != "running" && tasks(v)[0]["state"] != "queued"
+    });
+    assert_eq!(tasks(&st)[0]["state"], "done", "{st} {}", daemon.log());
 }

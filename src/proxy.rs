@@ -190,6 +190,9 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
     let mut parts = request.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    if method == "GET" && path.trim_end_matches('/') == "/v1/models" {
+        return models(&mut client, hub, &text, path);
+    }
     if method != "POST" || (path != "/v1/chat/completions" && path != "/v1/responses") {
         return write_json(
             &mut client,
@@ -421,6 +424,67 @@ fn release_hold(hub: &Hub, id: &str, n: u64) {
     if let Some(meter) = g.meters.get_mut(id) {
         meter.held = meter.held.saturating_sub(n);
     }
+}
+
+/// Harnesses ask what models there are before they send a prompt. The
+/// upstream's own answer is passed back. It costs no tokens.
+fn models(client: &mut UnixStream, hub: &Hub, request: &str, path: &str) -> Result<()> {
+    let (known, upstream, key) = {
+        let g = hub.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let known = bearer(request).is_some_and(|token| g.tokens.contains_key(&token));
+        (known, g.upstream.clone(), g.key.clone())
+    };
+    if !known {
+        return write_json(
+            client,
+            401,
+            r#"{"error":{"type":"unauthorized","message":"token"}}"#,
+        );
+    }
+    let Some(upstream) = upstream else {
+        return write_json(
+            client,
+            503,
+            r#"{"error":{"type":"no_upstream","message":"proxy.upstream is unset"}}"#,
+        );
+    };
+    let mut relay = || -> Result<()> {
+        let origin = parse_origin(&upstream)?;
+        let mut stream = connect(&origin)?;
+        let host = if origin.port == origin.default_port() {
+            origin.host.clone()
+        } else {
+            format!("{}:{}", origin.host, origin.port)
+        };
+        let auth = match &key {
+            Some(k) => format!("Authorization: Bearer {k}\r\n"),
+            None => String::new(),
+        };
+        stream.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )?;
+        let mut buf = [0u8; 8192];
+        let mut sent = 0usize;
+        // A model list is small. Anything past a megabyte is not one.
+        while sent < 1024 * 1024 {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            client.write_all(&buf[..n])?;
+            sent += n;
+        }
+        Ok(())
+    };
+    if relay().is_err() {
+        return write_json(
+            client,
+            502,
+            r#"{"error":{"type":"upstream","message":"model list"}}"#,
+        );
+    }
+    Ok(())
 }
 
 fn forward(

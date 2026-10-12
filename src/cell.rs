@@ -22,6 +22,9 @@ const FS_WRITE: u64 = (1 << 1)
     | (1 << 13)
     | (1 << 14);
 const FS_ALL: u64 = FS_READ | FS_WRITE;
+/// What a rule on a single file may carry. The kernel refuses directory
+/// rights there, and a refused rule is no rule: the file cannot be run.
+const FS_READ_FILE: u64 = (1 << 0) | (1 << 2);
 
 #[repr(C)]
 struct RulesetAttr {
@@ -397,7 +400,15 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         None => None,
     };
     let run_access = if req.door { FS_ALL } else { FS_READ };
-    let mut rules_pivot: Vec<Rule> = ro_c.iter().map(|p| (p.as_ptr(), FS_READ)).collect();
+    let ro_rules: Vec<Rule> = ro
+        .iter()
+        .zip(&ro_c)
+        .map(|(path, c)| {
+            let access = if path.is_dir() { FS_READ } else { FS_READ_FILE };
+            (c.as_ptr(), access)
+        })
+        .collect();
+    let mut rules_pivot = ro_rules.clone();
     rules_pivot.extend([
         (c"/work".as_ptr(), FS_ALL),
         (c"/scratch".as_ptr(), FS_ALL),
@@ -408,7 +419,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         (c"/etc".as_ptr(), FS_READ),
         (c"/run".as_ptr(), run_access),
     ]);
-    let mut rules_host: Vec<Rule> = ro_c.iter().map(|p| (p.as_ptr(), FS_READ)).collect();
+    let mut rules_host = ro_rules;
     rules_host.extend([
         (work.as_ptr(), FS_ALL),
         (scratch.as_ptr(), FS_ALL),
@@ -423,7 +434,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         rules_host.push((proxy.as_ptr(), FS_ALL));
         rules_host.push((worker.as_ptr(), FS_ALL));
         if let Some(exe) = &exe_c {
-            rules_host.push((exe.as_ptr(), FS_READ));
+            rules_host.push((exe.as_ptr(), FS_READ_FILE));
         }
     }
 
@@ -705,6 +716,16 @@ fn env_strings(req: &SpawnRequest, path: &str, pivoted: bool, exe: Option<&Path>
         for (name, _) in &req.files {
             let key = name.split('.').next().unwrap_or(name).to_uppercase();
             env.push(format!("INLET_{key}_FILE={etc}/{name}"));
+        }
+    }
+    // NixOS runs a generic-linux binary through nix-ld, which finds the real
+    // loader by these. They point under /run on the host, which a cell does
+    // not share, so pass where they resolve to.
+    for key in ["NIX_LD", "NIX_LD_LIBRARY_PATH"] {
+        if let Some(real) = std::env::var_os(key).and_then(|v| fs::canonicalize(v).ok()) {
+            if real.starts_with("/nix/store") {
+                env.push(format!("{key}={}", show(&real)));
+            }
         }
     }
     for (key, value) in &req.env {

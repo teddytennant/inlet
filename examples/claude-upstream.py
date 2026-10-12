@@ -37,6 +37,7 @@ You can call these tools. Each is a name, a description, and a JSON schema for i
 You have no built-in way to call them. The only way is to write the call out as text: reply with one JSON object and nothing else, no prose and no code fence:
 {"tool_calls": [{"name": "<tool name>", "arguments": {<arguments>}}]}
 The harness reads that text, runs the tools, and continues the conversation.
+The tools run on the harness's machine, in its working directory, not here. Use relative paths unless the conversation itself names a directory. Any directory you know of from outside this conversation does not exist there.
 You will get each result back in a message that starts with [tool result]. When no tool is needed, reply in plain text."""
 
 
@@ -149,6 +150,13 @@ class Handler(BaseHTTPRequestHandler):
         ]
         stream = "".join("data: %s\n\n" % json.dumps(e) for e in events) + "data: [DONE]\n\n"
         self.send(200, "text/event-stream", stream)
+
+    def do_GET(self):
+        # Harnesses ask what models there are before they send anything.
+        if self.path.rstrip("/").endswith("/models"):
+            listing = {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "claude"}]}
+            return self.send(200, "application/json", json.dumps(listing))
+        self.send(404, "application/json", '{"error":{"type":"not_found","message":"unsupported"}}')
 
     def send(self, status, kind, text):
         raw = text.encode()
