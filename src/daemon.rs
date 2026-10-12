@@ -1459,6 +1459,30 @@ impl Daemon {
             })
             .map(|t| t.id.clone())
             .collect();
+        // A node that was cut off and finished the work anyway is believed.
+        // If the task placed in its stead is still running, that one is
+        // stopped and takes the result: the goal is done once, not twice.
+        let finished: Vec<String> = tasks
+            .iter()
+            .filter(|t| t.state == "done")
+            .map(|t| t.leader.clone())
+            .collect();
+        for orig in finished {
+            let Some(heir) = self.heir_of(&orig) else {
+                continue;
+            };
+            let Some((on, _)) = self.state.placed.get(&heir).cloned() else {
+                continue;
+            };
+            eprintln!("inlet: node {name} had finished {orig}; stopping {heir} on {on}");
+            if let (Some(cfg), Some(ids)) =
+                (self.policy.cfg.nodes.get(&on), self.remote_ids.get(&heir))
+            {
+                node::kill(cfg.cmd.clone(), ids.clone());
+            }
+            // Nothing charged here: what the node spent is charged below.
+            self.finish_remote(&heir, 0, "ok", 0)?;
+        }
         // What a node spent on a task this leader had already given up on and
         // refunded. The spend was real. It comes out of the pool, once.
         let late: Vec<Record> = tasks
@@ -1469,7 +1493,10 @@ impl Daemon {
                 self.state
                     .tasks
                     .get(&t.leader)
-                    .is_some_and(|mine| mine.state.is_settled() && mine.reason == "node")
+                    // Not one already charged when it was given up.
+                    .is_some_and(|mine| {
+                        mine.state.is_settled() && mine.reason == "node" && mine.used == 0
+                    })
             })
             .map(|t| Record::Charge {
                 id: t.leader.clone(),
@@ -1536,6 +1563,23 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// The live task standing in for one that was lost with its node.
+    fn heir_of(&self, orig: &str) -> Option<String> {
+        let mut at = self.state.tasks.get(orig)?;
+        for _ in 0..8 {
+            if !(at.state.is_settled() && at.reason == "node") {
+                break;
+            }
+            let id = at.id.clone();
+            at = self
+                .state
+                .tasks
+                .values()
+                .find(|t| t.retry_of.as_deref() == Some(id.as_str()))?;
+        }
+        (at.id != orig && at.state.is_live()).then(|| at.id.clone())
     }
 
     /// Settle a task that ran on a node. Only a lost node is tried again

@@ -1849,3 +1849,105 @@ fn a_standby_never_leads_while_the_leader_lives_through_a_rotation() {
     assert_eq!(swarm(&st, "many")["done"], 40, "{st}");
     assert_eq!(st["available"], 10000, "{st}");
 }
+
+#[test]
+fn a_node_that_finished_while_cut_off_is_believed() {
+    let port = fake_upstream();
+    let seed = scratch("cutseed");
+    fs::write(
+        seed.join("client.py"),
+        r#"import os, urllib.request
+req = urllib.request.Request(
+    os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+    data=b'{"messages": [], "max_tokens": 10}',
+    headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"], "Content-Type": "application/json"},
+)
+open("reply", "w").write(urllib.request.urlopen(req).read().decode())
+"#,
+    )
+    .unwrap();
+    let proxy = format!(r#"proxy = {{ upstream = "http://127.0.0.1:{port}", key = "k" }}"#);
+    // East calls the model and finishes. West would take a minute over it.
+    let east = scratch("cuteast");
+    policy(
+        &east,
+        r#"job = { cmd = { "/bin/sh", "-c", "\"$INLET_BIN\" door run -- python3 client.py; sleep 1; echo ok > out" }, net = "host" },"#,
+        &proxy,
+    );
+    let west = node_home(
+        "cutwest",
+        r#"job = { cmd = { "/bin/sh", "-c", "sleep 60; echo ok > out" } },"#,
+    );
+    let leader = scratch("cutleader");
+    let gate = leader.join("cut");
+    policy(
+        &leader,
+        r#"job = { on = "nodes" },"#,
+        &format!(
+            r#"nodes = {{
+  east = {{ cmd = {{ "/bin/sh", "-c", "test -e {gate} && exit 1; exec {bin} --home {east} \"$@\"", "sh" }}, slots = 1 }},
+  west = {{ cmd = {{ "{bin}", "--home", "{west}" }}, slots = 1 }},
+}}
+node_grace = 8"#,
+            gate = gate.display(),
+            bin = bin().display(),
+            east = east.display(),
+            west = west.display(),
+        ),
+    );
+    let east_d = start(&east);
+    let daemon = start(&leader);
+    wait(&leader, &daemon, |v| {
+        v["nodes"]
+            .as_array()
+            .is_some_and(|n| n.iter().any(|n| n["name"] == "east" && n["ready"] == true))
+    });
+    inlet(
+        &leader,
+        &[
+            "add",
+            "-w",
+            "job",
+            "-g",
+            "once",
+            "--seed",
+            seed.to_str().unwrap(),
+            "--verify",
+            "grep -q ok out",
+        ],
+    );
+    wait(&east, &east_d, |v| v["live"] == 1);
+    // The link goes. East finishes inside its lease, and nobody hears.
+    fs::write(&gate, "").unwrap();
+    wait(&east, &east_d, |v| {
+        tasks(v).iter().any(|t| t["state"] == "done")
+    });
+    let west_d = start(&west);
+    // The leader gives east up and places the goal on west.
+    wait(&west, &west_d, |v| v["live"] == 1);
+    // The link comes back, with the answer.
+    fs::remove_file(&gate).unwrap();
+    let st = wait(&leader, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let all = tasks(&st);
+    assert_eq!(all.len(), 2, "{st}");
+    assert_eq!(
+        all.iter().filter(|t| t["reason"] == "node").count(),
+        1,
+        "{st}"
+    );
+    assert_eq!(
+        all.iter().filter(|t| t["state"] == "done").count(),
+        1,
+        "{st}"
+    );
+    // West was stopped, not left to do it again.
+    let st_west = wait(&west, &west_d, |v| v["live"] == 0);
+    assert!(
+        tasks(&st_west).iter().all(|t| t["state"] != "done"),
+        "{st_west}"
+    );
+    // And what east spent while nobody was looking is on the leader's books, once.
+    let st = wait(&leader, &daemon, |v| v["available"] == 10000 - 22);
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(status(&leader)["available"], 10000 - 22, "{st}");
+}
