@@ -322,6 +322,7 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
             extra.push_str(&format!("x-api-key: {k}\r\n"));
         }
     }
+    let mut sent = false;
     match forward(
         &upstream,
         key.as_deref(),
@@ -329,9 +330,16 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
         &extra,
         &payload,
         &mut client,
+        &mut sent,
     ) {
-        Ok((bytes, usage)) => {
-            let actual = usage.unwrap_or(bytes.div_ceil(4));
+        Ok((bytes, usage, status)) => {
+            // No usage on a success is counted from bytes, closed. An error
+            // from the provider with no usage was not a completion and is free.
+            let actual = match usage {
+                Some(n) => n,
+                None if (200..300).contains(&status) => bytes.div_ceil(4),
+                None => 0,
+            };
             let (charge, kill) = settle(hub, &id, planned.hold, actual);
             if charge > 0 {
                 hub.note(Note::Cost {
@@ -345,8 +353,16 @@ fn handle(mut client: UnixStream, hub: &Hub) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            // The hold stays spent. Fail closed. Do not kill unless the purse is actually empty.
-            let charge = settle_fail(hub, &id, planned.hold);
+            // A request that never left cost nothing: the upstream was down or
+            // unreachable, and a worker that retries through an outage must not
+            // drain its slice on calls no model saw. One that broke after it
+            // was sent may have been billed, so its hold stays spent.
+            let charge = if sent {
+                settle_fail(hub, &id, planned.hold)
+            } else {
+                release_hold(hub, &id, planned.hold);
+                0
+            };
             if charge > 0 {
                 hub.note(Note::Cost {
                     id: id.clone(),
@@ -524,7 +540,8 @@ fn forward(
     extra: &str,
     body: &[u8],
     client: &mut UnixStream,
-) -> Result<(u64, Option<u64>)> {
+    sent: &mut bool,
+) -> Result<(u64, Option<u64>, u16)> {
     let origin = parse_origin(upstream)?;
     let mut stream = connect(&origin)?;
     let host = if origin.port == origin.default_port() {
@@ -542,10 +559,16 @@ fn forward(
     );
     stream.write_all(req.as_bytes())?;
     stream.write_all(body)?;
+    *sent = true;
     let mut header = Vec::new();
     read_headers(&mut stream, &mut header)?;
     client.write_all(&header)?;
     let header_text = String::from_utf8_lossy(&header);
+    let status: u16 = header_text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
     let mut bytes = 0u64;
     let mut tail = Vec::new();
     if let Some(len) = content_length(&header_text) {
@@ -562,7 +585,7 @@ fn forward(
             bytes += n as u64;
         }
     }
-    Ok((bytes, extract_usage(&tail)))
+    Ok((bytes, extract_usage(&tail), status))
 }
 
 fn copy_n(

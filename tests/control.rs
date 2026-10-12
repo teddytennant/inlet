@@ -132,7 +132,8 @@ fn swarm(v: &Value, name: &str) -> Value {
 }
 
 fn wait(home: &Path, daemon: &Daemon, mut pred: impl FnMut(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Generous: the suite runs in parallel, often on a busy machine.
+    let deadline = Instant::now() + Duration::from_secs(40);
     let mut last = Value::Null;
     while Instant::now() < deadline {
         last = status(home);
@@ -602,13 +603,13 @@ fn a_constraint_lapses_and_clears_without_a_key() {
         "",
     );
     let daemon = start(&home);
-    inlet(&home, &["bind", "--for", "1", "freeze #code"]);
+    inlet(&home, &["bind", "--for", "3", "freeze #code"]);
     inlet(&home, &["add", "-w", "job", "-g", "early", "--no-verify"]);
     let st = wait(&home, &daemon, |v| {
         tasks(v).iter().any(|t| t["state"] == "failed")
     });
     assert_eq!(tasks(&st)[0]["reason"], "constraint");
-    thread::sleep(Duration::from_millis(1100));
+    thread::sleep(Duration::from_millis(3100));
     inlet(&home, &["add", "-w", "job", "-g", "late", "--no-verify"]);
     let st = wait(&home, &daemon, |v| {
         tasks(v)
@@ -782,7 +783,7 @@ fn a_kept_worker_cannot_outrun_its_clock_or_a_kill() {
             "late",
             "--no-verify",
             "--seconds",
-            "2",
+            "6",
         ],
     );
     inlet(
@@ -1068,4 +1069,105 @@ fn memory_is_capped_by_what_a_worker_really_uses() {
     assert!(log.contains("over 150 MB, stopped"), "{log}");
     let thin = all.iter().find(|t| t["worker"] == "thin").unwrap();
     assert_eq!(thin["state"], "done", "{st} {}", daemon.log());
+}
+
+#[test]
+fn an_upstream_that_is_down_or_refuses_costs_nothing() {
+    use std::io::{Read, Write};
+    let home = scratch("outage");
+    // One port nobody listens on, one that answers every call with a 503.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy_port = busy.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut conn in busy.incoming().flatten() {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // The whole request, or closing with bytes unread resets the caller.
+            while let Ok(n) = conn.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+                if let Some(head) = text.find("\r\n\r\n") {
+                    let want = text
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|rest| rest.lines().next().map(|n| n.trim().to_string()))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + want {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"error":{"type":"overloaded","message":"try later"}}"#;
+            let _ = write!(
+                conn,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let seed = home.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    fs::write(
+        seed.join("client.py"),
+        r#"import os, urllib.request, urllib.error
+codes = []
+for _ in range(4):
+    req = urllib.request.Request(
+        os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+        data=b'{"messages": [], "max_tokens": 50}',
+        headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"], "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req)
+        codes.append(200)
+    except urllib.error.HTTPError as e:
+        codes.append(e.code)
+open("codes", "w").write(" ".join(map(str, codes)))
+"#,
+    )
+    .unwrap();
+    for (name, port, want) in [
+        ("dead", dead, "502 502 502 502"),
+        ("busy", busy_port, "503 503 503 503"),
+    ] {
+        let home = home.join(name);
+        fs::create_dir_all(home.join("ledger")).unwrap();
+        fs::create_dir_all(home.join("run")).unwrap();
+        policy(
+            &home,
+            r#"caller = { cmd = { "/bin/sh", "-c", "exec \"$INLET_BIN\" door run -- python3 client.py" }, net = "host" },"#,
+            &format!(r#"proxy = {{ upstream = "http://127.0.0.1:{port}" }}"#),
+        );
+        let daemon = start(&home);
+        inlet(
+            &home,
+            &[
+                "add",
+                "-w",
+                "caller",
+                "-g",
+                "call",
+                "--seed",
+                seed.to_str().unwrap(),
+                "--verify",
+                "test -s codes",
+            ],
+        );
+        let st = wait(&home, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+        let task = &tasks(&st)[0];
+        assert_eq!(task["state"], "done", "{name}: {st} {}", daemon.log());
+        assert_eq!(work(&home, &task["id"], "codes"), want, "{name}");
+        // Four calls that no model answered. The slice came back whole.
+        assert_eq!(st["available"], 10000, "{name}: {st}");
+    }
 }

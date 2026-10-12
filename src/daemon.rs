@@ -127,6 +127,7 @@ struct Daemon {
     ledger: Ledger,
     state: State,
     cell_ok: bool,
+    cell_bin: PathBuf,
     hub: Arc<Hub>,
     notes: Receiver<Note>,
     gate_tx: Sender<GateMsg>,
@@ -165,10 +166,21 @@ fn daemonize(home: &Path) -> Result<()> {
         return Err(err("fork"));
     }
     if pid > 0 {
+        // Up means this daemon wrote its own pid, which it does once it has
+        // replayed the ledger and taken its workers back. A socket file alone
+        // may be the last daemon's.
         let sock = paths::operator_sock(home);
-        for _ in 0..150 {
-            if sock.exists() {
+        let want = pid.to_string();
+        for _ in 0..1500 {
+            let mine = fs::read_to_string(paths::pid_file(home)).is_ok_and(|p| p.trim() == want);
+            if mine && sock.exists() {
                 return Ok(());
+            }
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                let log = fs::read_to_string(paths::daemon_log(home)).unwrap_or_default();
+                let why = log.lines().last().unwrap_or("see the daemon log");
+                return Err(err(format!("daemon did not start: {why}")));
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -287,6 +299,18 @@ fn run(home: &Path) -> Result<()> {
     let _ = std::os::unix::fs::symlink("../door/worker.sock", &old);
     listen_socket(&paths::operator_sock(home), cmd_tx, false)?;
     let cell_ok = cell::probe(home);
+    // The binary the cells run is a copy taken now. An upgrade that replaces
+    // the file on disk must not change, or break, a daemon that is running.
+    let cell_bin = home
+        .join("run/bin")
+        .join(format!("inlet-{}", std::process::id()));
+    fs::create_dir_all(home.join("run/bin"))?;
+    for old in fs::read_dir(home.join("run/bin"))?.flatten() {
+        // A keeper still running holds its copy open by its mount, not its name.
+        let _ = fs::remove_file(old.path());
+    }
+    fs::copy("/proc/self/exe", &cell_bin)?;
+    fs::set_permissions(&cell_bin, fs::Permissions::from_mode(0o755))?;
 
     let mut daemon = Daemon {
         home: home.to_path_buf(),
@@ -294,6 +318,7 @@ fn run(home: &Path) -> Result<()> {
         ledger: opened.ledger,
         state,
         cell_ok,
+        cell_bin,
         hub,
         notes,
         gate_tx,
@@ -554,9 +579,6 @@ impl Daemon {
                     continue;
                 };
                 self.hub.insert(id, token, task.budget.tokens);
-                if let Some(parent) = &task.parent {
-                    self.hub.lend(parent, task.budget.tokens);
-                }
                 self.workers.push(Worker {
                     id: id.clone(),
                     pid,
@@ -575,25 +597,34 @@ impl Daemon {
                 finished.push((id.clone(), status));
             }
         }
-        // What each had spent is in the ledger. Children's slices were lent above.
+        // Rebuild each meter from the ledger. A child that is still to settle
+        // has its slice lent out of its parent. One that died with the daemon
+        // has spent it.
         for task in &live {
             if !self.workers.iter().any(|w| w.id == task.id) {
                 continue;
             }
-            let lent: u64 = live
+            let (mut lent, mut gone) = (0u64, 0u64);
+            for child in live
                 .iter()
                 .filter(|c| c.parent.as_deref() == Some(task.id.as_str()))
-                .filter(|c| self.workers.iter().any(|w| w.id == c.id))
-                .map(|c| c.budget.tokens)
-                .sum();
-            let used = self
+                .filter(|c| self.state.purse.open.contains_key(&c.id))
+            {
+                if kept.contains(&child.id) {
+                    lent += child.budget.tokens;
+                } else {
+                    gone += child.budget.tokens;
+                }
+            }
+            let cost = self
                 .state
                 .purse
                 .open
                 .get(&task.id)
-                .map(|slice| slice.used)
+                .map(|slice| slice.cost)
                 .unwrap_or(0);
-            self.hub.charge(&task.id, used.saturating_sub(lent));
+            self.hub.lend(&task.id, lent);
+            self.hub.charge(&task.id, cost.saturating_add(gone));
         }
         (kept, finished, recheck)
     }
@@ -1173,6 +1204,7 @@ impl Daemon {
                 ("prompt".into(), full),
             ],
             stdin: worker.stdin.then(|| "prompt".to_string()),
+            exe: Some(self.cell_bin.clone()),
             keep: keep.then(|| cell::Keep {
                 log: paths::transcript(&self.home, id),
                 status: paths::exit_file(&self.home, id),

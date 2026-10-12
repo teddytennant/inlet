@@ -134,6 +134,8 @@ struct SliceSnap {
     id: String,
     tokens: u64,
     used: u64,
+    #[serde(default)]
+    cost: u64,
     memory_mb: u64,
     memory_lent: u64,
     pids: u64,
@@ -255,6 +257,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
             id: id.clone(),
             tokens: slice.tokens,
             used: slice.used,
+            cost: slice.cost,
             memory_mb: slice.memory_mb,
             memory_lent: slice.memory_lent,
             pids: slice.pids,
@@ -447,6 +450,7 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
             OpenSlice {
                 tokens: slice.tokens,
                 used: slice.used,
+                cost: slice.cost,
                 memory_mb: slice.memory_mb,
                 memory_lent: slice.memory_lent,
                 pids: slice.pids,

@@ -5,7 +5,10 @@ use crate::error::{err, Result};
 #[derive(Debug, Clone)]
 pub struct OpenSlice {
     pub tokens: u64,
+    /// Model spend plus what is lent to children that have not settled.
     pub used: u64,
+    /// Model spend alone, as the proxy reported it.
+    pub cost: u64,
     pub memory_mb: u64,
     pub memory_lent: u64,
     pub pids: u64,
@@ -103,6 +106,7 @@ impl Purse {
             OpenSlice {
                 tokens,
                 used: 0,
+                cost: 0,
                 memory_mb,
                 memory_lent: 0,
                 pids,
@@ -147,6 +151,7 @@ impl Purse {
             OpenSlice {
                 tokens,
                 used: 0,
+                cost: 0,
                 memory_mb,
                 memory_lent: 0,
                 pids,
@@ -183,6 +188,7 @@ impl Purse {
     pub fn note_used(&mut self, id: &str, tokens: u64) {
         if let Some(slice) = self.open.get_mut(id) {
             slice.used = slice.used.saturating_add(tokens).min(slice.tokens);
+            slice.cost = slice.cost.saturating_add(tokens).min(slice.tokens);
         }
     }
 }

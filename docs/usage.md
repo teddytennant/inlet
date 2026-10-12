@@ -83,6 +83,29 @@ A worker's binary has to be somewhere the cell can see: `/usr`, `/bin`, `/nix/st
 
 Nothing has to be done. `kill -9` the daemon, or stop it with SIGTERM, and its workers keep running. Ctrl-C on a foreground daemon is the one that stops them. `inlet up` takes them back: same task, same attempt. One that finished in between is settled from the status its keeper wrote down. A model call that was in flight is lost, so a harness should retry a refused proxy connection for a minute, as `examples/agent.py` does. `adopt = false` in the policy turns this off, and then a dead daemon takes its workers with it.
 
+## keeping the daemon up
+
+inlet does not supervise itself. Put it under whatever supervises the box:
+
+    [Unit]
+    Description=inlet
+    After=network.target
+
+    [Service]
+    ExecStart=%h/.local/bin/inlet up -f
+    Restart=always
+    RestartSec=1
+    KillMode=process
+
+    [Install]
+    WantedBy=default.target
+
+`KillMode=process` matters: systemd then signals the daemon alone, the workers stay up, and the restarted daemon takes them back. The same file is in `contrib/inlet.service`.
+
+To check a build before trusting it with work:
+
+    scripts/chaos.py target/release/inlet --tasks 600 --seconds 240
+
 ## operator skill
 
 A harness with a shell (Pi, Wizard, Claude Code) loads the skill and runs the swarm. Nobody approves its steps. It cannot sign.

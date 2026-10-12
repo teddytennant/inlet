@@ -1,0 +1,13 @@
+[Unit]
+Description=inlet
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/inlet up -f
+Restart=always
+RestartSec=1
+# Signal the daemon alone. The workers stay up and the next daemon takes them back.
+KillMode=process
+
+[Install]
+WantedBy=default.target

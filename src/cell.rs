@@ -69,6 +69,8 @@ pub struct SpawnRequest {
     pub files: Vec<(String, String)>,
     /// Name of an `etc/` file to feed on stdin. `None` is `/dev/null`.
     pub stdin: Option<String>,
+    /// The binary bound into the cell as its door client. `None` is this one.
+    pub exe: Option<PathBuf>,
     /// Let the worker outlive the daemon.
     pub keep: Option<Keep>,
 }
@@ -338,7 +340,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
 
     // The worker's client for the door is this binary.
     let exe = if req.door {
-        std::env::current_exe().ok()
+        req.exe.clone().or_else(|| std::env::current_exe().ok())
     } else {
         None
     };
