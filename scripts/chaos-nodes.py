@@ -230,8 +230,21 @@ time.sleep(2)
 for proc in standbys:
     if proc.poll() is None:
         proc.wait(timeout=10)
-left = [p for p in subprocess.run(["pgrep", "-f", root + "/"], capture_output=True, text=True).stdout.split() if p != str(os.getpid())]
-check(not left, "processes left: %s" % left[:5])
+# Give a daemon that is putting its workers down the time it is allowed.
+left = []
+for _ in range(30):
+    left = [p for p in subprocess.run(["pgrep", "-f", root + "/"], capture_output=True, text=True).stdout.split() if p != str(os.getpid())]
+    if not left:
+        break
+    time.sleep(0.5)
+def what(p):
+    try:
+        return "%s %s" % (p, open("/proc/%s/cmdline" % p).read().replace("\0", " ")[-90:])
+    except OSError:
+        return p
+
+
+check(not left, "processes left: %s" % [what(p) for p in left[:5]])
 for name, home in homes.items():
     for sub in ("run/live", "run/exit", "run/cells"):
         path = os.path.join(home, sub)
