@@ -54,7 +54,19 @@ A worker is a command. The prompt reaches it however it reads one.
 
 The prompt is the preamble, the goal, the verifier that will judge it, and on a retry what the last attempt got wrong. Inside the cell a worker hands work off with `$INLET_BIN door spawn` and collects it with `$INLET_BIN door wait`. See [doc/worker-socket.md](../doc/worker-socket.md).
 
+`examples/agent.py` is a whole worker in 90 lines: it reads the prompt, asks the model through the proxy what to run, and runs it until the model says DONE. `examples/claude-upstream.py` is a model endpoint for a box with a Claude login and no API key.
+
+    python3 examples/claude-upstream.py 8791 &
+
+    proxy   = { upstream = "http://127.0.0.1:8791" }
+    cell    = { ro = { "/path/to/inlet/examples" } }
+    workers = { agent = { cmd = { "python3", "/path/to/inlet/examples/agent.py" } } }
+
 A worker's binary has to be somewhere the cell can see: `/usr`, `/bin`, `/nix/store`, or a path listed in `cell = { ro = { ... } }`.
+
+## when the daemon dies
+
+Nothing has to be done. `kill -9` the daemon and its workers keep running. `inlet up` takes them back: same task, same attempt. One that finished in between is settled from the status its keeper wrote down. A model call that was in flight is lost, so a harness should retry a refused proxy connection for a minute, as `examples/agent.py` does. `adopt = false` in the policy turns this off, and then a dead daemon takes its workers with it.
 
 ## operator skill
 

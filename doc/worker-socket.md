@@ -1,6 +1,8 @@
 # Worker socket
 
-`run/worker.sock` is a unix socket mode `0600`. The daemon accepts a peer
+`door/worker.sock` is a unix socket mode `0600`, alone in its directory so a
+cell can mount it without seeing the operator socket. `run/worker.sock` is a
+link to it. The daemon accepts a peer
 only when `SO_PEERCRED` matches its own uid.
 
 A worker does not have to speak it. `$INLET_BIN door` is the client, and it

@@ -700,10 +700,11 @@ impl State {
 
     /// Admit with no exit: the process is gone. Charge the token slice.
     /// A retry, when the chain allows one, is a fresh task, not a refund.
-    pub fn recover(&self, cfg: &Config, ts: u64) -> Vec<Record> {
+    /// `kept` are the tasks whose worker outlived the daemon.
+    pub fn recover(&self, cfg: &Config, ts: u64, kept: &HashSet<String>) -> Vec<Record> {
         let mut out = Vec::new();
         for task in self.tasks.values() {
-            if !task.state.is_live() {
+            if !task.state.is_live() || kept.contains(&task.id) {
                 continue;
             }
             let used = task.budget.tokens;
@@ -720,7 +721,7 @@ impl State {
         let dead: std::collections::HashSet<&str> = self
             .tasks
             .values()
-            .filter(|t| t.state.is_live())
+            .filter(|t| t.state.is_live() && !kept.contains(&t.id))
             .map(|t| t.id.as_str())
             .collect();
         for task in self.tasks.values() {

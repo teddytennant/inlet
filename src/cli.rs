@@ -823,8 +823,17 @@ inlet door vote <target> <choice> [--channel NAME]";
     let token = std::env::var("INLET_TOKEN").map_err(|_| err("INLET_TOKEN is not set"))?;
     let call = |mut body: Value| -> Result<Value> {
         body["token"] = json!(token);
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .map_err(|e| err(format!("worker socket: {e}")))?;
+        // A refusal means the daemon is restarting. Its workers wait for it.
+        let started = std::time::Instant::now();
+        let mut stream = loop {
+            match std::os::unix::net::UnixStream::connect(&sock) {
+                Ok(stream) => break stream,
+                Err(e) if started.elapsed() > Duration::from_secs(60) => {
+                    return Err(err(format!("worker socket: {e}")));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(250)),
+            }
+        };
         let mut line = serde_json::to_string(&body)?;
         line.push('\n');
         stream.write_all(line.as_bytes())?;

@@ -80,6 +80,12 @@ struct Worker {
     log_len: u64,
     /// Last output or model call. A worker past its `stall` is stopped.
     last_io: Instant,
+    /// Runs under a keeper, which writes the transcript and the wait status.
+    kept: bool,
+    /// Taken back after a restart. Not this daemon's child, so no waitpid.
+    adopted: bool,
+    /// Start time from /proc, so a reused pid is not mistaken for it.
+    start: u64,
 }
 
 struct Check {
@@ -199,8 +205,9 @@ fn guard_ro(home: &Path, policy: &mut Policy) {
     let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     policy.cfg.cell_ro.retain(|path| {
         let real = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-        let reserved = [
-            "/",
+        // The cell puts its own tree at each of these. A bind under one would
+        // be hidden, and the worker would be told a path that is not there.
+        let shadowed = [
             "/etc",
             "/run",
             "/proc",
@@ -211,8 +218,11 @@ fn guard_ro(home: &Path, policy: &mut Policy) {
             "/registry",
         ]
         .iter()
-        .any(|dir| real == Path::new(dir));
-        let ok = !reserved && !home.starts_with(&real) && !real.starts_with(&home);
+        .any(|dir| real.starts_with(dir));
+        let ok = real != Path::new("/")
+            && !shadowed
+            && !home.starts_with(&real)
+            && !real.starts_with(&home);
         if !ok {
             eprintln!("inlet: cell.ro {} refused", path.display());
         }
@@ -271,6 +281,10 @@ fn run(home: &Path) -> Result<()> {
     let (gate_tx, gate_rx) = mpsc::channel();
     install_signals(cmd_tx.clone())?;
     listen_socket(&paths::worker_sock(home), cmd_tx.clone(), true)?;
+    // The old path, for anything on the host that still dials it.
+    let old = home.join("run/worker.sock");
+    let _ = fs::remove_file(&old);
+    let _ = std::os::unix::fs::symlink("../door/worker.sock", &old);
     listen_socket(&paths::operator_sock(home), cmd_tx, false)?;
     let cell_ok = cell::probe(home);
 
@@ -458,9 +472,16 @@ fn same_user(stream: &std::os::unix::net::UnixStream) -> bool {
 impl Daemon {
     fn recover_and_arm(&mut self) -> Result<()> {
         let now = now_ms();
-        let extra = self.state.recover(&self.policy.cfg, now);
+        let (kept, finished, recheck) = self.adopt();
+        let extra = self.state.recover(&self.policy.cfg, now, &kept);
         if !extra.is_empty() {
             self.commit(&extra, true)?;
+        }
+        for (id, status) in finished {
+            self.worker_exited(&id, status)?;
+        }
+        for id in recheck {
+            self.start_check(&id)?;
         }
         if self.state.purse.due(now_ms()) {
             self.commit(
@@ -472,6 +493,102 @@ impl Daemon {
             )?;
         }
         self.settle()
+    }
+
+    /// Find the workers that outlived the last daemon. Returns the tasks that
+    /// are not crashes: still running, finished while nobody watched (with the
+    /// wait status), or stopped mid-verifier (to be checked again).
+    #[allow(clippy::type_complexity)]
+    fn adopt(&mut self) -> (HashSet<String>, Vec<(String, i32)>, Vec<String>) {
+        let mut kept = HashSet::new();
+        let mut finished = Vec::new();
+        let mut recheck = Vec::new();
+        // Ids sort by creation, so a parent is seen before its children.
+        let live: Vec<crate::state::TaskView> = self
+            .state
+            .tasks
+            .values()
+            .filter(|t| t.state.is_live())
+            .cloned()
+            .collect();
+        for task in &live {
+            let id = &task.id;
+            let note: Option<Value> = fs::read(paths::live_file(&self.home, id))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let Some(note) = note else { continue };
+            let pid = note["pid"].as_i64().unwrap_or(0) as i32;
+            let start = note["start"].as_u64().unwrap_or(0);
+            let running = pid > 1 && proc_start(pid) == Some(start);
+            // A child without its parent has nobody to answer to.
+            let orphan = task.parent.as_ref().is_some_and(|p| !kept.contains(p));
+            if orphan || (running && !self.policy.cfg.adopt) {
+                if running {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+                continue;
+            }
+            if note["verify"].as_bool() == Some(true) {
+                kept.insert(id.clone());
+                recheck.push(id.clone());
+            } else if running {
+                let token = note["token"].as_str().unwrap_or("");
+                let Ok(log) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(paths::transcript(&self.home, id))
+                else {
+                    continue;
+                };
+                let Ok(stdout) = File::open("/dev/null") else {
+                    continue;
+                };
+                self.hub.insert(id, token, task.budget.tokens);
+                if let Some(parent) = &task.parent {
+                    self.hub.lend(parent, task.budget.tokens);
+                }
+                self.workers.push(Worker {
+                    id: id.clone(),
+                    pid,
+                    stdout,
+                    log_len: log.metadata().map(|m| m.len()).unwrap_or(0),
+                    log,
+                    last_io: Instant::now(),
+                    kept: true,
+                    adopted: true,
+                    start,
+                });
+                kept.insert(id.clone());
+                eprintln!("inlet: took back {id} (pid {pid})");
+            } else if let Some(status) = read_exit(&self.home, id) {
+                kept.insert(id.clone());
+                finished.push((id.clone(), status));
+            }
+        }
+        // What each had spent is in the ledger. Children's slices were lent above.
+        for task in &live {
+            if !self.workers.iter().any(|w| w.id == task.id) {
+                continue;
+            }
+            let lent: u64 = live
+                .iter()
+                .filter(|c| c.parent.as_deref() == Some(task.id.as_str()))
+                .filter(|c| self.workers.iter().any(|w| w.id == c.id))
+                .map(|c| c.budget.tokens)
+                .sum();
+            let used = self
+                .state
+                .purse
+                .open
+                .get(&task.id)
+                .map(|slice| slice.used)
+                .unwrap_or(0);
+            self.hub.charge(&task.id, used.saturating_sub(lent));
+        }
+        (kept, finished, recheck)
     }
 
     fn commit(&mut self, recs: &[Record], hard: bool) -> Result<()> {
@@ -1014,6 +1131,10 @@ impl Daemon {
         let preamble = prompt::preamble(&ctx, template);
         let full = prompt::compose(&ctx, template);
         let cmd = prompt::fill(&worker.cmd, &full, &task.goal, id)?;
+        let keep = self.policy.cfg.adopt;
+        if keep {
+            fs::create_dir_all(self.home.join("run/exit"))?;
+        }
         let spawned = cell::spawn(&SpawnRequest {
             cmd,
             work,
@@ -1039,7 +1160,23 @@ impl Daemon {
                 ("prompt".into(), full),
             ],
             stdin: worker.stdin.then(|| "prompt".to_string()),
+            keep: keep.then(|| cell::Keep {
+                log: paths::transcript(&self.home, id),
+                status: paths::exit_file(&self.home, id),
+                cap: TRANSCRIPT_CAP,
+                // The daemon times a worker out itself. This is for when it cannot.
+                deadline: task.budget.seconds.saturating_add(15),
+            }),
         })?;
+        let start = proc_start(spawned.pid).unwrap_or(0);
+        if keep {
+            durable_write(
+                &paths::live_file(&self.home, id),
+                json!({"pid": spawned.pid, "start": start, "token": token})
+                    .to_string()
+                    .as_bytes(),
+            )?;
+        }
         self.hub.insert(id, &token, task.budget.tokens);
         if let Some(parent) = &task.parent {
             self.hub.lend(parent, task.budget.tokens);
@@ -1055,6 +1192,9 @@ impl Daemon {
             log,
             log_len: 0,
             last_io: Instant::now(),
+            kept: keep,
+            adopted: false,
+            start,
         });
         self.commit(
             &[Record::Spawn {
@@ -1087,30 +1227,55 @@ impl Daemon {
                 self.complete_check(&id, code)?;
                 continue;
             }
-            let Some(pos) = self.workers.iter().position(|w| w.pid == pid) else {
+            let Some(pos) = self.workers.iter().position(|w| w.pid == pid && !w.adopted) else {
                 continue;
             };
             let id = self.workers[pos].id.clone();
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status) as i32
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
+            // The keeper's own exit says little. It wrote down the worker's.
+            let status = if self.workers[pos].kept {
+                read_exit(&self.home, &id).unwrap_or(status)
             } else {
-                -1
+                status
             };
-            let signalled = libc::WIFSIGNALED(status);
-            let reason = self.pending.remove(&id);
-            match reason.as_deref() {
-                Some("killed") => self.finish(&id, code, "killed", true)?,
-                Some("timeout") => self.finish(&id, code, "timeout", true)?,
-                // Crash keeps the slice. A purse kill refunds whatever the proxy did not spend.
-                Some("purse") => self.finish(&id, code, "purse", true)?,
-                Some(other) => self.finish(&id, code, other, other != "crash")?,
-                None if signalled => self.finish(&id, -1, "crash", false)?,
-                None if code == 0 && self.has_verifier(&id) => self.start_check(&id)?,
-                None if code == 0 => self.finish(&id, 0, "ok", true)?,
-                None => self.finish(&id, code, "exit", true)?,
-            }
+            self.worker_exited(&id, status)?;
+        }
+        // An adopted worker is not a child. Watch for its pid to go.
+        let gone: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|w| w.adopted && proc_start(w.pid) != Some(w.start))
+            .map(|w| w.id.clone())
+            .collect();
+        for id in gone {
+            // No status means its keeper was killed with it.
+            let status = read_exit(&self.home, &id).unwrap_or(libc::SIGKILL);
+            self.worker_exited(&id, status)?;
+        }
+        Ok(())
+    }
+
+    /// `status` is a raw wait status.
+    fn worker_exited(&mut self, id: &str, status: i32) -> Result<()> {
+        let id = id.to_string();
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            -1
+        };
+        let signalled = libc::WIFSIGNALED(status);
+        let reason = self.pending.remove(&id);
+        match reason.as_deref() {
+            Some("killed") => self.finish(&id, code, "killed", true)?,
+            Some("timeout") => self.finish(&id, code, "timeout", true)?,
+            // Crash keeps the slice. A purse kill refunds whatever the proxy did not spend.
+            Some("purse") => self.finish(&id, code, "purse", true)?,
+            Some(other) => self.finish(&id, code, other, other != "crash")?,
+            None if signalled => self.finish(&id, -1, "crash", false)?,
+            None if code == 0 && self.has_verifier(&id) => self.start_check(&id)?,
+            None if code == 0 => self.finish(&id, 0, "ok", true)?,
+            None => self.finish(&id, code, "exit", true)?,
         }
         Ok(())
     }
@@ -1125,6 +1290,11 @@ impl Daemon {
 
     fn start_check(&mut self, id: &str) -> Result<()> {
         self.workers.retain(|worker| worker.id != id);
+        if self.policy.cfg.adopt {
+            // If the daemon dies here, the next one runs the verifier again.
+            let _ = fs::create_dir_all(self.home.join("run/live"));
+            let _ = fs::write(paths::live_file(&self.home, id), r#"{"verify":true}"#);
+        }
         if let Some(task) = self.state.tasks.get_mut(id) {
             task.pid = None;
         }
@@ -1242,6 +1412,8 @@ impl Daemon {
             self.hub.reclaim(&parent, reserved, tokens_used);
         }
         self.workers.retain(|w| w.id != id);
+        let _ = fs::remove_file(paths::live_file(&self.home, id));
+        let _ = fs::remove_file(paths::exit_file(&self.home, id));
         if reason == "killed" {
             self.commit(
                 &[Record::Kill {
@@ -1340,6 +1512,15 @@ impl Daemon {
 
     fn drain_logs(&mut self) {
         for worker in &mut self.workers {
+            if worker.kept {
+                // The keeper writes the transcript. Growth is the sign of life.
+                let len = worker.log.metadata().map(|m| m.len()).unwrap_or(0);
+                if len != worker.log_len {
+                    worker.log_len = len;
+                    worker.last_io = Instant::now();
+                }
+                continue;
+            }
             let mut buf = [0u8; 8192];
             loop {
                 let n = unsafe {
@@ -1873,7 +2054,35 @@ impl Daemon {
         }
         tags.sort();
         tags.dedup();
-        let defaults = &self.policy.cfg.default_budget;
+        let mut defaults = self.policy.cfg.default_budget.clone();
+        // A child that names no budget gets half of what its parent has left.
+        // The policy default is sized for a root, and would never fit inside one.
+        if let Some(slice) = task
+            .parent
+            .as_ref()
+            .and_then(|p| self.state.purse.open.get(p))
+        {
+            let half = |room: u64| (room / 2).max(1);
+            defaults.tokens = defaults
+                .tokens
+                .min(half(slice.tokens.saturating_sub(slice.used)));
+            defaults.memory_mb = defaults
+                .memory_mb
+                .min(half(slice.memory_mb.saturating_sub(slice.memory_lent)));
+            defaults.pids = defaults
+                .pids
+                .min(half(slice.pids.saturating_sub(slice.pids_lent)));
+            let elapsed = task
+                .parent
+                .as_ref()
+                .and_then(|p| self.state.tasks.get(p))
+                .and_then(|t| t.admit_ms)
+                .map(|start| now_ms().saturating_sub(start) / 1000)
+                .unwrap_or(0);
+            defaults.seconds = defaults
+                .seconds
+                .min(slice.seconds.saturating_sub(elapsed).max(1));
+        }
         let budget = Budget {
             tokens: task.tokens.unwrap_or(defaults.tokens),
             seconds: task.seconds.unwrap_or(defaults.seconds),
@@ -2516,6 +2725,22 @@ impl Daemon {
         let _ = fs::remove_file(paths::pid_file(&self.home));
         Ok(())
     }
+}
+
+/// A process's start time, in clock ticks since boot. `None` once it is gone.
+fn proc_start(pid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.get(stat.rfind(')')? + 2..)?.split(' ');
+    if matches!(fields.next()?, "Z" | "X") {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
+}
+
+/// The wait status a keeper left behind.
+fn read_exit(home: &Path, id: &str) -> Option<i32> {
+    let bytes = fs::read(paths::exit_file(home, id)).ok()?;
+    Some(i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?))
 }
 
 fn drain_check(check: &mut Check) {

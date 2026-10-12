@@ -22,7 +22,8 @@ pub fn operator_sock(home: &Path) -> PathBuf {
     home.join("run/operator.sock")
 }
 pub fn worker_sock(home: &Path) -> PathBuf {
-    home.join("run/worker.sock")
+    // Its own directory, which a cell can mount without seeing the operator socket.
+    home.join("door/worker.sock")
 }
 pub fn proxy_sock(home: &Path) -> PathBuf {
     home.join("proxy/proxy.sock")
@@ -64,4 +65,14 @@ pub fn snap_git(home: &Path) -> PathBuf {
 /// What the verifier printed for a task.
 pub fn verify_log(home: &Path, id: &str) -> PathBuf {
     home.join("runs").join(format!("{id}.verify.log"))
+}
+
+/// Where a kept worker's parent leaves the wait status.
+pub fn exit_file(home: &Path, id: &str) -> PathBuf {
+    home.join("run/exit").join(id)
+}
+
+/// What the daemon needs to find a kept worker again: pid, start time, token.
+pub fn live_file(home: &Path, id: &str) -> PathBuf {
+    home.join("run/live").join(id)
 }

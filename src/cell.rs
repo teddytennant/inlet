@@ -66,6 +66,21 @@ pub struct SpawnRequest {
     pub files: Vec<(String, String)>,
     /// Name of an `etc/` file to feed on stdin. `None` is `/dev/null`.
     pub stdin: Option<String>,
+    /// Let the worker outlive the daemon.
+    pub keep: Option<Keep>,
+}
+
+/// A kept worker runs under a small parent that stays in the cell with it.
+/// That parent writes the worker's output to `log` and its wait status to
+/// `status`, so neither needs the daemon to be alive.
+pub struct Keep {
+    pub log: PathBuf,
+    /// Four bytes, the raw wait status, written when the worker exits.
+    pub status: PathBuf,
+    /// Output past this many bytes is dropped.
+    pub cap: u64,
+    /// Seconds after which the worker is killed with no daemon to do it. 0 is never.
+    pub deadline: u64,
 }
 
 pub struct Spawned {
@@ -94,8 +109,6 @@ struct Raw {
     newroot: *const libc::c_char,
     work: *const libc::c_char,
     scratch: *const libc::c_char,
-    proxy: *const libc::c_char,
-    worker: *const libc::c_char,
     devnull: *const libc::c_char,
     devzero: *const libc::c_char,
     devurandom: *const libc::c_char,
@@ -104,8 +117,6 @@ struct Raw {
     nr_null: *const libc::c_char,
     nr_zero: *const libc::c_char,
     nr_urandom: *const libc::c_char,
-    nr_sock: *const libc::c_char,
-    nr_worker: *const libc::c_char,
     nr_old: *const libc::c_char,
     binds: *const Bind,
     n_binds: usize,
@@ -122,8 +133,12 @@ struct Raw {
     memory_mb: u64,
     pids: u64,
     seconds: u64,
-    door: bool,
     in_user_ns: bool,
+    keep: bool,
+    log_fd: i32,
+    status_fd: i32,
+    cap: u64,
+    deadline: u64,
 }
 
 /// Host paths every cell sees read-only: `/usr`, the top-level dirs a
@@ -237,8 +252,8 @@ pub fn probe(home: &Path) -> bool {
         scratch,
         registry,
         root,
+        worker_sock: proxy.clone(),
         proxy_sock: proxy,
-        worker_sock: home.join("run/worker.sock"),
         preamble: "probe\n".into(),
         net_none: true,
         memory_mb: 64,
@@ -314,8 +329,6 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let nr_null = join("dev/null")?;
     let nr_zero = join("dev/zero")?;
     let nr_urandom = join("dev/urandom")?;
-    let nr_sock = join("run/proxy.sock")?;
-    let nr_worker = join("run/worker.sock")?;
     let nr_old = join("old")?;
 
     // The worker's client for the door is this binary.
@@ -333,6 +346,40 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         fs::File::create(req.root.join("run/inlet"))?;
         bind_c.push((c(exe)?, join("run/inlet")?, remount_flags(exe)));
     }
+    if req.door {
+        // The directory, not the socket: a restarted daemon binds a new inode
+        // at the same name, and a kept worker has to find it. Read-only, so a
+        // worker cannot swap the socket out from under its siblings.
+        for (sock, dir, link) in [
+            (&req.proxy_sock, "run/px", "run/proxy.sock"),
+            (&req.worker_sock, "run/wk", "run/worker.sock"),
+        ] {
+            let (Some(parent), Some(name)) = (sock.parent(), sock.file_name()) else {
+                return Err(err("socket path has no directory"));
+            };
+            fs::create_dir_all(req.root.join(dir))?;
+            bind_c.push((c(parent)?, join(dir)?, remount_flags(parent)));
+            let target = Path::new(dir.trim_start_matches("run/")).join(name);
+            std::os::unix::fs::symlink(target, req.root.join(link))?;
+        }
+    }
+    let kept = match &req.keep {
+        Some(keep) => {
+            let open = |path: &Path, flags: i32| -> Result<OwnedFd> {
+                let fd =
+                    unsafe { libc::open(c_path(path)?.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+                if fd < 0 {
+                    return Err(err(format!("open {}", path.display())));
+                }
+                Ok(OwnedFd(fd))
+            };
+            Some((
+                open(&keep.log, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND)?,
+                open(&keep.status, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?,
+            ))
+        }
+        None => None,
+    };
     let binds: Vec<Bind> = bind_c
         .iter()
         .map(|(src, dst, flags)| Bind {
@@ -411,8 +458,6 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         newroot: newroot.as_ptr(),
         work: work.as_ptr(),
         scratch: scratch.as_ptr(),
-        proxy: proxy.as_ptr(),
-        worker: worker.as_ptr(),
         devnull: devnull.as_ptr(),
         devzero: devzero.as_ptr(),
         devurandom: devurandom.as_ptr(),
@@ -421,8 +466,6 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         nr_null: nr_null.as_ptr(),
         nr_zero: nr_zero.as_ptr(),
         nr_urandom: nr_urandom.as_ptr(),
-        nr_sock: nr_sock.as_ptr(),
-        nr_worker: nr_worker.as_ptr(),
         nr_old: nr_old.as_ptr(),
         binds: binds.as_ptr(),
         n_binds: binds.len(),
@@ -438,8 +481,12 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         memory_mb: req.memory_mb,
         pids: req.pids,
         seconds: req.seconds,
-        door: req.door,
         in_user_ns: true,
+        keep: kept.is_some(),
+        log_fd: kept.as_ref().map_or(-1, |k| k.0 .0),
+        status_fd: kept.as_ref().map_or(-1, |k| k.1 .0),
+        cap: req.keep.as_ref().map_or(0, |k| k.cap),
+        deadline: req.keep.as_ref().map_or(0, |k| k.deadline),
     };
 
     let stack = map_stack()?;
@@ -467,6 +514,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     drop(ack_r);
     drop(err_w);
     drop(out_w);
+    drop(kept);
 
     let mut byte = [0u8; 1];
     if read_full(ready_r.0, &mut byte).is_err() {
@@ -506,13 +554,7 @@ fn prepare_root(root: &Path, ro: &[PathBuf]) -> Result<()> {
     ] {
         fs::create_dir_all(root.join(rel))?;
     }
-    for rel in [
-        "dev/null",
-        "dev/zero",
-        "dev/urandom",
-        "run/proxy.sock",
-        "run/worker.sock",
-    ] {
+    for rel in ["dev/null", "dev/zero", "dev/urandom"] {
         File::create(root.join(rel))?;
     }
     for src in ro {
@@ -636,10 +678,12 @@ extern "C" fn trampoline(arg: *mut libc::c_void) -> libc::c_int {
 
 /// Child side. Never returns to Rust.
 unsafe fn child_entry(a: &Raw) -> ! {
-    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-    // pid 1 of a new pid namespace sees getppid() == 0. The fallback fork does not.
-    if !a.in_user_ns && libc::getppid() != a.parent {
-        libc::raise(libc::SIGKILL);
+    if !a.keep {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        // pid 1 of a new pid namespace sees getppid() == 0. The fallback fork does not.
+        if !a.in_user_ns && libc::getppid() != a.parent {
+            libc::raise(libc::SIGKILL);
+        }
     }
     if !a.in_user_ns && libc::unshare(libc::CLONE_NEWUSER) != 0 {
         fail(a.err_w, errno());
@@ -671,6 +715,23 @@ unsafe fn child_entry(a: &Raw) -> ! {
     set_limits(a.memory_mb, a.pids, a.seconds);
     let _ = libc::chdir(if pivoted { c"/work".as_ptr() } else { a.work });
 
+    let mut out = a.out_w;
+    if a.keep {
+        let mut ends = [0i32; 2];
+        if libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            fail(a.err_w, errno());
+        }
+        let worker = libc::fork();
+        if worker < 0 {
+            fail(a.err_w, errno());
+        }
+        if worker > 0 {
+            libc::close(ends[1]);
+            keeper(a, worker, ends[0]);
+        }
+        out = ends[1];
+    }
+
     let input = if pivoted { a.stdin_pivot } else { a.stdin_host };
     let mut stdin = -1;
     if !input.is_null() {
@@ -683,12 +744,98 @@ unsafe fn child_entry(a: &Raw) -> ! {
         libc::dup2(stdin, 0);
         libc::close(stdin);
     }
-    libc::dup2(a.out_w, 1);
-    libc::dup2(a.out_w, 2);
+    libc::dup2(out, 1);
+    libc::dup2(out, 2);
     close_except(a.err_w);
     let envp = if pivoted { a.envp_pivot } else { a.envp_host };
     libc::execve(a.argv.read(), a.argv, envp);
     fail(a.err_w, errno());
+}
+
+/// The kept worker's parent. Holds nothing of the daemon's: not its lock on
+/// the ledger, not its sockets. Copies output to the log, waits, records the
+/// status, and leaves. No allocation; this runs in a forked child.
+unsafe fn keeper(a: &Raw, worker: i32, pipe: i32) -> ! {
+    // Move the three descriptors it needs out of the way, then close the rest.
+    let pipe = libc::fcntl(pipe, libc::F_DUPFD_CLOEXEC, 3);
+    let log = libc::fcntl(a.log_fd, libc::F_DUPFD_CLOEXEC, 3);
+    let status = libc::fcntl(a.status_fd, libc::F_DUPFD_CLOEXEC, 3);
+    let mut held = [pipe, log, status];
+    held.sort_unstable();
+    if held[0] < 3 {
+        libc::_exit(127);
+    }
+    let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+    for fd in 0..3 {
+        if null >= 0 {
+            libc::dup2(null, fd);
+        }
+    }
+    // The setup pipe closes here. The daemon's read of it ends when the
+    // worker's copy does, on exec or on failure.
+    let mut from = 3u32;
+    for fd in held {
+        if fd as u32 > from {
+            libc::syscall(libc::SYS_close_range, from, fd as u32 - 1, 0);
+        }
+        from = fd as u32 + 1;
+    }
+    libc::syscall(libc::SYS_close_range, from, u32::MAX, 0);
+    let flags = libc::fcntl(pipe, libc::F_GETFL);
+    libc::fcntl(pipe, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+    let mut started: libc::timespec = std::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut started);
+    let mut written = 0u64;
+    let mut buf = [0u8; 8192];
+    let mut code = -1;
+    let mut done = false;
+    loop {
+        loop {
+            let n = libc::read(pipe, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            let room = a.cap.saturating_sub(written).min(n as u64) as usize;
+            let mut put = 0;
+            while put < room {
+                let w = libc::write(log, buf[put..].as_ptr().cast(), room - put);
+                if w <= 0 {
+                    break;
+                }
+                put += w as usize;
+            }
+            written += room as u64;
+        }
+        if done {
+            break;
+        }
+        if libc::waitpid(worker, &mut code, libc::WNOHANG) == worker {
+            // One more pass for what it printed last.
+            done = true;
+            continue;
+        }
+        if a.deadline > 0 {
+            let mut now: libc::timespec = std::mem::zeroed();
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+            if (now.tv_sec - started.tv_sec) as u64 > a.deadline {
+                libc::kill(worker, libc::SIGKILL);
+            }
+        }
+        let nap = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        };
+        libc::nanosleep(&nap, ptr::null_mut());
+    }
+    let bytes = code.to_ne_bytes();
+    libc::write(status, bytes.as_ptr().cast(), 4);
+    libc::fsync(status);
+    libc::_exit(if libc::WIFEXITED(code) {
+        libc::WEXITSTATUS(code)
+    } else {
+        128 + libc::WTERMSIG(code)
+    });
 }
 
 unsafe fn pivot(a: &Raw) -> i32 {
@@ -726,10 +873,6 @@ unsafe fn pivot(a: &Raw) -> i32 {
     let _ = mount_bind(a.devnull, a.nr_null, 0);
     let _ = mount_bind(a.devzero, a.nr_zero, 0);
     let _ = mount_bind(a.devurandom, a.nr_urandom, 0);
-    if a.door {
-        let _ = mount_bind(a.proxy, a.nr_sock, 0);
-        let _ = mount_bind(a.worker, a.nr_worker, 0);
-    }
     if libc::syscall(libc::SYS_pivot_root, a.newroot, a.nr_old) != 0 {
         return errno();
     }

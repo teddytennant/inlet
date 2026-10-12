@@ -190,6 +190,8 @@ pub struct Config {
     pub verify_seconds: u64,
     /// Extra host paths every cell sees read-only.
     pub cell_ro: Vec<std::path::PathBuf>,
+    /// Workers outlive a daemon that dies, and the next one takes them back.
+    pub adopt: bool,
 }
 
 pub struct Policy {
@@ -354,6 +356,9 @@ fn read_config(lua: &Lua) -> Result<Config> {
         if table.contains_key("max_backoff")? {
             cfg.retry.max_backoff_ms = read_span(table.get::<Value>("max_backoff")?)?;
         }
+    }
+    if let Some(v) = g.get::<Option<bool>>("adopt")? {
+        cfg.adopt = v;
     }
     if let Some(v) = g.get::<Option<i64>>("verify_seconds")? {
         cfg.verify_seconds = v.max(1) as u64;
@@ -667,6 +672,7 @@ pub fn preset(setup: &str) -> Config {
         },
         verify_seconds: 300,
         cell_ro: Vec::new(),
+        adopt: true,
     }
 }
 

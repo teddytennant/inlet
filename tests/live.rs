@@ -81,6 +81,7 @@ min_ev = 0
 value = 400000
 debug = 1
 unattended = false
+adopt = false
 retry = {{ max = 0, backoff = 0 }}
 default_budget = {{ tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }}
 proxy = {{ {proxy} }}

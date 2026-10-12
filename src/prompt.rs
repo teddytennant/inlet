@@ -24,7 +24,7 @@ Nobody is watching this run and nobody will answer a question. Decide, act, and 
 
 $INLET_REGISTRY holds tools another worker built and a second one verified. Look there before you build.
 
-You have no API keys. Model calls go through the proxy and stop when the budget is spent. You cannot kill, rebudget, or raise caps.
+You have no API keys. Model calls go through the proxy and stop when the budget is spent. If the proxy or the door refuses a connection, the supervisor is restarting: wait and try again. You cannot kill, rebudget, or raise caps.
 ";
 
 /// Bytes of the last verifier output and transcript a retry gets to read.

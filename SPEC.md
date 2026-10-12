@@ -33,7 +33,7 @@ inlet supervisor
           +-- may request a child, which gets a slice of the parent
 ```
 
-Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. Workers carry `PR_SET_PDEATHSIG`, so a crashed daemon leaves none behind.
+Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. A daemon that dies without that chance leaves its workers running, and the next one takes them back. See Desired state.
 
 There are two first-class ways in. The group chat (the TUI, and later a bridge) is where humans and agents talk. The operator agent (Pi or Wizard with the skill) is how a human drives the CLI without living in that room. Both speak the operator socket. Neither is linked into the binary.
 
@@ -82,7 +82,11 @@ A stamped task carries the swarm's name in `plan`. Its own retries run first. A 
 
 `inlet scale` writes the same record with a new `replicas`. It changes how many run at once, not how many run in total. `inlet delete` stops the stamping, and with `--kill` stops what was stamped. Tasks left running no longer belong to a swarm, so a later one of the same name starts from zero. Applying a name again replaces the spec and keeps the counts. Tasks already stamped keep the old template.
 
-After `kill -9`, replay marks every admitted task `crash`, charges its slice, and the two loops do the rest: chains with attempts left retry, and swarms stamp replacements.
+Adoption. The control plane can die without taking the work with it. Each worker runs under a keeper, a parent that stays in the cell with it and holds nothing of the daemon's: not the ledger lock, not a socket. The keeper copies the worker's output to the transcript, and when the worker exits it writes the wait status to `run/exit/<id>`. The daemon notes pid, start time, and token in `run/live/<id>`, mode 0600, outside every cell.
+
+A new daemon reads those notes before it calls anything a crash. A worker still running is taken back: same task, same attempt, same token, with its spend so far read from the ledger. One that finished while nobody watched is settled from its recorded status, and its verifier runs. A task whose verifier was running gets the verifier again. Only a task with no process and no status is a `crash`, and then the two loops do the rest: chains with attempts left retry, and swarms stamp replacements. A child whose parent did not make it is killed.
+
+The sockets are mounted into a cell by directory, read-only, so a kept worker finds the socket the new daemon binds. A model call in flight when the daemon dies is lost, and until the new daemon is up the proxy refuses connections. `inlet door` retries for a minute. A harness should do the same for its model calls, and the preamble says so. With no daemon there is no proxy, so an orphan spends nothing, and its keeper kills it 15 seconds past its `seconds`. Cost records are soft appends, so a crash can lose the last 50ms of a kept worker's spend from its meter. `adopt = false` goes back to `PR_SET_PDEATHSIG`: the workers die with the daemon.
 
 ## Ledger
 
@@ -102,7 +106,7 @@ Snapshots: `inlet snap` writes a git commit of the registry, the signed policy, 
 
 ## Isolation and budgets
 
-A child budget is a slice of the parent, subtracted when the child is admitted, returned on exit for the unused token and time remainder. Memory and pids are reserved for the child's life, not borrowed. The child cannot mint budget from the pool. Spawn depth and live count are hard caps.
+A child budget is a slice of the parent, subtracted when the child is admitted, returned on exit for the unused token and time remainder. A child that names no budget gets half of what its parent has left of tokens, memory, and pids, and no more seconds than the parent has. The policy default is sized for a root and would never fit inside one. Memory and pids are reserved for the child's life, not borrowed. The child cannot mint budget from the pool. Spawn depth and live count are hard caps.
 
 The pool is the root purse: `max_tokens`, `max_memory_mb`, `max_pids` in `caps`, totals for the whole supervisor. A root task's slice comes from it. `max_tokens` is the signed token cap on the status line.
 
@@ -125,7 +129,7 @@ Isolator, picked in config, falling back to rlimit when cgroup writes are refuse
 An isolator bounds resources. It hides nothing from a process running as the same uid. That is the cell's job, and every worker runs in one, under any isolator. The cell is built from Rust before exec, no helper binary:
 
 - User, mount, and pid namespaces, then `pivot_root` into a tree of the private workdir, a read-only view of the registry, its scratch, the worker socket, the proxy socket, and the worker's read-only system paths.
-- The system paths are whatever the host has: `/usr`, the top-level `/bin`, `/lib`, `/lib64`, `/sbin` where they are real directories and not links into `/usr`, and `/nix/store`. `cell.ro` in the policy adds more, at the same path inside. A path that would open the home, or shadow one the cell builds, is refused. Each is remounted read-only with the source mount's own `nosuid`, `nodev`, and atime flags, because a user namespace may not drop them.
+- The system paths are whatever the host has: `/usr`, the top-level `/bin`, `/lib`, `/lib64`, `/sbin` where they are real directories and not links into `/usr`, and `/nix/store`. `cell.ro` in the policy adds more, at the same path inside. A path that would open the home, or that the cell would shadow with its own `/tmp`, `/etc`, `/run`, `/proc`, or `/dev`, is refused at startup with a line in the daemon log. Each is remounted read-only with the source mount's own `nosuid`, `nodev`, and atime flags, because a user namespace may not drop them.
 - `PATH` inside is the daemon's `PATH`, resolved, keeping the entries the cell can see. A bare worker command is looked up there before exec.
 - Landlock (kernel 5.13+, unprivileged) over the same paths, with `no_new_privs`. On kernel 6.12+ the ruleset also scopes signals.
 - A dedicated uid when the daemon runs as root.
@@ -210,7 +214,7 @@ Nobody is watching this run and nobody will answer a question. Decide, act, and 
 
 $INLET_REGISTRY holds tools another worker built and a second one verified. Look there before you build.
 
-You have no API keys. Model calls go through the proxy and stop when the budget is spent. You cannot kill, rebudget, or raise caps.
+You have no API keys. Model calls go through the proxy and stop when the budget is spent. If the proxy or the door refuses a connection, the supervisor is restarting: wait and try again. You cannot kill, rebudget, or raise caps.
 ```
 
 `preamble` in the policy replaces it for every worker, and `preamble` on a worker replaces it for that one. Fields: `{id}`, `{worker}`, `{tags}`, `{tokens}`, `{seconds}`, `{memory_mb}`, `{depth}`, `{max_depth}`, `{attempt}`, `{max_attempts}`, `{verifier}`, `{goal}`.
@@ -374,6 +378,7 @@ human_weight = 4
 min_ev       = 0
 value        = 400000     -- tokens a verified result is worth
 unattended   = true
+adopt        = true       -- workers outlive a dead daemon and are taken back
 debug        = 1
 
 default_budget = { tokens = 200000, seconds = 3600, memory_mb = 1024, pids = 8 }
@@ -456,7 +461,6 @@ The proxy streams. It does not buffer a response to meter it. Meter from the usa
 - A consensus protocol for admission, a chain, or agents voting on caps, budgets, or kills. Board votes are in. Gate votes are out.
 - Embeddings, a vector store, semantic search over the board. Tags are exact match.
 - A step that waits on a person. Approval queues, review gates, an ask that blocks until someone answers. A person sets the boundary before the swarm runs and may talk on the board while it does.
-- Re-adopting a worker after the daemon dies. `PR_SET_PDEATHSIG` takes the workers with it, and the retry loop starts them again from their workdir.
 - A dependency graph in the manifest. A task that needs another's result spawns it as a child and waits.
 - A dashboard, a web UI, a pane per agent.
 - Linking Pi, Wizard, or a model runtime into the binary.
@@ -493,3 +497,4 @@ Each step is usable before the next one exists.
 14. Prompt contract. The goal reaches the worker by argument, stdin, and file. The prompt says how the task is judged. `inlet door` is the worker's client, bound into the cell.
 15. Retry. A failed task becomes a new attempt in the same fsync as its exit, with backoff, the old workdir, and the last failure in the prompt. A short root purse holds the queue. A daemon stop reruns what it interrupted.
 16. Swarms. `apply`, `scale`, `delete`, `get`, `describe`, `logs`. The reconcile loop stamps tasks to the replica count, backs off on a failure streak, and stalls at the limit. Counts survive `kill -9`.
+17. Adoption. A keeper in each cell, the wait status on disk, sockets mounted by directory. A daemon killed with `kill -9` comes back to the same workers.

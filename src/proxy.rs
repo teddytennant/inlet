@@ -104,6 +104,14 @@ impl Hub {
         );
     }
 
+    /// Spend from before a restart, for a worker the daemon took back.
+    pub fn charge(&self, id: &str, n: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(meter) = g.meters.get_mut(id) {
+            meter.spent = meter.spent.saturating_add(n).min(meter.cap);
+        }
+    }
+
     /// Child slice stays out of the parent's room until the child settles.
     pub fn lend(&self, id: &str, n: u64) {
         if n == 0 {

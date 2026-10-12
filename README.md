@@ -11,16 +11,16 @@ Gastown, reimagined. Kubernetes for AI agents.
     inlet apply -f sweep.json
     inlet get swarms
 
-Say what should be running. inlet keeps it running: a failed task is tried again with the verifier's output in its prompt, a swarm is topped back up to its count, and a restarted daemon picks up from the ledger. Nothing waits on a person. [docs/usage.md](docs/usage.md)
+Say what should be running. inlet keeps it running: a failed task is tried again with the verifier's output in its prompt, a swarm is topped back up to its count, and a daemon killed with `kill -9` comes back to the same running workers. Nothing waits on a person. [docs/usage.md](docs/usage.md)
 
     {"kind": "swarm", "name": "sweep", "replicas": 4, "completions": 200,
      "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check"}}
 
-- one static binary, 3.13MB
+- one static binary, 3.14MB
 - scheduler, reconciler, ledger, token proxy, board, tui
-- 16,302 lines in src/
+- 16,799 lines in src/
 - 2.5MB RSS, empty
-- 130 tests
+- 133 tests
 
 Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file.
 

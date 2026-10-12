@@ -467,7 +467,12 @@ fn a_retry_inside_a_swarm_is_not_a_swarm_failure() {
 #[test]
 fn a_swarm_picks_up_after_kill9() {
     let home = scratch("kill9");
-    policy(&home, r#"nap = { cmd = { "sleep", "0.5" } },"#, "");
+    // Without adoption a dead daemon takes its workers with it.
+    policy(
+        &home,
+        r#"nap = { cmd = { "sleep", "0.5" } },"#,
+        "adopt = false",
+    );
     let mut daemon = start(&home);
     manifest(
         &home,
@@ -519,7 +524,7 @@ fn a_parent_hands_off_through_the_door_and_reads_the_answer() {
     let home = scratch("door");
     policy(
         &home,
-        r#"lead = { cmd = { "/bin/sh", "-c", "\"$INLET_BIN\" door spawn -w kid -g 'the part' --verify 'test -f made' --tokens 20 > kid && \"$INLET_BIN\" door wait --timeout 10 > kids && \"$INLET_BIN\" door post lead-finished" } },
+        r#"lead = { cmd = { "/bin/sh", "-c", "\"$INLET_BIN\" door spawn -w kid -g 'the part' --verify 'test -f made' > kid && \"$INLET_BIN\" door wait --timeout 10 > kids && \"$INLET_BIN\" door post lead-finished" } },
         kid = { cmd = { "/bin/sh", "-c", "touch made; \"$INLET_BIN\" door post 'kid found 42'" } },"#,
         "",
     );
@@ -546,6 +551,16 @@ fn a_parent_hands_off_through_the_door_and_reads_the_answer() {
     assert_eq!(lead["state"], "done", "{st} {}", daemon.log());
     let kid = all.iter().find(|t| t["worker"] == "kid").unwrap();
     assert_eq!(kid["parent"], lead["id"]);
+    // It named no budget and got half of what its parent had left.
+    let shown = inlet(&home, &["get", "tasks", "--json"]);
+    let rows: Value = serde_json::from_str(&shown).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["worker"] == "kid")
+        .unwrap();
+    assert_eq!(row["budget_tokens"], 50, "{row}");
     assert_eq!(
         work(&home, &lead["id"], "kid").trim(),
         kid["id"].as_str().unwrap()
@@ -657,4 +672,142 @@ fn a_daemon_stop_reruns_what_it_interrupted() {
     assert_eq!(rerun["attempt"], 1, "{st}");
     assert_eq!(work(&home, &rerun["id"], "runs").lines().count(), 2);
     assert_eq!(st["available"], 10000, "{st}");
+}
+
+fn kill9(daemon: &mut Daemon) {
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+}
+
+#[test]
+fn a_worker_outlives_the_daemon_and_is_taken_back() {
+    let home = scratch("adopt");
+    policy(
+        &home,
+        r#"slow = { cmd = { "/bin/sh", "-c", "echo started; echo $$ > pid; sleep 1.5; echo finished; \"$INLET_BIN\" door post after-the-restart; touch made" } },"#,
+        "",
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "slow",
+            "-g",
+            "ride it out",
+            "--verify",
+            "test -f made",
+        ],
+    );
+    let st = wait(&home, &daemon, |v| v["live"] == 1);
+    let id = tasks(&st)[0]["id"].clone();
+    while work(&home, &id, "pid").is_empty() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    kill9(&mut daemon);
+    thread::sleep(Duration::from_millis(200));
+
+    let daemon = start(&home);
+    assert!(daemon.log().contains("took back"), "{}", daemon.log());
+    let mid = status(&home);
+    assert_eq!(mid["live"], 1, "{mid}");
+    assert_eq!(tasks(&mid).len(), 1, "{mid}");
+    let st = wait(&home, &daemon, |v| tasks(v)[0]["state"] != "running");
+    let task = &tasks(&st)[0];
+    // One task, one attempt, one process from start to finish.
+    assert_eq!(task["state"], "done", "{st} {}", daemon.log());
+    assert_eq!(task["attempt"], 1);
+    assert_eq!(tasks(&st).len(), 1);
+    let log = inlet(&home, &["logs", id.as_str().unwrap()]);
+    assert!(log.starts_with("started\nfinished\n"), "{log}");
+    // Its token still opened the door, on a socket the new daemon bound.
+    assert!(
+        st["posts"].to_string().contains("after-the-restart"),
+        "{st}"
+    );
+    assert_eq!(st["held"], 0, "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+}
+
+#[test]
+fn a_worker_that_finished_while_the_daemon_was_down_still_counts() {
+    let home = scratch("offline");
+    policy(
+        &home,
+        r#"quick = { cmd = { "/bin/sh", "-c", "sleep 0.4; echo $1 > out; exit $1", "sh", "{goal}" } },"#,
+        "",
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &["add", "-w", "quick", "-g", "0", "--verify", "grep -q 0 out"],
+    );
+    inlet(&home, &["add", "-w", "quick", "-g", "3", "--no-verify"]);
+    wait(&home, &daemon, |v| v["live"] == 2);
+    kill9(&mut daemon);
+    thread::sleep(Duration::from_millis(900));
+
+    let daemon = start(&home);
+    let st = wait(&home, &daemon, |v| v["live"] == 0);
+    let all = tasks(&st);
+    assert_eq!(all.len(), 2, "{st}");
+    let ok = all.iter().find(|t| t["goal"] == "0").unwrap();
+    assert_eq!(ok["state"], "done", "{st} {}", daemon.log());
+    // The exit code survived with nobody there to wait for it.
+    let bad = all.iter().find(|t| t["goal"] == "3").unwrap();
+    assert_eq!(
+        (bad["state"].as_str(), bad["reason"].as_str()),
+        (Some("failed"), Some("exit"))
+    );
+    assert_eq!(st["available"], 10000, "{st}");
+}
+
+#[test]
+fn a_kept_worker_cannot_outrun_its_clock_or_a_kill() {
+    let home = scratch("clock");
+    policy(
+        &home,
+        r#"hang = { cmd = { "/bin/sh", "-c", "echo $$ > pid; sleep 60" } },"#,
+        "",
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "hang",
+            "-g",
+            "late",
+            "--no-verify",
+            "--seconds",
+            "2",
+        ],
+    );
+    inlet(
+        &home,
+        &["add", "-w", "hang", "-g", "unwanted", "--no-verify"],
+    );
+    let st = wait(&home, &daemon, |v| v["live"] == 2);
+    let unwanted = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "unwanted")
+        .unwrap();
+    kill9(&mut daemon);
+
+    let daemon = start(&home);
+    inlet(&home, &["kill", unwanted["id"].as_str().unwrap()]);
+    let st = wait(&home, &daemon, |v| v["live"] == 0);
+    let all = tasks(&st);
+    let late = all.iter().find(|t| t["goal"] == "late").unwrap();
+    assert_eq!(late["reason"], "timeout", "{st}");
+    let gone = all.iter().find(|t| t["goal"] == "unwanted").unwrap();
+    assert_eq!(gone["state"], "killed", "{st}");
+    assert!(run(&home, &["status"]).status.success());
+    // Nothing of either is left on the host.
+    for task in &all {
+        let live = home.join("run/live").join(task["id"].as_str().unwrap());
+        assert!(!live.exists(), "{}", live.display());
+    }
 }
