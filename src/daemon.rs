@@ -861,6 +861,7 @@ impl Daemon {
             task_id: id.to_string(),
             cgroup: placement.cgroup,
             door: true,
+            ..Default::default()
         })?;
         self.hub.insert(id, &token, task.budget.tokens);
         if let Some(parent) = &task.parent {
@@ -975,6 +976,7 @@ impl Daemon {
             task_id: id.to_string(),
             cgroup: None,
             door: false,
+            ..Default::default()
         }) {
             Ok(child) => {
                 self.checks.push(Check {

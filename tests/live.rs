@@ -83,7 +83,7 @@ debug = 1
 default_budget = {{ tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }}
 proxy = {{ {proxy} }}
 workers = {{
-  sleeper = {{ cmd = {{ "/bin/sleep", "60" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+  sleeper = {{ cmd = {{ "sleep", "60" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
   {extra_workers}
 }}
 function admit(ctx)
@@ -423,7 +423,7 @@ fn crash_requeue_is_a_new_admission() {
     policy(
         &home,
         &base_policy(
-            r#"prover = { cmd = { "/usr/bin/python3", "-c", "import os; os.abort()" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
+            r#"prover = { cmd = { "python3", "-c", "import os; os.abort()" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
             r#"return "allow""#,
             "max_tokens = 250,",
             "",
@@ -747,7 +747,7 @@ fn code_crash_stays_failed() {
     policy(
         &home,
         &base_policy(
-            r#"bomber = { cmd = { "/usr/bin/python3", "-c", "import os; os.abort()" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"bomber = { cmd = { "python3", "-c", "import os; os.abort()" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -794,7 +794,7 @@ fn clean_exit_refunds_the_slice() {
     policy(
         &home,
         &base_policy(
-            r#"done = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"done = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -943,7 +943,7 @@ fn verifier_lands_on_the_ledger() {
         &home,
         &base_policy(
             r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" }, tags = { "code" }, net = "host", on_crash = "fail" },
-            bad = { cmd = { "/bin/false" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            bad = { cmd = { "false" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -990,7 +990,7 @@ fn verifier_lands_on_the_ledger() {
             "--goal",
             "fail",
             "--verify",
-            "/bin/false",
+            "false",
             "--tokens",
             "40",
             "--seconds",
@@ -1021,7 +1021,7 @@ fn verifier_lands_on_the_ledger() {
             "--goal",
             "exit",
             "--verify",
-            "/bin/true",
+            "true",
             "--tokens",
             "40",
             "--seconds",
@@ -1051,7 +1051,7 @@ fn child_slice_or_deny() {
         &home,
         &base_policy(
             r#"holder = { cmd = { "/bin/sh", "-c", "if [ -S /run/worker.sock ]; then echo DOOROK > /work/door; fi; sleep 40" }, tags = { "code" }, net = "host", on_crash = "fail" },
-            kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            kid = { cmd = { "sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -1109,7 +1109,7 @@ fn child_slice_or_deny() {
             "token": token,
             "worker": "kid",
             "goal": "nap",
-            "verify": "/bin/true",
+            "verify": "true",
             "tokens": 30,
             "seconds": 10,
             "memory_mb": 16,
@@ -1170,8 +1170,8 @@ fn child_slice_or_deny() {
     policy(
         &home,
         &base_policy(
-            r#"holder = { cmd = { "/bin/sleep", "40" }, tags = { "code" }, net = "host", on_crash = "fail" },
-            kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"holder = { cmd = { "sleep", "40" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            kid = { cmd = { "sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -1205,7 +1205,7 @@ fn child_slice_or_deny() {
     let spawned = worker_rpc(
         &home,
         serde_json::json!({
-            "op":"spawn","token": token, "worker":"kid","goal":"too big","verify":"/bin/true",
+            "op":"spawn","token": token, "worker":"kid","goal":"too big","verify":"true",
             "tokens": 200, "seconds": 10, "memory_mb": 16, "pids": 2
         }),
     );
@@ -1239,8 +1239,8 @@ fn child_slice_or_deny() {
     policy(
         &home,
         &base_policy(
-            r#"holder = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
-            kid = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"holder = { cmd = { "sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            kid = { cmd = { "sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_depth = 1,",
             "",
@@ -1270,7 +1270,7 @@ fn child_slice_or_deny() {
     let spawned = worker_rpc(
         &home,
         serde_json::json!({
-            "op":"spawn","token": token, "worker":"kid","goal":"too deep","verify":"/bin/true",
+            "op":"spawn","token": token, "worker":"kid","goal":"too deep","verify":"true",
             "tokens": 10, "seconds": 5, "memory_mb": 16, "pids": 2
         }),
     );
@@ -1366,7 +1366,7 @@ fn second_run_readies_then_pin_promotes() {
     policy(
         &home,
         &base_policy(
-            r#"nap = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
+            r#"nap = { cmd = { "sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
             checker = { cmd = { "/bin/sh", "-c", "./run" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
@@ -1463,9 +1463,9 @@ fn second_run_readies_then_pin_promotes() {
 fn unattended_promotes_and_a_stub_does_not() {
     let home = scratch("auto");
     let mut body = base_policy(
-        r#"nap = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+        r#"nap = { cmd = { "sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
         checker = { cmd = { "/bin/sh", "-c", "./run" }, tags = { "code" }, net = "host", on_crash = "fail" },
-        plain = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+        plain = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
         r#"return "allow""#,
         "max_tokens = 1000,",
         "",
@@ -1562,8 +1562,8 @@ fn unattended_promotes_and_a_stub_does_not() {
 
     let home = scratch("stub");
     let mut body = base_policy(
-        r#"nap = { cmd = { "/bin/sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
-        plain = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+        r#"nap = { cmd = { "sleep", "20" }, tags = { "code" }, net = "host", on_crash = "fail" },
+        plain = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
         r#"return "allow""#,
         "",
         "",
@@ -1593,7 +1593,7 @@ fn unattended_promotes_and_a_stub_does_not() {
     let token = token_of(tasks(&st)[0]["pid"].as_i64().unwrap());
     worker_rpc(
         &home,
-        serde_json::json!({"op":"draft","token": token, "name":"noop","run": recipe_run(), "verifier": "/bin/true"}),
+        serde_json::json!({"op":"draft","token": token, "name":"noop","run": recipe_run(), "verifier": "true"}),
     );
     inlet(
         &home,
@@ -1604,7 +1604,7 @@ fn unattended_promotes_and_a_stub_does_not() {
             "--goal",
             "second",
             "--verify",
-            "/bin/true",
+            "true",
             "--recipe",
             "noop",
             "--tokens",
@@ -1649,7 +1649,7 @@ fn author_does_not_promote_and_the_cell_keeps_the_preamble() {
         &base_policy(
             &format!(
                 r#"hold = {{ cmd = {{ "/bin/sh", "-c", {script:?} }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
-                plain = {{ cmd = {{ "/bin/true" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
+                plain = {{ cmd = {{ "true" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
                 look = {{ cmd = {{ "/bin/sh", "-c", "if [ -f /registry/recipes/add/run ]; then echo SEEN > /work/seen; else echo MISSING > /work/seen; fi" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},
                 watch = {{ cmd = {{ "/bin/sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do if [ -f /registry/recipes/add/run ]; then echo SEEN > /work/seen; exit 0; fi; sleep 0.2; done; echo HIDDEN > /work/seen; sleep 15" }}, tags = {{ "code" }}, net = "host", on_crash = "fail" }},"#
             ),
@@ -1965,7 +1965,7 @@ fn decision_sends_headers_and_caches() {
     policy(
         &home,
         &decision_policy(
-            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"quick = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             fake.port,
             "",
         ),
@@ -2227,7 +2227,7 @@ fn decision_down_lets_the_verifier_finish() {
     policy(
         &home,
         &decision_policy(
-            r#"paced = { cmd = { "/bin/sleep", "1" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"paced = { cmd = { "sleep", "1" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             fake.port,
             "",
         ),
@@ -2381,7 +2381,7 @@ fn decision_spend_survives_kill9() {
     policy(
         &home,
         &decision_policy(
-            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"quick = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             fake.port,
             "  purse_tokens = 40,\n",
         ),
@@ -2636,7 +2636,7 @@ debug = 1
 preamble = "SIGNED-PREAMBLE {id}\n"
 default_budget = { tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }
 workers = {
-  sleeper = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
+  sleeper = { cmd = { "sleep", "30" }, tags = { "code" }, net = "host", on_crash = "fail" },
   peek = { cmd = { "/bin/sh", "-c", "cp /etc/preamble /work/seen" }, tags = { "code" }, net = "host", on_crash = "fail" },
 }
 function admit(ctx)
@@ -2754,7 +2754,7 @@ fn constraints_bind_until_a_signed_clear() {
     policy(
         &home,
         &base_policy(
-            r#"prover = { cmd = { "/bin/true" }, tags = { "math" }, net = "host", on_crash = "fail" },"#,
+            r#"prover = { cmd = { "true" }, tags = { "math" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 2000,",
             "",
@@ -3198,7 +3198,7 @@ fn snap_replays_from_the_offset() {
     policy(
         &home,
         &decision_policy(
-            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"quick = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             fake.port,
             "",
         ),
@@ -3430,7 +3430,7 @@ fn losing_fence_does_not_spend() {
     policy(
         &home,
         &base_policy(
-            r#"quick = { cmd = { "/bin/true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
+            r#"quick = { cmd = { "true" }, tags = { "code" }, net = "host", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",
@@ -3788,7 +3788,7 @@ fn verifier_cannot_touch_the_host() {
         &home,
         &base_policy(
             &format!(
-                r#"quick = {{ cmd = {{ "/bin/true" }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},
+                r#"quick = {{ cmd = {{ "true" }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},
                 writer = {{ cmd = {{ "/bin/sh", "-c", {check:?} }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},
                 py = {{ cmd = {{ "/bin/sh", "-c", {py:?} }}, tags = {{ "code" }}, net = "none", on_crash = "fail" }},"#
             ),
@@ -3941,7 +3941,7 @@ fn verifier_cannot_touch_the_host() {
 
 #[test]
 fn cell_cannot_signal_the_host() {
-    let mut decoy = Command::new("/bin/sleep").arg("120").spawn().unwrap();
+    let mut decoy = Command::new("sleep").arg("120").spawn().unwrap();
     let decoy_pid = decoy.id();
     let home = scratch("signal");
     let script = format!(
@@ -4262,7 +4262,7 @@ fn child_slice_shrinks_the_parent_proxy() {
     policy(
         &home,
         &base_policy(
-            r#"kid = { cmd = { "/bin/sleep", "30" }, tags = { "code" }, net = "none", on_crash = "fail" },"#,
+            r#"kid = { cmd = { "sleep", "30" }, tags = { "code" }, net = "none", on_crash = "fail" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             &format!("upstream = \"http://127.0.0.1:{port}\", key = \"test-key\""),
@@ -4302,7 +4302,7 @@ fn child_slice_shrinks_the_parent_proxy() {
             "token": token,
             "worker": "kid",
             "goal": "nap",
-            "verify": "/bin/true",
+            "verify": "true",
             "tokens": 40,
             "seconds": 10
         }),
@@ -4501,7 +4501,7 @@ fn channels_follow_tags() {
     policy(
         &home,
         &base_policy(
-            r#"mathy = { cmd = { "/bin/sleep", "60" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
+            r#"mathy = { cmd = { "sleep", "60" }, tags = { "math" }, net = "none", on_crash = "requeue" },"#,
             r#"return "allow""#,
             "max_tokens = 1000,",
             "",

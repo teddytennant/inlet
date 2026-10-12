@@ -63,8 +63,8 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 const WORKER_CHOICES: &[(&str, &str)] = &[
-    ("check", "/bin/true"),
-    ("sleeper", "/bin/sleep 60"),
+    ("check", "true"),
+    ("sleeper", "sleep 60"),
     ("pi", "pi --mode rpc"),
     ("prover", "prover"),
 ];
@@ -72,14 +72,14 @@ const WORKER_CHOICES: &[(&str, &str)] = &[
 const WORKER_PRESETS: &[WorkerPreset] = &[
     WorkerPreset {
         name: "check",
-        cmd: &["/bin/true"],
+        cmd: &["true"],
         tags: &["code"],
         net: "host",
         on_crash: "fail",
     },
     WorkerPreset {
         name: "sleeper",
-        cmd: &["/bin/sleep", "60"],
+        cmd: &["sleep", "60"],
         tags: &["code"],
         net: "host",
         on_crash: "fail",
@@ -279,7 +279,7 @@ fn answers_from_env() -> Result<Answers> {
     config::parse_period(&period)?;
     let budget = env_u64("INLET_BUDGET")?.unwrap_or(200_000);
     let worker = check_worker(&env_string("INLET_WORKER").unwrap_or_else(|| "check".into()))?;
-    let cmd = split_cmd(&env_string("INLET_WORKER_CMD").unwrap_or_else(|| "/bin/true".into()))?;
+    let cmd = split_cmd(&env_string("INLET_WORKER_CMD").unwrap_or_else(|| "true".into()))?;
     let passphrase = match env_string("INLET_PASSPHRASE") {
         Some(value) if value.len() < 4 => return Err(err("passphrase too short")),
         Some(value) => Some(value),
@@ -863,7 +863,7 @@ fn patch_worker_pass(
             .workers
             .get(&name)
             .map(|worker| worker.cmd.clone())
-            .unwrap_or_else(|| vec!["/bin/true".into()])
+            .unwrap_or_else(|| vec!["true".into()])
     };
     let rendered = cmd
         .iter()
@@ -1404,7 +1404,7 @@ fn load_fields(home: &Path) -> Result<Vec<Field>> {
     let cfg = &policy.cfg;
     let (worker, command) = match cfg.workers.iter().next() {
         Some((name, worker)) => (name.clone(), worker.cmd.join(" ")),
-        None => ("check".into(), "/bin/true".into()),
+        None => ("check".into(), "true".into()),
     };
     let cell = if crate::cell::probe(home) {
         "ready"
@@ -2184,7 +2184,7 @@ mod tests {
             period: "1d".into(),
             budget: 200_000,
             worker: worker.into(),
-            cmd: vec!["/bin/true".into()],
+            cmd: vec!["true".into()],
             tags: vec!["code".into()],
             net: "host".into(),
             on_crash: "fail".into(),
@@ -2198,7 +2198,7 @@ mod tests {
     fn prover_preset_is_a_math_worker() {
         let body = render(&sample_answers("check"));
         assert!(body.contains(
-            "check = { cmd = { \"/bin/true\" }, tags = { \"code\" }, net = \"host\", on_crash = \"fail\" }"
+            "check = { cmd = { \"true\" }, tags = { \"code\" }, net = \"host\", on_crash = \"fail\" }"
         ));
         Policy::parse(&body).unwrap();
         let mut answers = sample_answers("prover");

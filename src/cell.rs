@@ -39,6 +39,7 @@ struct PathBeneath {
     parent_fd: i32,
 }
 
+#[derive(Default)]
 pub struct SpawnRequest {
     pub cmd: Vec<String>,
     pub work: PathBuf,
@@ -57,12 +58,31 @@ pub struct SpawnRequest {
     pub cgroup: Option<PathBuf>,
     /// Worker door: proxy socket, worker socket, and a token. Verifiers leave this off.
     pub door: bool,
+    /// Extra read-only host paths, visible at the same path inside.
+    pub ro: Vec<PathBuf>,
+    /// Extra environment for the worker.
+    pub env: Vec<(String, String)>,
+    /// Files written under the cell's `etc/`, next to `preamble`.
+    pub files: Vec<(String, String)>,
+    /// Name of an `etc/` file to feed on stdin. `None` is `/dev/null`.
+    pub stdin: Option<String>,
 }
 
 pub struct Spawned {
     pub pid: i32,
     pub stdout: File,
 }
+
+/// One read-only bind into the new root. `flags` carries the source mount's
+/// locked flags, or a remount inside a user namespace is refused.
+#[repr(C)]
+struct Bind {
+    src: *const libc::c_char,
+    dst: *const libc::c_char,
+    flags: libc::c_ulong,
+}
+
+type Rule = (*const libc::c_char, u64);
 
 struct Raw {
     parent: i32,
@@ -74,14 +94,11 @@ struct Raw {
     newroot: *const libc::c_char,
     work: *const libc::c_char,
     scratch: *const libc::c_char,
-    registry: *const libc::c_char,
     proxy: *const libc::c_char,
     worker: *const libc::c_char,
-    usr: *const libc::c_char,
     devnull: *const libc::c_char,
     devzero: *const libc::c_char,
     devurandom: *const libc::c_char,
-    nr_usr: *const libc::c_char,
     nr_work: *const libc::c_char,
     nr_scratch: *const libc::c_char,
     nr_null: *const libc::c_char,
@@ -90,13 +107,110 @@ struct Raw {
     nr_sock: *const libc::c_char,
     nr_worker: *const libc::c_char,
     nr_old: *const libc::c_char,
+    binds: *const Bind,
+    n_binds: usize,
+    rules_pivot: *const Rule,
+    n_rules_pivot: usize,
+    rules_host: *const Rule,
+    n_rules_host: usize,
     argv: *const *const libc::c_char,
-    envp: *const *const libc::c_char,
+    envp_pivot: *const *const libc::c_char,
+    envp_host: *const *const libc::c_char,
+    /// Null is `/dev/null`.
+    stdin_pivot: *const libc::c_char,
+    stdin_host: *const libc::c_char,
     memory_mb: u64,
     pids: u64,
     seconds: u64,
     door: bool,
     in_user_ns: bool,
+}
+
+/// Host paths every cell sees read-only: `/usr`, the top-level dirs a
+/// merged-usr distro symlinks into it when they are real, and the Nix store.
+pub fn system_ro() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/lib32",
+        "/nix/store",
+    ] {
+        let path = Path::new(dir);
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir()) {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
+}
+
+fn visible(req: &SpawnRequest) -> Vec<PathBuf> {
+    let mut out = system_ro();
+    for path in &req.ro {
+        if path.is_absolute() && path.exists() && !out.contains(path) {
+            out.push(path.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The daemon's PATH, resolved, keeping the entries a cell can see.
+pub fn cell_path(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let host = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&host).chain(["/usr/bin".into(), "/bin".into()]) {
+        let Ok(real) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        for seen in [real, dir] {
+            if roots.iter().any(|root| seen.starts_with(root)) && !out.contains(&seen) {
+                out.push(seen);
+            }
+        }
+    }
+    out
+}
+
+/// execve does not search PATH. A bare name is looked up where the cell can see it.
+fn resolve_cmd(name: &str, path: &[PathBuf]) -> Result<String> {
+    if name.contains('/') {
+        return Ok(name.to_string());
+    }
+    for dir in path {
+        let full = dir.join(name);
+        if full.is_file() {
+            return Ok(full.to_string_lossy().into_owned());
+        }
+    }
+    Err(err(format!("worker command not found: {name}")))
+}
+
+fn remount_flags(path: &Path) -> libc::c_ulong {
+    let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
+    let Ok(c) = c_path(path) else {
+        return flags;
+    };
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+        return flags;
+    }
+    for (have, want) in [
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (libc::ST_RELATIME, libc::MS_RELATIME),
+    ] {
+        if vfs.f_flag & have != 0 {
+            flags |= want;
+        }
+    }
+    flags
 }
 
 /// Returns false when neither a mount namespace nor Landlock can be entered.
@@ -114,13 +228,8 @@ pub fn probe(home: &Path) -> bool {
     if listener.is_none() {
         return false;
     }
-    let true_bin = if Path::new("/bin/true").exists() {
-        "/bin/true"
-    } else {
-        "/usr/bin/true"
-    };
     let req = SpawnRequest {
-        cmd: vec![true_bin.into()],
+        cmd: vec!["true".into()],
         work,
         scratch,
         registry,
@@ -136,6 +245,7 @@ pub fn probe(home: &Path) -> bool {
         task_id: "probe".into(),
         cgroup: None,
         door: true,
+        ..Default::default()
     };
     match spawn(&req) {
         Ok(child) => {
@@ -158,12 +268,22 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     if req.cmd.is_empty() {
         return Err(err("empty worker command"));
     }
+    let ro = visible(req);
+    let path = cell_path(&ro);
+    let mut cmd = req.cmd.clone();
+    cmd[0] = resolve_cmd(&cmd[0], &path)?;
     fs::create_dir_all(&req.work)?;
     fs::create_dir_all(&req.scratch)?;
     fs::create_dir_all(&req.registry)?;
-    prepare_root(&req.root)?;
+    prepare_root(&req.root, &ro)?;
     crate::registry::snapshot(&req.registry, &req.root.join("registry"))?;
     fs::write(req.root.join("etc/preamble"), &req.preamble)?;
+    for (name, body) in &req.files {
+        if name.contains('/') || name.starts_with('.') {
+            return Err(err("bad cell file name"));
+        }
+        fs::write(req.root.join("etc").join(name), body)?;
+    }
     if unsafe { libc::geteuid() } == 0 {
         let _ = chown(&req.work, Some(65534), Some(65534));
         let _ = chown(&req.scratch, Some(65534), Some(65534));
@@ -179,14 +299,13 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let work = c(&req.work)?;
     let scratch = c(&req.scratch)?;
     let registry = c(&req.root.join("registry"))?;
+    let host_etc = c(&req.root.join("etc"))?;
     let proxy = c(&req.proxy_sock)?;
     let worker = c(&req.worker_sock)?;
-    let usr = c_path(Path::new("/usr"))?;
     let devnull = c_path(Path::new("/dev/null"))?;
     let devzero = c_path(Path::new("/dev/zero"))?;
     let devurandom = c_path(Path::new("/dev/urandom"))?;
     let join = |name: &str| c_path(&req.root.join(name));
-    let nr_usr = join("usr")?;
     let nr_work = join("work")?;
     let nr_scratch = join("scratch")?;
     let nr_null = join("dev/null")?;
@@ -196,13 +315,88 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     let nr_worker = join("run/worker.sock")?;
     let nr_old = join("old")?;
 
-    let argv_c = c_strings(&req.cmd)?;
+    // The worker's client for the door is this binary.
+    let exe = if req.door {
+        std::env::current_exe().ok()
+    } else {
+        None
+    };
+    let mut bind_c: Vec<(CString, CString, libc::c_ulong)> = Vec::new();
+    for src in &ro {
+        let rel = src.strip_prefix("/").unwrap_or(src);
+        bind_c.push((c(src)?, c(&req.root.join(rel))?, remount_flags(src)));
+    }
+    if let Some(exe) = &exe {
+        fs::File::create(req.root.join("run/inlet"))?;
+        bind_c.push((c(exe)?, join("run/inlet")?, remount_flags(exe)));
+    }
+    let binds: Vec<Bind> = bind_c
+        .iter()
+        .map(|(src, dst, flags)| Bind {
+            src: src.as_ptr(),
+            dst: dst.as_ptr(),
+            flags: *flags,
+        })
+        .collect();
+
+    let ro_c: Vec<CString> = ro.iter().map(|p| c(p)).collect::<Result<_>>()?;
+    let exe_c = match &exe {
+        Some(exe) => Some(c(exe)?),
+        None => None,
+    };
+    let run_access = if req.door { FS_ALL } else { FS_READ };
+    let mut rules_pivot: Vec<Rule> = ro_c.iter().map(|p| (p.as_ptr(), FS_READ)).collect();
+    rules_pivot.extend([
+        (c"/work".as_ptr(), FS_ALL),
+        (c"/scratch".as_ptr(), FS_ALL),
+        (c"/registry".as_ptr(), FS_READ),
+        (c"/proc".as_ptr(), FS_READ),
+        (c"/dev".as_ptr(), FS_ALL),
+        (c"/tmp".as_ptr(), FS_ALL),
+        (c"/etc".as_ptr(), FS_READ),
+        (c"/run".as_ptr(), run_access),
+    ]);
+    let mut rules_host: Vec<Rule> = ro_c.iter().map(|p| (p.as_ptr(), FS_READ)).collect();
+    rules_host.extend([
+        (work.as_ptr(), FS_ALL),
+        (scratch.as_ptr(), FS_ALL),
+        (registry.as_ptr(), FS_READ),
+        (host_etc.as_ptr(), FS_READ),
+        (c"/proc".as_ptr(), FS_READ),
+        (c"/dev".as_ptr(), FS_ALL),
+        (c"/etc".as_ptr(), FS_READ),
+        (c"/tmp".as_ptr(), FS_ALL),
+    ]);
+    if req.door {
+        rules_host.push((proxy.as_ptr(), FS_ALL));
+        rules_host.push((worker.as_ptr(), FS_ALL));
+        if let Some(exe) = &exe_c {
+            rules_host.push((exe.as_ptr(), FS_READ));
+        }
+    }
+
+    let argv_c = c_strings(&cmd)?;
     let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv.push(ptr::null());
-    let env_owned = env_strings(&req.token, &req.task_id, req.door);
-    let env_c = c_strings(&env_owned)?;
-    let mut envp: Vec<*const libc::c_char> = env_c.iter().map(|s| s.as_ptr()).collect();
-    envp.push(ptr::null());
+    let path_env = std::env::join_paths(&path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/usr/bin:/bin".into());
+    let env_pivot_c = c_strings(&env_strings(req, &path_env, true, exe.as_deref()))?;
+    let env_host_c = c_strings(&env_strings(req, &path_env, false, exe.as_deref()))?;
+    let ptrs = |strings: &[CString]| {
+        let mut out: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+        out.push(ptr::null());
+        out
+    };
+    let envp_pivot = ptrs(&env_pivot_c);
+    let envp_host = ptrs(&env_host_c);
+    let stdin_c = match &req.stdin {
+        Some(name) => Some((
+            c(&Path::new("/etc").join(name))?,
+            c(&req.root.join("etc").join(name))?,
+        )),
+        None => None,
+    };
 
     let mut raw = Raw {
         parent: unsafe { libc::getpid() },
@@ -214,14 +408,11 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         newroot: newroot.as_ptr(),
         work: work.as_ptr(),
         scratch: scratch.as_ptr(),
-        registry: registry.as_ptr(),
         proxy: proxy.as_ptr(),
         worker: worker.as_ptr(),
-        usr: usr.as_ptr(),
         devnull: devnull.as_ptr(),
         devzero: devzero.as_ptr(),
         devurandom: devurandom.as_ptr(),
-        nr_usr: nr_usr.as_ptr(),
         nr_work: nr_work.as_ptr(),
         nr_scratch: nr_scratch.as_ptr(),
         nr_null: nr_null.as_ptr(),
@@ -230,8 +421,17 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         nr_sock: nr_sock.as_ptr(),
         nr_worker: nr_worker.as_ptr(),
         nr_old: nr_old.as_ptr(),
+        binds: binds.as_ptr(),
+        n_binds: binds.len(),
+        rules_pivot: rules_pivot.as_ptr(),
+        n_rules_pivot: rules_pivot.len(),
+        rules_host: rules_host.as_ptr(),
+        n_rules_host: rules_host.len(),
         argv: argv.as_ptr(),
-        envp: envp.as_ptr(),
+        envp_pivot: envp_pivot.as_ptr(),
+        envp_host: envp_host.as_ptr(),
+        stdin_pivot: stdin_c.as_ref().map_or(ptr::null(), |s| s.0.as_ptr()),
+        stdin_host: stdin_c.as_ref().map_or(ptr::null(), |s| s.1.as_ptr()),
         memory_mb: req.memory_mb,
         pids: req.pids,
         seconds: req.seconds,
@@ -296,7 +496,7 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
     Ok(Spawned { pid, stdout })
 }
 
-fn prepare_root(root: &Path) -> Result<()> {
+fn prepare_root(root: &Path, ro: &[PathBuf]) -> Result<()> {
     let _ = fs::remove_dir_all(root);
     for rel in [
         "usr", "work", "scratch", "registry", "proc", "dev", "tmp", "etc", "run", "old",
@@ -312,6 +512,18 @@ fn prepare_root(root: &Path) -> Result<()> {
     ] {
         File::create(root.join(rel))?;
     }
+    for src in ro {
+        let dst = root.join(src.strip_prefix("/").unwrap_or(src));
+        if src.is_dir() {
+            fs::create_dir_all(&dst)?;
+        } else {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            File::create(&dst)?;
+        }
+    }
+    // Merged-usr hosts keep these as links. A host with real dirs had them bound above.
     for (link, target) in [
         ("bin", "usr/bin"),
         ("lib", "usr/lib"),
@@ -319,6 +531,9 @@ fn prepare_root(root: &Path) -> Result<()> {
         ("sbin", "usr/sbin"),
     ] {
         let path = root.join(link);
+        if path.is_dir() {
+            continue;
+        }
         let _ = fs::remove_file(&path);
         std::os::unix::fs::symlink(target, path)?;
     }
@@ -330,22 +545,75 @@ fn prepare_root(root: &Path) -> Result<()> {
         root.join("etc/nsswitch.conf"),
         "hosts: files dns\npasswd: files\n",
     )?;
+    // HTTPS from a worker needs the host's roots. /etc is not the host's.
+    for bundle in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ] {
+        if let Ok(pem) = fs::read(bundle) {
+            fs::create_dir_all(root.join("etc/ssl/certs"))?;
+            fs::write(root.join("etc/ssl/certs/ca-certificates.crt"), pem)?;
+            break;
+        }
+    }
     Ok(())
 }
 
-fn env_strings(token: &str, id: &str, door: bool) -> Vec<String> {
+/// Not pivoted is the Landlock fallback, where every path is the host's.
+fn env_strings(req: &SpawnRequest, path: &str, pivoted: bool, exe: Option<&Path>) -> Vec<String> {
+    let show = |p: &Path| p.to_string_lossy().into_owned();
+    let etc = if pivoted {
+        "/etc".to_string()
+    } else {
+        show(&req.root.join("etc"))
+    };
     let mut env = vec![
-        "HOME=/work".into(),
-        "PATH=/usr/bin:/bin".into(),
+        format!(
+            "HOME={}",
+            if pivoted {
+                "/work".into()
+            } else {
+                show(&req.work)
+            }
+        ),
+        format!("PATH={path}"),
         "TMPDIR=/tmp".into(),
         "LANG=C".into(),
     ];
-    if door {
-        env.push(format!("INLET_TOKEN={token}"));
-        env.push(format!("INLET_ID={id}"));
-        env.push("INLET_PROXY_SOCK=/run/proxy.sock".into());
-        env.push("INLET_SOCK=/run/worker.sock".into());
-        env.push(format!("OPENAI_API_KEY={token}"));
+    if req.root.join("etc/ssl/certs/ca-certificates.crt").exists() {
+        env.push(format!("SSL_CERT_FILE={etc}/ssl/certs/ca-certificates.crt"));
+    }
+    if req.door {
+        let (proxy, sock) = if pivoted {
+            (
+                "/run/proxy.sock".to_string(),
+                "/run/worker.sock".to_string(),
+            )
+        } else {
+            (show(&req.proxy_sock), show(&req.worker_sock))
+        };
+        env.push(format!("INLET_TOKEN={}", req.token));
+        env.push(format!("INLET_ID={}", req.task_id));
+        env.push(format!("INLET_PROXY_SOCK={proxy}"));
+        env.push(format!("INLET_SOCK={sock}"));
+        env.push(format!("OPENAI_API_KEY={}", req.token));
+        if let Some(exe) = exe {
+            let bin = if pivoted {
+                "/run/inlet".into()
+            } else {
+                show(exe)
+            };
+            env.push(format!("INLET_BIN={bin}"));
+        }
+        for (name, _) in &req.files {
+            let key = name.split('.').next().unwrap_or(name).to_uppercase();
+            env.push(format!("INLET_{key}_FILE={etc}/{name}"));
+        }
+    }
+    for (key, value) in &req.env {
+        if !key.is_empty() && !key.contains('=') && !key.starts_with("INLET_") {
+            env.push(format!("{key}={value}"));
+        }
     }
     env
 }
@@ -380,26 +648,35 @@ unsafe fn child_entry(a: &Raw) -> ! {
     }
 
     let pivoted = pivot(a) == 0;
-    let locked = if pivoted {
-        landlock_pivoted(a.door)
+    let rules = if pivoted {
+        std::slice::from_raw_parts(a.rules_pivot, a.n_rules_pivot)
     } else {
-        landlock_host(a)
+        std::slice::from_raw_parts(a.rules_host, a.n_rules_host)
     };
+    let locked = landlock(rules);
     if locked != 0 {
         fail(a.err_w, locked);
     }
     set_limits(a.memory_mb, a.pids, a.seconds);
     let _ = libc::chdir(if pivoted { c"/work".as_ptr() } else { a.work });
 
-    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-    if devnull >= 0 {
-        libc::dup2(devnull, 0);
-        libc::close(devnull);
+    let input = if pivoted { a.stdin_pivot } else { a.stdin_host };
+    let mut stdin = -1;
+    if !input.is_null() {
+        stdin = libc::open(input, libc::O_RDONLY);
+    }
+    if stdin < 0 {
+        stdin = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+    }
+    if stdin >= 0 {
+        libc::dup2(stdin, 0);
+        libc::close(stdin);
     }
     libc::dup2(a.out_w, 1);
     libc::dup2(a.out_w, 2);
     close_except(a.err_w);
-    libc::execve(a.argv.read(), a.argv, a.envp);
+    let envp = if pivoted { a.envp_pivot } else { a.envp_host };
+    libc::execve(a.argv.read(), a.argv, envp);
     fail(a.err_w, errno());
 }
 
@@ -424,20 +701,23 @@ unsafe fn pivot(a: &Raw) -> i32 {
     {
         return errno();
     }
-    if mount_bind(a.usr, a.nr_usr, true) != 0
-        || mount_bind(a.work, a.nr_work, false) != 0
-        || mount_bind(a.scratch, a.nr_scratch, false) != 0
-    {
+    for bind in std::slice::from_raw_parts(a.binds, a.n_binds) {
+        let rc = mount_bind(bind.src, bind.dst, bind.flags);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    if mount_bind(a.work, a.nr_work, 0) != 0 || mount_bind(a.scratch, a.nr_scratch, 0) != 0 {
         return errno();
     }
     // Registry is a copy taken at spawn, not a live bind, so a promotion
     // during this turn stays invisible until the next task.
-    let _ = mount_bind(a.devnull, a.nr_null, false);
-    let _ = mount_bind(a.devzero, a.nr_zero, false);
-    let _ = mount_bind(a.devurandom, a.nr_urandom, false);
+    let _ = mount_bind(a.devnull, a.nr_null, 0);
+    let _ = mount_bind(a.devzero, a.nr_zero, 0);
+    let _ = mount_bind(a.devurandom, a.nr_urandom, 0);
     if a.door {
-        let _ = mount_bind(a.proxy, a.nr_sock, false);
-        let _ = mount_bind(a.worker, a.nr_worker, false);
+        let _ = mount_bind(a.proxy, a.nr_sock, 0);
+        let _ = mount_bind(a.worker, a.nr_worker, 0);
     }
     if libc::syscall(libc::SYS_pivot_root, a.newroot, a.nr_old) != 0 {
         return errno();
@@ -466,7 +746,12 @@ unsafe fn pivot(a: &Raw) -> i32 {
     0
 }
 
-unsafe fn mount_bind(src: *const libc::c_char, dst: *const libc::c_char, ro: bool) -> i32 {
+/// `remount` is 0 for a writable bind, or the flags that make it read-only.
+unsafe fn mount_bind(
+    src: *const libc::c_char,
+    dst: *const libc::c_char,
+    remount: libc::c_ulong,
+) -> i32 {
     if libc::mount(
         src,
         dst,
@@ -477,60 +762,13 @@ unsafe fn mount_bind(src: *const libc::c_char, dst: *const libc::c_char, ro: boo
     {
         return errno();
     }
-    if ro
-        && libc::mount(
-            ptr::null(),
-            dst,
-            ptr::null(),
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
-            ptr::null(),
-        ) != 0
-    {
+    if remount != 0 && libc::mount(ptr::null(), dst, ptr::null(), remount, ptr::null()) != 0 {
         return errno();
     }
     0
 }
 
-unsafe fn landlock_pivoted(door: bool) -> i32 {
-    let run = if door { FS_ALL } else { FS_READ };
-    let rules = [
-        (c"/usr".as_ptr(), FS_READ),
-        (c"/work".as_ptr(), FS_ALL),
-        (c"/scratch".as_ptr(), FS_ALL),
-        (c"/registry".as_ptr(), FS_READ),
-        (c"/proc".as_ptr(), FS_READ),
-        (c"/dev".as_ptr(), FS_ALL),
-        (c"/tmp".as_ptr(), FS_ALL),
-        (c"/etc".as_ptr(), FS_READ),
-        (c"/run".as_ptr(), run),
-    ];
-    landlock(&rules)
-}
-
-unsafe fn landlock_host(a: &Raw) -> i32 {
-    let mut rules = [
-        (a.usr, FS_READ),
-        (a.work, FS_ALL),
-        (a.scratch, FS_ALL),
-        (a.registry, FS_READ),
-        (c"/proc".as_ptr(), FS_READ),
-        (c"/dev".as_ptr(), FS_ALL),
-        (c"/etc".as_ptr(), FS_READ),
-        (c"/tmp".as_ptr(), FS_ALL),
-        (ptr::null(), 0u64),
-        (ptr::null(), 0u64),
-    ];
-    let mut n = 8;
-    if a.door {
-        rules[n] = (a.proxy, FS_ALL);
-        n += 1;
-        rules[n] = (a.worker, FS_ALL);
-        n += 1;
-    }
-    landlock(&rules[..n])
-}
-
-unsafe fn landlock(rules: &[(*const libc::c_char, u64)]) -> i32 {
+unsafe fn landlock(rules: &[Rule]) -> i32 {
     let mut attr = RulesetAttr {
         handled_access_fs: FS_ALL,
         handled_access_net: 0,
@@ -766,6 +1004,7 @@ pub fn run_sealed(cmd: &[String], work: &Path) -> i32 {
         task_id: String::new(),
         cgroup: None,
         door: false,
+        ..Default::default()
     };
     let spawned = match spawn(&req) {
         Ok(child) => child,
