@@ -114,7 +114,7 @@ inlet add -w W -g GOAL (--verify CMD | --no-verify) [--tokens N] [--seconds N]
         [--seed DIR] [--retries N]
 inlet add -f tasks.jsonl
 inlet apply -f FILE      swarms and tasks from json. - is stdin
-inlet get [tasks|swarms] [--json]
+inlet get [tasks|swarms|nodes] [--json]
 inlet describe <id>      one task, its attempts, and what it printed
 inlet logs <id> [--verify]
 inlet scale <swarm> <replicas>
@@ -424,9 +424,14 @@ fn add(home: &Path, args: &[String]) -> Result<()> {
 }
 
 fn read_jsonl(path: &Path) -> Result<Vec<NewTask>> {
-    let file = fs::File::open(path)?;
+    // `-` is stdin, which is how a leader hands a task to a node.
+    let input: Box<dyn io::Read> = if path == Path::new("-") {
+        Box::new(io::stdin())
+    } else {
+        Box::new(fs::File::open(path)?)
+    };
     let mut tasks = Vec::new();
-    for (n, line) in io::BufReader::new(file).lines().enumerate() {
+    for (n, line) in io::BufReader::new(input).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -779,10 +784,11 @@ fn get(home: &Path, args: &[String]) -> Result<()> {
     let key = match what {
         "tasks" | "task" => "tasks",
         "swarms" | "swarm" => "swarms",
-        _ => return Err(err("usage: inlet get [tasks|swarms] [--json]")),
+        "nodes" | "node" => "nodes",
+        _ => return Err(err("usage: inlet get [tasks|swarms|nodes] [--json]")),
     };
     let v = checked(
-        proto::rpc(home, json!({"op":"status","brief": key == "swarms"}))?,
+        proto::rpc(home, json!({"op":"status","brief": key != "tasks"}))?,
         "get",
     )?;
     let rows = v
@@ -796,6 +802,22 @@ fn get(home: &Path, args: &[String]) -> Result<()> {
     }
     let text = |row: &Value, field: &str| row[field].as_str().unwrap_or("").to_string();
     let num = |row: &Value, field: &str| row[field].as_u64().unwrap_or(0);
+    if key == "nodes" {
+        println!("{:<20}  {:<9}  {:>8}", "NAME", "STATE", "PLACED");
+        for row in &rows {
+            println!(
+                "{:<20}  {:<9}  {:>8}",
+                text(row, "name"),
+                if row["ready"] == true {
+                    "ready"
+                } else {
+                    "not ready"
+                },
+                format!("{}/{}", num(row, "placed"), num(row, "slots")),
+            );
+        }
+        return Ok(());
+    }
     if key == "swarms" {
         println!(
             "{:<20}  {:<8}  {:>6}  {:>10}  {:>6}  {:<10}  GOAL",

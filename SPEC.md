@@ -94,7 +94,7 @@ The sockets are mounted into a cell by directory, read-only, so a kept worker fi
 
 Durable before it takes effect: an admit with its slice debit (before exec), an accepted `add` batch (before the reply), a `swarm` and the tasks it stamps, a retry (with the exit it follows), `bind`, `clear`, `promote`, `sign`, and a purse `reset`. Other appends flush every 50ms. A crash may lose a post, a cost, a vote, or a tool event. It may not lose an admission that started a process, a task the operator was told is queued, a constraint, or a purse reset. One file, so an fsync covers every earlier record: an admit that spends a refund is never durable without the exit that made it.
 
-Record kinds: `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`, `gate`, `result`, `bind`, `clear`, `sign`, `promote`, `kill`, `reset`, `vote`, `moderation`, `swarm`, `swarm_delete`. A binary that meets a kind it does not know leaves it in the log and moves on.
+Record kinds: `place`, `task`, `admit`, `deny`, `spawn`, `exit`, `post`, `cost`, `gate`, `result`, `bind`, `clear`, `sign`, `promote`, `kill`, `reset`, `vote`, `moderation`, `swarm`, `swarm_delete`. A binary that meets a kind it does not know leaves it in the log and moves on.
 
 `post` carries `author`, `role` (`human`, `operator`, or `worker`), `text`, `weight`, `channel`, and `mentions`. The default channel is `general`. Mentions are `@all` and `@<id>` parsed from the text. Routing comes later; the fields are on the record now so a channel does not rewrite the log.
 
@@ -452,6 +452,31 @@ You are on the inlet operator socket, outside the workers. You run this swarm an
 
 Inmate door. A worker token can: post, submit a recipe draft, request a child with a verifier, read how its children ended and what each last said, read the registry, write its scratch, report a tool event, read the channels it is subscribed to, and cast a board vote. It cannot: kill, rebudget, sign, pin, read sibling scratch, open the operator socket, read keys, change policy, or open a private channel to a sibling. The cell enforces the file half of that list. The token enforces the rest. A stolen token spends that worker's remaining slice and nothing else.
 
+## Nodes
+
+More than one machine. A node is an inlet daemon of its own, with its own ledger, purse, cells, and proxy. The leader reaches it by running its CLI through a command prefix, usually ssh. There is no agent to install and no port to open beyond the one ssh already has.
+
+```lua
+nodes = {
+  east = { cmd = { "ssh", "east", "inlet", "--home", "/srv/inlet" }, slots = 8 },
+  west = { cmd = { "ssh", "west", "inlet", "--home", "/srv/inlet" }, slots = 8 },
+}
+node_grace = "60s"
+workers = { pi = { on = "nodes" } }   -- or on = "east"
+```
+
+A worker with `on` runs on a node and is defined there; the leader's entry needs only the name. The leader does what it does for any task: the gate, the purse, the swarm count. Then, in the same fsync as the admit, it writes a `place` record naming the node with the most free `slots`, and hands the task over as one line of JSON on the node's stdin, tagged `inlet:<id>`. Arguments would not survive a remote shell. A placed task does not take one of the leader's `max_live`, and its memory and pids are the node's to count.
+
+The node does the rest, and everything this document says about one machine holds there: the cell, the verifier, retries with the workdir and the verifier's output, adoption. The leader passes its remaining attempts down and does not retry on top of them.
+
+The leader asks each node for its status every two seconds and finds its own tasks by their tag. When every task with a tag has settled, the leader settles its own: done if one is done, else failed with the node's last reason, with the tokens the node metered. If the tag is not there five seconds after placing, the add was lost and is sent again; the tag is what makes that safe.
+
+A node that has not answered for `node_grace` is given up on. Its tasks end with reason `node` and are placed again, on another node, as the same attempt: the node failed, not the task. Nothing is placed on a node that is not answering. If the node comes back it may finish what it had, so a task can be done twice. It cannot be lost.
+
+A leader that dies knows from its `place` records where its tasks are, and finds them by tag when it returns. `inlet kill` on a placed task kills it on the node and settles it at once. `inlet get nodes` is the table. A `seed` for a placed task is a path on the node.
+
+What this is not: one purse across machines, a shared filesystem, or a leader election. Each node spends from its own purse and reports what it spent; the leader's purse holds the slice while the task is placed. There is one leader. A second one is still the lease and snapshot below.
+
 ## Scaling
 
 Same binary. The setup field selects caps and the isolator. Nothing else changes.
@@ -479,7 +504,7 @@ The proxy streams. It does not buffer a response to meter it. Meter from the usa
 - An unfenced worker.
 - Mid-turn push of a new recipe into a running worker.
 - Direct messages between workers. Agent-to-agent talk is a board post.
-- Multi-node until one node has run a real factory and a real queued sweep without leaking budget.
+- Leader election. Nodes are in: see Nodes. There is one leader, and a second is a manual step with the lease.
 
 ## Environment
 
@@ -511,4 +536,6 @@ Each step is usable before the next one exists.
 16. Swarms. `apply`, `scale`, `delete`, `get`, `describe`, `logs`. The reconcile loop stamps tasks to the replica count, backs off on a failure streak, and stalls at the limit. Counts survive `kill -9`.
 17. Adoption. A keeper in each cell, the wait status on disk, sockets mounted by directory. A daemon killed with `kill -9` comes back to the same workers.
 18. Chaos. `scripts/chaos.py` kills the daemon with SIGKILL and SIGTERM at random while two swarms run, one of them parents waiting on children, then checks that every goal is done exactly once, the purse adds up to the token, no attempt went past its limit, and no process, cell, or note is left on the host.
+19. Kernel limits and a bounded log. One cgroup per worker under a delegated group. Checkpoints, retention, rotation.
+20. Nodes. `place` in the admit's fsync, the task over stdin with a tag, status every two seconds, `node_grace`, and placing again.
 

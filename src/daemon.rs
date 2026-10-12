@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -23,6 +23,7 @@ use crate::id::{self, now_ms};
 use crate::isolate;
 use crate::ledger::{self, Ledger};
 use crate::model::{Budget, Decoded, Plan, Record, TaskState, Template};
+use crate::node;
 use crate::paths;
 use crate::prompt;
 use crate::proto::{self, NewTask, Request, SwarmSpec};
@@ -160,6 +161,14 @@ struct Daemon {
     last_gc: Instant,
     /// Free space under the home, checked every few seconds.
     disk: (Instant, bool),
+    node_tx: Sender<node::Msg>,
+    node_rx: Receiver<node::Msg>,
+    /// Each node: when it last answered, and whether it is taking work.
+    nodes: BTreeMap<String, (Instant, bool)>,
+    /// Placed tasks whose add is on its way to the node.
+    adding: HashSet<String>,
+    /// What each placed task is called on its node.
+    remote_ids: HashMap<String, Vec<String>>,
 }
 
 pub fn serve(home: &Path, foreground: bool) -> Result<()> {
@@ -304,6 +313,7 @@ fn run(home: &Path) -> Result<()> {
 
     let (cmd_tx, cmds) = mpsc::channel();
     let (gate_tx, gate_rx) = mpsc::channel();
+    let (node_tx, node_rx) = mpsc::channel();
     install_signals(cmd_tx.clone())?;
     listen_socket(&paths::worker_sock(home), cmd_tx.clone(), true)?;
     // The old path, for anything on the host that still dials it.
@@ -359,7 +369,17 @@ fn run(home: &Path) -> Result<()> {
         told: HashSet::new(),
         last_gc: Instant::now(),
         disk: (Instant::now() - DISK_EVERY, true),
+        node_tx,
+        node_rx,
+        nodes: BTreeMap::new(),
+        adding: HashSet::new(),
+        remote_ids: HashMap::new(),
     };
+    for (name, cfg) in &daemon.policy.cfg.nodes {
+        // Unknown until it answers. Nothing is placed on a node not yet heard from.
+        daemon.nodes.insert(name.clone(), (Instant::now(), false));
+        node::watch(name.clone(), cfg.cmd.clone(), daemon.node_tx.clone());
+    }
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
         .state
@@ -599,7 +619,8 @@ impl Daemon {
     /// wait status), or stopped mid-verifier (to be checked again).
     #[allow(clippy::type_complexity)]
     fn adopt(&mut self) -> (HashSet<String>, Vec<(String, i32)>, Vec<String>) {
-        let mut kept = HashSet::new();
+        // A task on a node has no process here. It is not a crash for that.
+        let mut kept: HashSet<String> = self.state.placed.keys().cloned().collect();
         let mut finished = Vec::new();
         let mut recheck = Vec::new();
         // Ids sort by creation, so a parent is seen before its children.
@@ -733,6 +754,9 @@ impl Daemon {
         }
         while let Ok(msg) = self.gate_rx.try_recv() {
             self.on_gate(msg)?;
+        }
+        while let Ok(msg) = self.node_rx.try_recv() {
+            self.on_node(msg)?;
         }
         self.drain_logs();
         self.reap()?;
@@ -971,22 +995,65 @@ impl Daemon {
         if !self.disk.1 {
             return Ok(());
         }
-        let live = self.state.live();
+        // What runs on a node does not take one of this machine's places.
+        let live = self.state.live().saturating_sub(self.state.placed.len());
         let now = now_ms();
         let mut batch: Vec<Record> = Vec::new();
         let mut chosen: Vec<String> = Vec::new();
+        let mut placing: Vec<String> = Vec::new();
+        let mut node_load: HashMap<String, usize> = HashMap::new();
+        for (node, _) in self.state.placed.values() {
+            *node_load.entry(node.clone()).or_insert(0) += 1;
+        }
         let mut hold_tokens = 0u64;
         let mut hold_mem = 0u64;
         let mut hold_pids = 0u64;
         let mut child_hold: HashMap<String, (u64, u64, u64)> = HashMap::new();
         for id in queued {
-            if live + chosen.len() >= self.policy.cfg.caps.max_live {
-                break;
-            }
-            let Some(task) = self.state.tasks.get(&id).cloned() else {
+            let Some(mut task) = self.state.tasks.get(&id).cloned() else {
                 continue;
             };
             if task.state != TaskState::Queued || task.plan.not_before > now {
+                continue;
+            }
+            let on = self
+                .policy
+                .cfg
+                .workers
+                .get(&task.worker)
+                .and_then(|w| w.on.clone());
+            // The node with the most room, among those that answer.
+            let node = on.as_ref().and_then(|want| {
+                self.policy
+                    .cfg
+                    .nodes
+                    .iter()
+                    .filter(|(name, _)| want == "nodes" || want == *name)
+                    .filter(|(name, _)| self.nodes.get(*name).is_some_and(|rt| rt.1))
+                    .map(|(name, cfg)| {
+                        (
+                            cfg.slots
+                                .saturating_sub(node_load.get(name).copied().unwrap_or(0)),
+                            name.clone(),
+                        )
+                    })
+                    .filter(|(room, _)| *room > 0)
+                    .max()
+                    .map(|(_, name)| name)
+            });
+            if on.is_some() {
+                if node.is_none() {
+                    // No node has room, or none answers. It waits.
+                    continue;
+                }
+                // Its memory and processes are the node's to count.
+                task.budget.memory_mb = 0;
+                task.budget.pids = 0;
+            } else if live + chosen.len() >= self.policy.cfg.caps.max_live {
+                // Full here. Something further back may still go to a node.
+                if self.policy.cfg.nodes.is_empty() {
+                    break;
+                }
                 continue;
             }
             if gate::waits_for_purse(&task, &self.state.purse) {
@@ -1048,9 +1115,9 @@ impl Daemon {
                     cfg: &self.policy.cfg,
                     purse: &self.state.purse,
                     samples: &self.state.samples,
-                    live: live + chosen.len(),
+                    live: if on.is_some() { 0 } else { live + chosen.len() },
                     depth,
-                    cell_ok: self.cell_ok,
+                    cell_ok: self.cell_ok || on.is_some(),
                     lua_says: lua,
                     p,
                     blocked,
@@ -1090,7 +1157,19 @@ impl Daemon {
                         pids: task.budget.pids,
                         ts: now_ms(),
                     });
-                    chosen.push(id);
+                    match node {
+                        Some(node) => {
+                            // Where it goes is durable before the node is asked.
+                            batch.push(Record::Place {
+                                id: id.clone(),
+                                node: node.clone(),
+                                ts: now_ms(),
+                            });
+                            *node_load.entry(node).or_insert(0) += 1;
+                            placing.push(id);
+                        }
+                        None => chosen.push(id),
+                    }
                 }
             }
         }
@@ -1099,6 +1178,9 @@ impl Daemon {
         }
         // Durable before exec. One fsync for the whole wave.
         self.commit(&batch, true)?;
+        for id in placing {
+            self.send_add(&id);
+        }
         for id in chosen {
             if let Err(e) = self.spawn_worker(&id) {
                 self.finish(&id, 127, "cell", true)?;
@@ -1151,6 +1233,166 @@ impl Daemon {
         Ok(())
     }
 
+    /// Ask the node to run a placed task. The tag makes the ask safe to
+    /// repeat: the leader looks for it before asking again.
+    fn send_add(&mut self, id: &str) {
+        let (Some(task), Some((node, _))) = (self.state.tasks.get(id), self.state.placed.get(id))
+        else {
+            return;
+        };
+        let Some(cfg) = self.policy.cfg.nodes.get(node) else {
+            return;
+        };
+        let mut tags: Vec<String> = task
+            .tags
+            .iter()
+            .filter(|t| !t.starts_with("inlet:"))
+            .cloned()
+            .collect();
+        tags.push(node::tag(id));
+        let verifier = task.verifier.clone().filter(|v| !v.is_empty());
+        let spec = json!({
+            "worker": task.worker,
+            "goal": task.goal,
+            "no_verify": verifier.is_none(),
+            "verify": verifier,
+            "tokens": task.budget.tokens,
+            "seconds": task.budget.seconds,
+            "memory_mb": task.budget.memory_mb,
+            "pids": task.budget.pids,
+            "value": task.value,
+            // The node retries, with the workdir and the verifier's output.
+            "retries": task.plan.max_attempts().saturating_sub(task.plan.attempt()),
+            "tags": tags,
+            "seed": task.plan.seed,
+        });
+        self.adding.insert(id.to_string());
+        node::add(cfg.cmd.clone(), spec, id.to_string(), self.node_tx.clone());
+    }
+
+    fn on_node(&mut self, msg: node::Msg) -> Result<()> {
+        let (name, tasks) = match msg {
+            node::Msg::Added { id, .. } => {
+                // Failed or not, the next status says whether it is there.
+                self.adding.remove(&id);
+                return Ok(());
+            }
+            node::Msg::Status { node, tasks } => (node, tasks),
+        };
+        let mine: Vec<(String, u64)> = self
+            .state
+            .placed
+            .iter()
+            .filter(|(_, (node, _))| *node == name)
+            .map(|(id, (_, ts))| (id.clone(), *ts))
+            .collect();
+        let Some(tasks) = tasks else {
+            let grace = Duration::from_millis(self.policy.cfg.node_grace_ms);
+            let Some(rt) = self.nodes.get_mut(&name) else {
+                return Ok(());
+            };
+            if rt.0.elapsed() < grace {
+                return Ok(());
+            }
+            if rt.1 {
+                eprintln!("inlet: node {name} is not answering");
+            }
+            rt.1 = false;
+            // Given up on. Its tasks go to another node. If it comes back it
+            // may still finish them: twice done, never lost.
+            for (id, _) in mine {
+                self.finish_remote(&id, -1, "node", 0)?;
+            }
+            return Ok(());
+        };
+        if let Some(rt) = self.nodes.get_mut(&name) {
+            if !rt.1 {
+                eprintln!("inlet: node {name} is answering");
+            }
+            *rt = (Instant::now(), true);
+        }
+        let now = now_ms();
+        for (id, placed_at) in mine {
+            let there: Vec<&node::Remote> = tasks.iter().filter(|t| t.leader == id).collect();
+            if there.is_empty() {
+                // The add was lost, or the leader died before sending it.
+                if !self.adding.contains(&id) && now.saturating_sub(placed_at) > 5_000 {
+                    self.send_add(&id);
+                }
+                continue;
+            }
+            self.remote_ids
+                .insert(id.clone(), there.iter().map(|t| t.id.clone()).collect());
+            let settled =
+                |t: &&node::Remote| matches!(t.state.as_str(), "done" | "failed" | "killed");
+            if !there.iter().all(settled) {
+                continue;
+            }
+            let used: u64 = there.iter().map(|t| t.used).sum();
+            if there.iter().any(|t| t.state == "done") {
+                self.finish_remote(&id, 0, "ok", used)?;
+            } else {
+                // The node's chain is spent. Its last word is the reason.
+                let last = there
+                    .iter()
+                    .max_by(|a, b| a.id.cmp(&b.id))
+                    .map(|t| t.reason.clone());
+                let reason = last
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| "exit".into());
+                self.finish_remote(&id, 1, &reason, used)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle a task that ran on a node. Only a lost node is tried again
+    /// here: every other failure already used the node's retries.
+    fn finish_remote(&mut self, id: &str, code: i32, reason: &str, used: u64) -> Result<()> {
+        let Some(task) = self.state.tasks.get(id) else {
+            return Ok(());
+        };
+        if !task.state.is_live() {
+            return Ok(());
+        }
+        let reserved = task.budget.tokens;
+        let used = used.min(reserved);
+        let ts = now_ms();
+        let mut recs = Vec::new();
+        if used > 0 {
+            recs.push(Record::Cost {
+                id: id.to_string(),
+                tokens: used,
+                ts,
+            });
+        }
+        recs.push(Record::Exit {
+            id: id.to_string(),
+            code,
+            reason: reason.into(),
+            tokens_used: used,
+            refund_tokens: reserved - used,
+            ts,
+        });
+        if reason == "node" {
+            recs.extend(self.state.retry_for(id, reason, &self.policy.cfg, ts));
+        }
+        self.adding.remove(id);
+        self.remote_ids.remove(id);
+        self.commit(&recs, true)
+    }
+
+    /// Stop a placed task: tell the node, and settle it here without waiting.
+    fn kill_remote(&mut self, id: &str) -> Result<()> {
+        if let Some((node, _)) = self.state.placed.get(id) {
+            if let Some(cfg) = self.policy.cfg.nodes.get(node) {
+                let remote = self.remote_ids.get(id).cloned().unwrap_or_default();
+                node::kill(cfg.cmd.clone(), remote);
+            }
+        }
+        self.finish_remote(id, -1, "killed", 0)
+    }
+
     /// A deny settles the task. A transient one leaves a retry behind it.
     fn deny(&mut self, id: &str, reason: &str) -> Result<()> {
         let ts = now_ms();
@@ -1181,7 +1423,13 @@ impl Daemon {
                 let index = swarm.created + 1 + n;
                 let template = &swarm.template;
                 let id = id::ulid();
-                if let Some(seed) = &template.seed {
+                let remote = self
+                    .policy
+                    .cfg
+                    .workers
+                    .get(&template.worker)
+                    .is_some_and(|w| w.on.is_some());
+                if let (Some(seed), false) = (&template.seed, remote) {
                     seeds.push((seed.clone(), id.clone()));
                 }
                 recs.push(Record::Task {
@@ -1200,6 +1448,7 @@ impl Daemon {
                         max_attempts: template.max_attempts,
                         not_before: 0,
                         owner: Some(swarm.name.clone()),
+                        seed: template.seed.clone().filter(|_| remote),
                     },
                     ts: now,
                 });
@@ -1792,6 +2041,9 @@ impl Daemon {
                         }],
                         true,
                     ),
+                    Some(s) if s.is_live() && self.state.placed.contains_key(&task) => {
+                        self.kill_remote(&task)
+                    }
                     Some(s) if s.is_live() => {
                         // Durable before the signal: a daemon that dies in
                         // between must not come back and rerun it as a crash.
@@ -2265,7 +2517,14 @@ impl Daemon {
             })
             .collect();
         for (task, id) in tasks.iter().zip(ids.iter()) {
-            if let Some(seed) = &task.seed {
+            // A seed for a task that runs on a node is a path on the node.
+            let here = self
+                .policy
+                .cfg
+                .workers
+                .get(&task.worker)
+                .is_some_and(|w| w.on.is_none());
+            if let (Some(seed), true) = (&task.seed, here) {
                 copy_seed(Path::new(seed), &paths::work(&self.home, id))?;
             }
         }
@@ -2348,6 +2607,7 @@ impl Daemon {
                 max_attempts: 1 + task.retries.unwrap_or(self.policy.cfg.retry.max),
                 not_before: 0,
                 owner: None,
+                seed: task.seed.clone().filter(|_| worker.on.is_some()),
             },
             ts: now_ms(),
         })
@@ -2447,6 +2707,8 @@ impl Daemon {
                         reason: "deleted".into(),
                         ts,
                     });
+                } else if self.state.placed.contains_key(&id) {
+                    self.kill_remote(&id)?;
                 } else {
                     self.pending.insert(id.clone(), "killed".into());
                     self.signal(&id, libc::SIGKILL);
@@ -2507,6 +2769,8 @@ impl Daemon {
             "max_attempts": t.plan.max_attempts(),
             "not_before": t.plan.not_before,
             "swarm": t.plan.owner,
+            "node": self.state.placed.get(&t.id).map(|(node, _)| node),
+            "used": t.used,
         })
     }
 
@@ -2594,6 +2858,12 @@ impl Daemon {
                 "expires": c.expires,
             })).collect::<Vec<_>>(),
             "swarms": swarms,
+            "nodes": self.policy.cfg.nodes.iter().map(|(name, cfg)| json!({
+                "name": name,
+                "ready": self.nodes.get(name).is_some_and(|rt| rt.1),
+                "slots": cfg.slots,
+                "placed": self.state.placed.values().filter(|(node, _)| node == name).count(),
+            })).collect::<Vec<_>>(),
             "unattended": self.policy.cfg.unattended,
             "lease": self.holder,
             "fence": self.fence,
@@ -2868,6 +3138,9 @@ impl Daemon {
             ),
             Record::SwarmDelete { name, ts } => {
                 (1, json!({"ev":"swarm_delete","name":name,"ts":ts}))
+            }
+            Record::Place { id, node, ts } => {
+                (1, json!({"ev":"place","id":id,"node":node,"ts":ts}))
             }
             Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
             Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),

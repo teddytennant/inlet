@@ -9,8 +9,8 @@ use crate::purse::Purse;
 
 /// Failures a new attempt can fix. `killed` was asked for, `purse` would
 /// run dry again on the same budget, and a deny by a cap is not transient.
-pub const RETRYABLE: [&str; 7] = [
-    "crash", "verifier", "timeout", "exit", "stall", "gate", "stopped",
+pub const RETRYABLE: [&str; 8] = [
+    "crash", "verifier", "timeout", "exit", "stall", "gate", "stopped", "node",
 ];
 
 pub const POST_RING: usize = 400;
@@ -34,6 +34,8 @@ pub struct TaskView {
     pub plan: Plan,
     /// When it reached done, failed, or killed. 0 until then.
     pub settled_ms: u64,
+    /// Tokens its exit recorded as spent.
+    pub used: u64,
 }
 
 const SWARM_PACE_MS: u64 = 1_000;
@@ -196,6 +198,8 @@ pub struct State {
     pub swarms: BTreeMap<String, SwarmView>,
     /// Live tasks an operator asked to kill. The ask outlives a daemon crash.
     pub killing: HashSet<String>,
+    /// Live tasks that run on a node: which one, and since when.
+    pub placed: BTreeMap<String, (String, u64)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -252,6 +256,7 @@ impl State {
             channels: BTreeMap::new(),
             swarms: BTreeMap::new(),
             killing: HashSet::new(),
+            placed: BTreeMap::new(),
         }
     }
 
@@ -303,6 +308,7 @@ impl State {
                         admit_ms: None,
                         plan: plan.clone(),
                         settled_ms: 0,
+                        used: 0,
                     },
                 );
                 self.queue.push_back(id.clone());
@@ -411,6 +417,10 @@ impl State {
                     self.settle_owner(id, done, *ts);
                 }
                 self.killing.remove(id);
+                self.placed.remove(id);
+                if let Some(task) = self.tasks.get_mut(id) {
+                    task.used = *tokens_used;
+                }
                 self.stamp(id, *ts);
                 self.note_parent(id);
             }
@@ -563,6 +573,11 @@ impl State {
                     });
                 }
             }
+            Record::Place { id, node, ts } => {
+                if self.tasks.get(id).is_some_and(|t| t.state.is_live()) {
+                    self.placed.insert(id.clone(), (node.clone(), *ts));
+                }
+            }
             Record::Kill { id, .. } => {
                 if self.tasks.get(id).is_some_and(|t| t.state.is_live()) {
                     self.killing.insert(id.clone());
@@ -647,6 +662,26 @@ impl State {
         }
         let attempt = task.plan.attempt();
         let mut max = task.plan.max_attempts();
+        if reason == "node" {
+            // The node went dark, not the task. Placed again, same attempt.
+            return Some(Record::Task {
+                id: crate::id::ulid(),
+                parent: task.parent.clone(),
+                worker: task.worker.clone(),
+                tags: task.tags.clone(),
+                goal: task.goal.clone(),
+                verifier: task.verifier.clone(),
+                value: task.value,
+                budget: task.budget.clone(),
+                retry_of: Some(task.id.clone()),
+                recipe: task.recipe.clone(),
+                plan: Plan {
+                    not_before: 0,
+                    ..task.plan.clone()
+                },
+                ts,
+            });
+        }
         if reason == "stopped" {
             // The daemon was shut down under it. That is not the task's failure,
             // so the rerun is the same attempt. A child goes down with its parent,
@@ -704,6 +739,7 @@ impl State {
                 max_attempts: max,
                 not_before: ts.saturating_add(cfg.retry.delay_ms(attempt)),
                 owner: task.plan.owner.clone(),
+                seed: task.plan.seed.clone(),
             },
             ts,
         })

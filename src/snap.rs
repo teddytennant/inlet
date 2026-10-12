@@ -44,6 +44,8 @@ pub(crate) struct Index {
     #[serde(default)]
     killing: Vec<String>,
     #[serde(default)]
+    placed: Vec<(String, String, u64)>,
+    #[serde(default)]
     moderation: Vec<ModerationSnap>,
     #[serde(default)]
     posts_seen: u64,
@@ -77,6 +79,8 @@ struct HeaderSnap {
     plan: Plan,
     #[serde(default)]
     settled_ms: u64,
+    #[serde(default)]
+    used: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -229,6 +233,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
             recipe: task.recipe.clone(),
             admit_ms: task.admit_ms,
             settled_ms: task.settled_ms,
+            used: task.used,
             plan: task.plan.clone(),
         })
         .collect();
@@ -287,6 +292,11 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
         decision_spent: state.decision_spent,
         swarms: state.swarms.values().cloned().collect(),
         killing: state.killing.iter().cloned().collect(),
+        placed: state
+            .placed
+            .iter()
+            .map(|(id, (node, ts))| (id.clone(), node.clone(), *ts))
+            .collect(),
         votes: state
             .votes
             .values()
@@ -364,6 +374,7 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
                     pid: None,
                     admit_ms: header.admit_ms,
                     settled_ms: header.settled_ms,
+                    used: header.used,
                     plan: header.plan.clone(),
                 },
             )
@@ -401,6 +412,11 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
         .map(|swarm| (swarm.name.clone(), swarm.clone()))
         .collect();
     state.killing = index.killing.iter().cloned().collect();
+    state.placed = index
+        .placed
+        .iter()
+        .map(|(id, node, ts)| (id.clone(), (node.clone(), *ts)))
+        .collect();
     // An index from before tasks carried a settle time: count them from now.
     let now = crate::id::now_ms();
     for task in state.tasks.values_mut() {

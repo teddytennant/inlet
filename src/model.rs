@@ -60,6 +60,9 @@ pub struct Plan {
     /// The swarm that created the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// A seed directory on the node, for a task that runs on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
 }
 
 impl Plan {
@@ -217,6 +220,13 @@ pub enum Record {
         name: String,
         ts: u64,
     },
+    /// The task goes to this node. Written before the node is asked, so a
+    /// leader that dies in between knows where to look.
+    Place {
+        id: String,
+        node: String,
+        ts: u64,
+    },
     Clear {
         id: String,
         ts: u64,
@@ -260,7 +270,9 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
         | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation"
-        | "swarm" | "swarm_delete" => Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?))),
+        | "swarm" | "swarm_delete" | "place" => {
+            Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
+        }
         _ => Ok(Decoded::Opaque),
     }
 }

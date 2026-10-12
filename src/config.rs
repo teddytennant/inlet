@@ -100,6 +100,16 @@ pub struct WorkerCfg {
     /// Kill a worker silent for this long. 0 is off.
     pub stall_seconds: u64,
     pub preamble: Option<String>,
+    /// Run on a node: its name, or `nodes` for whichever has room. `None` is here.
+    pub on: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeCfg {
+    /// The prefix that runs the node's inlet CLI: `ssh host inlet --home /srv/inlet`.
+    pub cmd: Vec<String>,
+    /// Tasks this leader may have there at once.
+    pub slots: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +202,9 @@ pub struct Config {
     pub cell_ro: Vec<std::path::PathBuf>,
     /// Workers outlive a daemon that dies, and the next one takes them back.
     pub adopt: bool,
+    pub nodes: BTreeMap<String, NodeCfg>,
+    /// A node silent this long is given up on, and its tasks are placed again.
+    pub node_grace_ms: u64,
     /// A settled task is forgotten, and its workdir and transcripts removed,
     /// this long after it settled. 0 keeps everything.
     pub retain_ms: u64,
@@ -360,6 +373,20 @@ fn read_config(lua: &Lua) -> Result<Config> {
             cfg.retry.max_backoff_ms = read_span(table.get::<Value>("max_backoff")?)?;
         }
     }
+    if let Some(table) = g.get::<Option<Table>>("nodes")? {
+        for pair in table.pairs::<String, Table>() {
+            let (name, spec) = pair?;
+            let cmd: Vec<String> = spec
+                .get::<Option<Vec<String>>>("cmd")?
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| err("node cmd is required"))?;
+            let slots = spec.get::<Option<i64>>("slots")?.unwrap_or(4).max(0) as usize;
+            cfg.nodes.insert(name, NodeCfg { cmd, slots });
+        }
+    }
+    if g.contains_key("node_grace")? {
+        cfg.node_grace_ms = read_span(g.get::<Value>("node_grace")?)?.max(1000);
+    }
     if g.contains_key("retain")? {
         cfg.retain_ms = read_span(g.get::<Value>("retain")?)?;
     }
@@ -418,9 +445,12 @@ fn read_config(lua: &Lua) -> Result<Config> {
 }
 
 fn read_worker(spec: &Table) -> Result<WorkerCfg> {
+    // A worker that runs on a node is defined there. Here it only needs a name.
+    let remote = spec.get::<Option<String>>("on")?.is_some();
     let cmd: Vec<String> = spec
         .get::<Option<Vec<String>>>("cmd")?
         .filter(|c| !c.is_empty())
+        .or_else(|| remote.then(|| vec!["true".to_string()]))
         .ok_or_else(|| err("worker cmd is required"))?;
     let tags = spec.get::<Option<Vec<String>>>("tags")?.unwrap_or_default();
     let net = match spec.get::<Option<String>>("net")? {
@@ -462,6 +492,7 @@ fn read_worker(spec: &Table) -> Result<WorkerCfg> {
         preamble: spec
             .get::<Option<String>>("preamble")?
             .filter(|p| !p.is_empty()),
+        on: spec.get::<Option<String>>("on")?.filter(|n| !n.is_empty()),
     })
 }
 
@@ -680,6 +711,8 @@ pub fn preset(setup: &str) -> Config {
         cell_ro: Vec::new(),
         adopt: true,
         retain_ms: 30 * 86_400_000,
+        nodes: BTreeMap::new(),
+        node_grace_ms: 60_000,
     }
 }
 

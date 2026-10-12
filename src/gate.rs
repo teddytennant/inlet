@@ -158,6 +158,7 @@ mod tests {
             pid: None,
             admit_ms: None,
             settled_ms: 0,
+            used: 0,
             plan: crate::model::Plan::default(),
         }
     }

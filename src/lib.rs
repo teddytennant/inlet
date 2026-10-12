@@ -12,6 +12,7 @@ pub mod id;
 pub mod isolate;
 pub mod ledger;
 pub mod model;
+pub mod node;
 pub mod paths;
 pub mod prompt;
 pub mod proto;

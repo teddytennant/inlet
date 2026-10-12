@@ -83,6 +83,17 @@ A worker's binary has to be somewhere the cell can see: `/usr`, `/bin`, `/nix/st
 
 Nothing has to be done. `kill -9` the daemon, or stop it with SIGTERM, and its workers keep running. Ctrl-C on a foreground daemon is the one that stops them. `inlet up` takes them back: same task, same attempt. One that finished in between is settled from the status its keeper wrote down. A model call that was in flight is lost, so a harness should retry a refused proxy connection for a minute, as `examples/agent.py` does. `adopt = false` in the policy turns this off, and then a dead daemon takes its workers with it.
 
+## more machines
+
+A node is another machine running `inlet up` with its own policy. The leader needs a way to run its CLI, and nothing else:
+
+    nodes = {
+      east = { cmd = { "ssh", "east", "inlet", "--home", "/srv/inlet" }, slots = 8 },
+    }
+    workers = { pi = { on = "nodes" } }
+
+The worker `pi` is defined in east's policy. Tasks for it are placed on the node with the most room, run there in cells, and are retried there. `inlet get nodes` shows who is answering. A node silent for `node_grace` (a minute by default) loses its tasks to another.
+
 ## keeping the daemon up
 
 inlet does not supervise itself. Put it under whatever supervises the box:

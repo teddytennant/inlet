@@ -1447,3 +1447,204 @@ fn the_ledger_rotates_and_nothing_is_lost() {
             .any(|t| t["goal"] == "after" && t["state"] == "done")
     });
 }
+
+/// Two daemons on one machine. The second is a node, reached by running its
+/// CLI, the way `ssh host inlet --home ...` would.
+fn node_home(name: &str, workers: &str) -> PathBuf {
+    let home = scratch(name);
+    policy(&home, workers, "");
+    home
+}
+
+fn node_policy(leader: &Path, nodes: &[(&str, &Path, usize)], extra: &str) {
+    let list: String = nodes
+        .iter()
+        .map(|(name, home, slots)| {
+            format!(
+                r#"{name} = {{ cmd = {{ "{}", "--home", "{}" }}, slots = {slots} }},"#,
+                bin().display(),
+                home.display()
+            )
+        })
+        .collect();
+    policy(
+        leader,
+        r#"job = { on = "nodes" }, here = { cmd = { "/bin/sh", "-c", "echo local > out" } },"#,
+        &format!("nodes = {{ {list} }}\nnode_grace = 3\n{extra}"),
+    );
+}
+
+#[test]
+fn a_swarm_runs_on_nodes_and_the_leader_keeps_the_books() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "echo try >> tries; cat \"$INLET_GOAL_FILE\" > goal; sleep 0.3" } },"#;
+    let east = node_home("east", job);
+    let west = node_home("west", job);
+    let leader = scratch("leader");
+    node_policy(&leader, &[("east", &east, 2), ("west", &west, 2)], "");
+    let east_d = start(&east);
+    let west_d = start(&west);
+    let daemon = start(&leader);
+    wait(&leader, &daemon, |v| {
+        v["nodes"]
+            .as_array()
+            .is_some_and(|n| n.len() == 2 && n.iter().all(|n| n["ready"] == true))
+    });
+    // One goal in three needs a second attempt, which the node gives it.
+    manifest(
+        &leader,
+        r#"{"kind":"swarm","name":"far","replicas":4,"completions":9,
+            "template":{"worker":"job","goal":"g {index}","retries":2,
+                        "verify":"n=$(cut -d' ' -f2 goal); [ $((n % 3)) -ne 0 ] || [ $(wc -l < tries) -ge 2 ]"}}"#,
+    );
+    inlet(
+        &leader,
+        &[
+            "add",
+            "-w",
+            "here",
+            "-g",
+            "stays",
+            "--verify",
+            "grep -q local out",
+        ],
+    );
+    let mut peak = 0;
+    let st = wait(&leader, &daemon, |v| {
+        let placed: u64 = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["placed"].as_u64().unwrap())
+            .sum();
+        peak = peak.max(placed);
+        swarm(v, "far")["phase"] == "done" && v["live"] == 0
+    });
+    assert_eq!(swarm(&st, "far")["done"], 9, "{st}");
+    assert!(
+        (3..=4).contains(&peak),
+        "both nodes used, never past their slots: {peak}"
+    );
+    // Nothing ran in a cell on the leader but the one local task.
+    let local = fs::read_dir(leader.join("work"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name() != "probe")
+        .count();
+    assert_eq!(local, 1);
+    assert_eq!(st["held"], 0, "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    // The nodes did the work, and the retries.
+    let (e, w) = (tasks(&status(&east)), tasks(&status(&west)));
+    assert!(
+        !e.is_empty() && !w.is_empty(),
+        "east {} west {}",
+        e.len(),
+        w.len()
+    );
+    assert_eq!(e.len() + w.len(), 12, "nine goals, three of them twice");
+    assert_eq!(
+        e.iter().chain(&w).filter(|t| t["state"] == "done").count(),
+        9
+    );
+    let table = inlet(&leader, &["get", "nodes"]);
+    assert!(table.contains("east") && table.contains("ready"), "{table}");
+    drop((east_d, west_d));
+}
+
+#[test]
+fn a_node_that_goes_dark_loses_its_tasks_to_another() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 1.5; echo ok > out" } },"#;
+    let east = node_home("east2", job);
+    let west = node_home("west2", job);
+    let leader = scratch("leader2");
+    node_policy(&leader, &[("east", &east, 2), ("west", &west, 2)], "");
+    // East is the only node up at first.
+    let mut east_d = start(&east);
+    let daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    for goal in ["a", "b"] {
+        inlet(
+            &leader,
+            &["add", "-w", "job", "-g", goal, "--verify", "grep -q ok out"],
+        );
+    }
+    wait(&leader, &daemon, |v| v["nodes"][0]["placed"] == 2);
+    wait(&east, &east_d, |v| v["live"] == 2);
+    // East dies, daemon and workers both. West comes up.
+    unsafe { libc::kill(east_d.child.id() as i32, libc::SIGINT) };
+    east_d.child.wait().unwrap();
+    let west_d = start(&west);
+    let st = wait(&leader, &daemon, |v| {
+        tasks(v).iter().filter(|t| t["state"] == "done").count() == 2
+    });
+    let all = tasks(&st);
+    // Lost with the node, and placed again as the same attempt.
+    let lost: Vec<&Value> = all.iter().filter(|t| t["reason"] == "node").collect();
+    assert_eq!(lost.len(), 2, "{st}");
+    for t in all.iter().filter(|t| t["state"] == "done") {
+        assert_eq!(t["attempt"], 1, "{st}");
+        assert!(lost.iter().any(|l| l["id"] == t["retry_of"]), "{st}");
+    }
+    let west_done = tasks(&status(&west))
+        .iter()
+        .filter(|t| t["state"] == "done")
+        .count();
+    assert_eq!(west_done, 2);
+    assert_eq!(st["nodes"][0]["ready"], false, "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    drop(west_d);
+}
+
+#[test]
+fn a_leader_that_dies_finds_its_placed_tasks_again() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 2; echo ok > out" } },"#;
+    let east = node_home("east3", job);
+    let leader = scratch("leader3");
+    node_policy(&leader, &[("east", &east, 4)], "");
+    let east_d = start(&east);
+    let mut daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    for goal in ["a", "b", "c"] {
+        inlet(
+            &leader,
+            &["add", "-w", "job", "-g", goal, "--verify", "grep -q ok out"],
+        );
+    }
+    wait(&east, &east_d, |v| v["live"] == 3);
+    kill9(&mut daemon);
+    let daemon = start(&leader);
+    let st = wait(&leader, &daemon, |v| v["live"] == 0 && v["queued"] == 0);
+    let all = tasks(&st);
+    assert_eq!(all.len(), 3, "no crash, no second placement: {st}");
+    assert!(all.iter().all(|t| t["state"] == "done"), "{st}");
+    // Asked for once each, however many times the leader looked.
+    assert_eq!(tasks(&status(&east)).len(), 3);
+
+    // A kill goes through to the node.
+    inlet(
+        &leader,
+        &[
+            "add",
+            "-w",
+            "job",
+            "-g",
+            "doomed",
+            "--verify",
+            "grep -q ok out",
+        ],
+    );
+    wait(&east, &east_d, |v| v["live"] == 1);
+    let doomed = tasks(&status(&leader))
+        .into_iter()
+        .find(|t| t["goal"] == "doomed")
+        .unwrap();
+    inlet(&leader, &["kill", doomed["id"].as_str().unwrap()]);
+    let st = wait(&leader, &daemon, |v| v["live"] == 0);
+    let killed = tasks(&st)
+        .into_iter()
+        .find(|t| t["goal"] == "doomed")
+        .unwrap();
+    assert_eq!(killed["state"], "killed", "{st}");
+    assert_eq!(st["available"], 10000, "{st}");
+    drop(east_d);
+}
