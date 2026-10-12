@@ -202,6 +202,8 @@ pub struct State {
     pub killing: HashSet<String>,
     /// Live tasks that run on a node: which one, and since when.
     pub placed: BTreeMap<String, (String, u64)>,
+    /// Remote tasks whose late spend has been charged.
+    pub late: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,6 +261,7 @@ impl State {
             swarms: BTreeMap::new(),
             killing: HashSet::new(),
             placed: BTreeMap::new(),
+            late: HashSet::new(),
         }
     }
 
@@ -573,6 +576,11 @@ impl State {
                         weight: *weight,
                         ts: *ts,
                     });
+                }
+            }
+            Record::Charge { remote, tokens, .. } => {
+                if self.late.insert(remote.clone()) {
+                    self.purse.available = self.purse.available.saturating_sub(*tokens);
                 }
             }
             Record::Place { id, node, ts } => {
@@ -1103,5 +1111,21 @@ mod tests {
         held.apply(&admit("a", 99));
         assert_eq!(held.purse.spent(), 50);
         assert_eq!(held.tasks["a"].state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_late_charge_is_taken_once() {
+        let mut state = State::new(&crate::config::preset("box"));
+        let before = state.purse.available;
+        let charge = Record::Charge {
+            id: "a".into(),
+            remote: "r1".into(),
+            tokens: 40,
+            ts: 3,
+        };
+        state.apply(&charge);
+        state.apply(&charge);
+        assert_eq!(state.purse.available, before - 40);
+        assert!(state.late.contains("r1"));
     }
 }

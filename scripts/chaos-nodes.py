@@ -193,6 +193,13 @@ tasks, ends, _ = ledger(homes["leader"])
 # node reported as spent, and no worker here spends anything, so that is only
 # ever a slice a node kept because the task crashed there.
 reported = sum(e[0].get("tokens_used", 0) for e in ends.values() if len(e) == 1 and e[0]["kind"] == "exit")
+# And what a node spent on a task the leader had given up on, charged late.
+late = {}
+for home_log in (homes["leader"] + "/ledger/log.old", homes["leader"] + "/ledger/log"):
+    if os.path.exists(home_log):
+        for m in re.finditer(rb'\{"kind":"charge","id":"[^"]*","remote":"([^"]*)","tokens":(\d+)', open(home_log, "rb").read()):
+            late.setdefault(m.group(1), int(m.group(2)))
+reported += sum(late.values())
 check(st["available"] + reported == CAP, "leader purse: available %d + reported by nodes %d != %d" % (st["available"], reported, CAP))
 check(all(len(ends[i]) == 1 for i in tasks), "leader tasks not settled exactly once: %d" % sum(1 for i in tasks if len(ends[i]) != 1))
 done = collections.Counter(t["goal"] for i, t in tasks.items() if ends[i] and ends[i][0].get("reason") == "ok")

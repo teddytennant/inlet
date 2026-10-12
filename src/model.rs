@@ -223,6 +223,14 @@ pub enum Record {
         name: String,
         ts: u64,
     },
+    /// Tokens a node reports for a task the leader had already given up
+    /// on and refunded. Taken from the pool, once per remote task.
+    Charge {
+        id: String,
+        remote: String,
+        tokens: u64,
+        ts: u64,
+    },
     /// The task goes to this node. Written before the node is asked, so a
     /// leader that dies in between knows where to look.
     Place {
@@ -273,7 +281,7 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
         | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation"
-        | "swarm" | "swarm_delete" | "place" => {
+        | "swarm" | "swarm_delete" | "place" | "charge" => {
             Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
         }
         _ => Ok(Decoded::Opaque),

@@ -46,6 +46,8 @@ pub(crate) struct Index {
     #[serde(default)]
     placed: Vec<(String, String, u64)>,
     #[serde(default)]
+    late: Vec<String>,
+    #[serde(default)]
     moderation: Vec<ModerationSnap>,
     #[serde(default)]
     posts_seen: u64,
@@ -300,6 +302,7 @@ pub(crate) fn checkpoint(state: &State, offset: u64) -> Index {
         decision_spent: state.decision_spent,
         swarms: state.swarms.values().cloned().collect(),
         killing: state.killing.iter().cloned().collect(),
+        late: state.late.iter().cloned().collect(),
         placed: state
             .placed
             .iter()
@@ -420,6 +423,7 @@ pub(crate) fn restore(state: &mut State, index: &Index) {
         .map(|swarm| (swarm.name.clone(), swarm.clone()))
         .collect();
     state.killing = index.killing.iter().cloned().collect();
+    state.late = index.late.iter().cloned().collect();
     state.placed = index
         .placed
         .iter()

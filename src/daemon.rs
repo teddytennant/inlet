@@ -1459,6 +1459,28 @@ impl Daemon {
             })
             .map(|t| t.id.clone())
             .collect();
+        // What a node spent on a task this leader had already given up on and
+        // refunded. The spend was real. It comes out of the pool, once.
+        let late: Vec<Record> = tasks
+            .iter()
+            .filter(|t| t.used > 0 && matches!(t.state.as_str(), "done" | "failed" | "killed"))
+            .filter(|t| !self.state.late.contains(&t.id))
+            .filter(|t| {
+                self.state
+                    .tasks
+                    .get(&t.leader)
+                    .is_some_and(|mine| mine.state.is_settled() && mine.reason == "node")
+            })
+            .map(|t| Record::Charge {
+                id: t.leader.clone(),
+                remote: t.id.clone(),
+                tokens: t.used,
+                ts: now_ms(),
+            })
+            .collect();
+        if !late.is_empty() {
+            self.commit(&late, true)?;
+        }
         // Asked once, and again only if it is still there ten seconds on.
         self.stale_asked
             .retain(|_, at| at.elapsed() < Duration::from_secs(60));
@@ -3398,6 +3420,15 @@ impl Daemon {
             Record::Place { id, node, ts } => {
                 (1, json!({"ev":"place","id":id,"node":node,"ts":ts}))
             }
+            Record::Charge {
+                id,
+                remote,
+                tokens,
+                ts,
+            } => (
+                1,
+                json!({"ev":"charge","id":id,"remote":remote,"tokens":tokens,"ts":ts}),
+            ),
             Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
             Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),
             Record::Vote {
