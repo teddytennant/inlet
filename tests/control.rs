@@ -2090,3 +2090,76 @@ fn a_node_turns_away_a_leader_that_has_been_replaced() {
     );
     drop(east_d);
 }
+
+#[test]
+fn a_lock_that_did_not_hold_leaves_one_leader() {
+    let home = scratch("lostlock");
+    policy(
+        &home,
+        r#"job = { cmd = { "/bin/sh", "-c", "sleep 0.3; echo hi > out" } },"#,
+        "",
+    );
+    let spawn = |args: &[&str], log: &str| {
+        let log_path = home.join(log);
+        let file = File::create(&log_path).unwrap();
+        let child = Command::new(bin())
+            .arg("--home")
+            .arg(&home)
+            .args(args)
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        Daemon { child, log_path }
+    };
+    let mut first = spawn(&["up", "-f"], "first.log");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !run(&home, &["status", "--json"]).status.success() {
+        assert!(Instant::now() < deadline, "never answered");
+        thread::sleep(Duration::from_millis(50));
+    }
+    manifest(
+        &home,
+        r#"{"kind":"swarm","name":"many","replicas":2,"completions":30,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&home, &first, |v| {
+        swarm(v, "many")["done"].as_u64().unwrap_or(0) >= 3
+    });
+    let standby = spawn(&["up", "-f", "--standby"], "second.log");
+    thread::sleep(Duration::from_millis(600));
+    // What storage that loses a lock looks like from here: the name now
+    // points at a file the first leader holds no lock on. Both are alive.
+    let log = home.join("ledger/log");
+    let copy = home.join("ledger/log.copy");
+    fs::copy(&log, &copy).unwrap();
+    fs::rename(&copy, &log).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while first.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "two leaders: {}", first.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        first.log().contains("another leader has taken this home"),
+        "{}",
+        first.log()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !standby.log().contains("taking over")
+        || !run(&home, &["status", "--json"]).status.success()
+    {
+        assert!(Instant::now() < deadline, "nobody leads: {}", standby.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The one that is left finishes the work, each goal once.
+    let st = wait(&home, &standby, |v| swarm(v, "many")["phase"] == "done");
+    assert_eq!(swarm(&st, "many")["done"], 30, "{st}");
+    let st = wait(&home, &standby, |v| v["live"] == 0 && v["held"] == 0);
+    // A worker that died with the first leader is a crash, charged in full.
+    let crashed: u64 = tasks(&st)
+        .iter()
+        .filter(|t| t["reason"] == "crash")
+        .map(|t| t["budget_tokens"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(st["available"].as_u64().unwrap() + crashed, 10000, "{st}");
+}
