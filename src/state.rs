@@ -52,8 +52,10 @@ pub struct SwarmView {
     pub failed: u64,
     /// Failures in a row, counted after a task's own retries ran out.
     pub streak: u32,
-    /// No new task before this time.
-    pub next_ms: u64,
+    /// When the last owned task settled, if that settle calls for a pause:
+    /// a failure, or a success in a swarm with no end. 0 is no pause.
+    #[serde(default)]
+    pub paced_ms: u64,
     pub generation: u64,
 }
 
@@ -66,9 +68,21 @@ impl SwarmView {
         self.backoff_limit > 0 && self.streak >= self.backoff_limit
     }
 
+    /// No new task before this time. The pause is worked out from the policy
+    /// in force now, so the ledger alone decides the state.
+    pub fn next_ms(&self, retry: &RetryCfg) -> u64 {
+        if self.paced_ms == 0 {
+            return 0;
+        }
+        // Never less than a second, whatever `retry.backoff` says: an instant
+        // task in a swarm with no end, or one that always fails, would spin the ledger.
+        self.paced_ms
+            .saturating_add(retry.delay_ms(self.streak.max(1)).max(SWARM_PACE_MS))
+    }
+
     /// How many tasks to stamp now.
-    pub fn wants(&self, now: u64) -> u64 {
-        if self.finished() || self.stalled() || now < self.next_ms {
+    pub fn wants(&self, now: u64, retry: &RetryCfg) -> u64 {
+        if self.finished() || self.stalled() || now < self.next_ms(retry) {
             return 0;
         }
         let room = self.replicas.saturating_sub(self.active);
@@ -178,7 +192,6 @@ pub struct State {
     pub posts_seen: u64,
     pub channels: BTreeMap<String, ChannelStat>,
     pub swarms: BTreeMap<String, SwarmView>,
-    retry: RetryCfg,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,7 +247,6 @@ impl State {
             posts_seen: 0,
             channels: BTreeMap::new(),
             swarms: BTreeMap::new(),
-            retry: cfg.retry,
         }
     }
 
@@ -469,7 +481,7 @@ impl State {
                         done: 0,
                         failed: 0,
                         streak: 0,
-                        next_ms: 0,
+                        paced_ms: 0,
                         generation: 0,
                     });
                 swarm.replicas = *replicas;
@@ -478,7 +490,7 @@ impl State {
                 swarm.template = template.clone();
                 // A new spec is a new chance.
                 swarm.streak = 0;
-                swarm.next_ms = 0;
+                swarm.paced_ms = 0;
                 swarm.generation += 1;
             }
             Record::SwarmDelete { name, .. } => {
@@ -558,23 +570,18 @@ impl State {
         let Some(owner) = self.tasks.get(id).and_then(|t| t.plan.owner.clone()) else {
             return;
         };
-        let retry = self.retry;
         let Some(swarm) = self.swarms.get_mut(&owner) else {
             return;
         };
         swarm.active = swarm.active.saturating_sub(1);
-        // Never less than a second, whatever `retry.backoff` says: an instant
-        // task in a swarm with no end, or one that always fails, would spin the ledger.
         if done {
             swarm.done += 1;
             swarm.streak = 0;
-            if swarm.completions == 0 {
-                swarm.next_ms = ts.saturating_add(retry.delay_ms(1).max(SWARM_PACE_MS));
-            }
+            swarm.paced_ms = if swarm.completions == 0 { ts } else { 0 };
         } else {
             swarm.failed += 1;
             swarm.streak = swarm.streak.saturating_add(1);
-            swarm.next_ms = ts.saturating_add(retry.delay_ms(swarm.streak).max(SWARM_PACE_MS));
+            swarm.paced_ms = ts;
         }
     }
 
@@ -823,22 +830,33 @@ mod tests {
             template: Template::default(),
             ts: 1,
         });
-        assert_eq!(state.swarms["s"].wants(5), 2);
+        let retry = crate::config::preset("box").retry;
+        assert_eq!(state.swarms["s"].wants(5, &retry), 2);
         state.apply(&owned("a", None));
         state.apply(&owned("b", None));
-        assert_eq!(state.swarms["s"].wants(5), 0);
+        assert_eq!(state.swarms["s"].wants(5, &retry), 0);
         for id in ["a", "b"] {
             state.apply(&admit(id, 0));
         }
         state.apply(&exit("a", true));
         // One done, one in flight, three wanted: room for one more.
-        assert_eq!(state.swarms["s"].wants(20), 1);
+        assert_eq!(state.swarms["s"].wants(20, &retry), 1);
 
         state.apply(&exit("b", false));
         let swarm = &state.swarms["s"];
         assert_eq!((swarm.failed, swarm.streak, swarm.active), (1, 1, 0));
-        assert_eq!(swarm.next_ms, 10 + 10_000, "a failure backs off");
-        assert_eq!(swarm.wants(11), 0);
+        assert_eq!(swarm.next_ms(&retry), 10 + 10_000, "a failure backs off");
+        assert_eq!(swarm.wants(11, &retry), 0);
+        // The pause is the policy's, read when asked. The ledger holds no delay.
+        let quick = RetryCfg {
+            backoff_ms: 0,
+            ..retry
+        };
+        assert_eq!(
+            swarm.next_ms(&quick),
+            10 + 1_000,
+            "never faster than a second"
+        );
         // The retry takes the failure back and holds the slot.
         state.apply(&owned("b2", Some("b")));
         let swarm = &state.swarms["s"];
@@ -851,7 +869,7 @@ mod tests {
         state.apply(&admit("c", 0));
         state.apply(&exit("c", false));
         assert!(state.swarms["s"].stalled());
-        assert_eq!(state.swarms["s"].wants(u64::MAX), 0);
+        assert_eq!(state.swarms["s"].wants(u64::MAX, &retry), 0);
         // A new spec clears the streak and keeps the counts.
         state.apply(&Record::Swarm {
             name: "s".into(),
@@ -864,7 +882,7 @@ mod tests {
         let swarm = &state.swarms["s"];
         assert_eq!((swarm.generation, swarm.done, swarm.failed), (2, 1, 2));
         assert_eq!(
-            swarm.wants(30),
+            swarm.wants(30, &retry),
             2,
             "completions bound the stamp, not replicas"
         );

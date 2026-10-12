@@ -612,6 +612,7 @@ impl Ui {
                             "tags": task.tags,
                             "parent": task.parent,
                             "recipe": task.recipe,
+                            "retries": task.retries,
                         })
                         .to_string(),
                     ),
@@ -620,6 +621,54 @@ impl Ui {
                         KeyAction::None
                     }
                 },
+                "apply" => {
+                    let Some(path) = parts.first() else {
+                        self.push("apply needs a file".into());
+                        return KeyAction::None;
+                    };
+                    let doc = std::fs::read_to_string(path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|text| {
+                            serde_json::from_str::<serde_json::Value>(&text)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|doc| {
+                            crate::proto::parse_swarm(&doc)
+                                .map(|_| doc)
+                                .map_err(|e| e.to_string())
+                        });
+                    match doc {
+                        Ok(mut doc) => {
+                            doc["op"] = "apply".into();
+                            KeyAction::Send(doc.to_string())
+                        }
+                        Err(e) => {
+                            self.push(format!("apply: {e}"));
+                            KeyAction::None
+                        }
+                    }
+                }
+                "scale" => {
+                    let replicas = parts.get(1).and_then(|n| n.parse::<u64>().ok());
+                    let (Some(name), Some(replicas)) = (parts.first(), replicas) else {
+                        self.push("scale needs a swarm and a count".into());
+                        return KeyAction::None;
+                    };
+                    KeyAction::Send(
+                        serde_json::json!({"op":"scale","name": name, "replicas": replicas})
+                            .to_string(),
+                    )
+                }
+                "delete" => {
+                    let Some(name) = parts.iter().find(|p| !p.starts_with('-')) else {
+                        self.push("delete needs a swarm".into());
+                        return KeyAction::None;
+                    };
+                    let kill = parts.iter().any(|p| p == "--kill");
+                    KeyAction::Send(
+                        serde_json::json!({"op":"delete","name": name, "kill": kill}).to_string(),
+                    )
+                }
                 other => {
                     self.push(format!("{other} is not in this build"));
                     KeyAction::None
@@ -898,6 +947,25 @@ mod tests {
             KeyAction::Send(line) => assert!(line.contains("\"level\":3")),
             _ => panic!("debug"),
         }
+        match ui.command("/scale sweep 8".into()) {
+            KeyAction::Send(line) => {
+                assert!(line.contains("\"op\":\"scale\""), "{line}");
+                assert!(line.contains("\"replicas\":8"), "{line}");
+            }
+            _ => panic!("scale"),
+        }
+        match ui.command("/delete sweep --kill".into()) {
+            KeyAction::Send(line) => {
+                assert!(line.contains("\"name\":\"sweep\""), "{line}");
+                assert!(line.contains("\"kill\":true"), "{line}");
+            }
+            _ => panic!("delete"),
+        }
+        assert!(matches!(ui.command("/scale sweep".into()), KeyAction::None));
+        assert!(matches!(
+            ui.command("/apply /nonexistent/swarm.json".into()),
+            KeyAction::None
+        ));
         match ui.command("/bind stay out #code".into()) {
             KeyAction::Send(line) => {
                 assert!(line.contains("\"op\":\"bind\""));

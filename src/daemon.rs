@@ -299,6 +299,14 @@ fn run(home: &Path) -> Result<()> {
         snap_offset,
         told: HashSet::new(),
     };
+    // A swarm that stalled before the restart already said so.
+    daemon.told = daemon
+        .state
+        .swarms
+        .values()
+        .filter(|swarm| swarm.stalled())
+        .map(|swarm| (swarm.name.clone(), swarm.generation))
+        .collect();
     daemon.recover_and_arm()?;
     fs::write(paths::pid_file(home), format!("{}\n", std::process::id()))?;
     loop {
@@ -863,7 +871,7 @@ impl Daemon {
             if swarm.stalled() {
                 stalled.push((swarm.name.clone(), swarm.generation, swarm.streak));
             }
-            let want = swarm.wants(now).min(STAMP_BATCH);
+            let want = swarm.wants(now, &self.policy.cfg.retry).min(STAMP_BATCH);
             for n in 0..want {
                 let index = swarm.created + 1 + n;
                 let template = &swarm.template;
@@ -2108,7 +2116,7 @@ impl Daemon {
                     "streak": swarm.streak,
                     "created": swarm.created,
                     "generation": swarm.generation,
-                    "next_ms": swarm.next_ms,
+                    "next_ms": swarm.next_ms(&self.policy.cfg.retry),
                     "worker": swarm.template.worker,
                     "goal": swarm.template.goal,
                 })

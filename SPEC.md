@@ -78,7 +78,7 @@ The retry keeps the workdir. The supervisor renames the old one into place, so t
 
 Swarm. `inlet apply` writes a `swarm` record: a name, `replicas`, `completions`, `backoff_limit`, and a task template. The supervisor stamps tasks from the template until `replicas` are in flight, and stops when `completions` are done. `completions` defaults to `replicas`. `completions = 0` never finishes, and paces itself by `retry.backoff` after each task so an instant worker cannot spin the ledger. `{index}` in the goal is the number of the task in its swarm.
 
-A stamped task carries the swarm's name in `plan`. Its own retries run first. A failure counts against the swarm only when the chain is spent. Failures in a row back the swarm off like a retry, and at `backoff_limit` (default 6, 0 for never) the swarm stalls: it stamps nothing and says so on `general`. Any new spec for that name, `apply` or `scale`, clears the streak. A swarm never stamps faster than once a second after a failure, or after a success when it has no end, whatever `retry.backoff` says. Counts are kept by the record stream, not by the running policy, so a replay under an edited policy lands on the same numbers.
+A stamped task carries the swarm's name in `plan`. Its own retries run first. A failure counts against the swarm only when the chain is spent. Failures in a row back the swarm off like a retry, and at `backoff_limit` (default 6, 0 for never) the swarm stalls: it stamps nothing and says so on `general`. Any new spec for that name, `apply` or `scale`, clears the streak. A swarm never stamps faster than once a second after a failure, or after a success when it has no end, whatever `retry.backoff` says. Counts are kept by the record stream, not by the running policy, so a replay under an edited policy lands on the same numbers. The pause is not stored at all: the swarm keeps when it last settled, and the policy in force says how long to wait from there.
 
 `inlet scale` writes the same record with a new `replicas`. It changes how many run at once, not how many run in total. `inlet delete` stops the stamping, and with `--kill` stops what was stamped. Tasks left running no longer belong to a swarm, so a later one of the same name starts from zero. Applying a name again replaces the spec and keeps the counts. Tasks already stamped keep the old template.
 
@@ -272,6 +272,9 @@ Lines starting with `/` are operator commands and do not appear as chat:
 
 ```
 /add <goal> [flags]     enqueue, same flags as inlet add
+/apply <file>           one swarm manifest
+/scale <swarm> <n>
+/delete <swarm> [--kill]
 /bind <text>            constraint, blocks conflicting admits
 /clear <id>             drop a constraint, asks for the passphrase
 /kill <id>
