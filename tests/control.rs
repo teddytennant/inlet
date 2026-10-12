@@ -2019,3 +2019,74 @@ node_loss = "wait""#,
     );
     drop(west_d);
 }
+
+#[test]
+fn a_leader_that_has_been_replaced_stops_writing() {
+    let home = scratch("deposed");
+    policy(
+        &home,
+        r#"job = { cmd = { "/bin/sh", "-c", "sleep 30" } },"#,
+        "",
+    );
+    let mut daemon = start(&home);
+    inlet(&home, &["add", "-w", "job", "-g", "a", "--no-verify"]);
+    wait(&home, &daemon, |v| v["live"] == 1);
+    let epoch: u64 = fs::read_to_string(home.join("ledger/epoch"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let before = fs::metadata(home.join("ledger/log")).unwrap().len();
+    // Storage that only pretends to lock has let another daemon in.
+    fs::write(home.join("ledger/epoch"), (epoch + 1).to_string()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while daemon.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "still leading: {}", daemon.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        daemon.log().contains("another leader has taken this home"),
+        "{}",
+        daemon.log()
+    );
+    assert_eq!(
+        fs::metadata(home.join("ledger/log")).unwrap().len(),
+        before,
+        "it wrote on the way out"
+    );
+}
+
+#[test]
+fn a_node_turns_away_a_leader_that_has_been_replaced() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 1; echo ok > out" } },"#;
+    let east = node_home("depeast", job);
+    let leader = scratch("depleader");
+    node_policy(&leader, &[("east", &east, 2)], "");
+    let east_d = start(&east);
+    let mut daemon = start(&leader);
+    wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
+    // Somebody newer, with the same name, has spoken to the node.
+    let me = fs::read_to_string(leader.join("run/node")).unwrap_or_default();
+    let name = if me.trim().is_empty() {
+        status(&leader)["node"].as_str().unwrap_or("").to_string()
+    } else {
+        me.trim().to_string()
+    };
+    assert!(!name.is_empty(), "no leader name");
+    let out = run(
+        &east,
+        &["status", "--json", "--leader", &format!("{name}@999")],
+    );
+    assert!(out.status.success());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while daemon.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "still leading: {}", daemon.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        daemon.log().contains("another leader has taken this home"),
+        "{}",
+        daemon.log()
+    );
+    drop(east_d);
+}

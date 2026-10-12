@@ -184,6 +184,22 @@ pub(crate) fn node_id(home: &Path) -> Result<String> {
     Ok(id)
 }
 
+/// How many daemons have led this home. 0 when nobody has said.
+pub(crate) fn read_epoch(home: &Path) -> u64 {
+    fs::read_to_string(paths::epoch(home))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A new leader counts itself in. Whoever led before reads a number that
+/// is not its own and knows it has been replaced.
+pub(crate) fn bump_epoch(home: &Path) -> Result<u64> {
+    let next = read_epoch(home) + 1;
+    durable(&paths::epoch(home), next.to_string().as_bytes())?;
+    Ok(next)
+}
+
 pub(crate) fn ensure_lease(home: &Path, node: &str) -> Result<Lease> {
     let path = paths::lease(home);
     if let Ok(bytes) = fs::read(&path) {

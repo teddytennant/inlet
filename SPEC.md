@@ -487,6 +487,8 @@ The leader's purse is the budget for everything it places: it holds each task's 
 
 A second leader is a standby. `inlet up -f --standby` on the same home waits for the lock on the ledger, which the kernel releases the instant the leader's process is gone. It reads nothing until it holds the lock, so it replays everything the leader wrote and nothing it was still writing, and it checks that the file it locked is still the one with the name, because a rotation swaps the log under it. Then it reads the policy, the index, and the log and carries on: the swarms from their counts, the placed tasks by their tags. On one machine that is a second unit. Across machines it needs the home on storage both can reach and that honours `flock`. There is no consensus protocol here and no split brain to arbitrate: the lock is the election.
 
+The lock is the kernel's word on one machine. On shared storage it is the storage's word, and some storage lies. So a leader also counts itself in: `ledger/epoch` goes up by one each time a daemon takes the home, and a leader reads it before every durable write and twice a second besides. A number that is not its own means another has taken over, and it stops without writing another byte. The count goes to the nodes too, in the status call and on every task handed over. A node that has heard a newer leader of the same home tells an older one so, takes no tasks from it, and does not count its calls toward any lease.
+
 ## Scaling
 
 Same binary. The setup field selects caps and the isolator. Nothing else changes.
@@ -551,4 +553,5 @@ Each step is usable before the next one exists.
 21. Chaos across nodes. `scripts/chaos-nodes.py` runs a leader and nodes on one box, kills any of them at random, and leaves a node down past `node_grace` now and then. Its first runs found a daemon that a signal could freeze mid-spawn with the ledger locked.
 22. Leases and a standby. A node stops a leader's tasks when the leader goes quiet for half the grace. `inlet up -f --standby` takes over a home when its leader dies. `chaos-nodes.py --flaky --standby` runs both over a link that drops and hangs.
 23. A real network. `scripts/netns-nodes.py` gives each node its own network namespace, address and sshd, and the leader reaches it by ssh over TCP through a link with 60ms delay and 10% loss. It cuts one node off past `node_grace`, kills the leader, and cuts another for 3s. Needs root, so it is run by hand, not in CI. The node cut off stops its own work, a short cut moves nothing, and the purses add up. Goals a node finished while cut off, whose replacements had also finished before the link came back, were done twice: 3 to 5 in 100 in these runs. With `--wait` it sets `node_loss = "wait"` and fails if any goal is finished twice; none were.
+24. Fencing. `ledger/epoch`, checked before every fsync and carried to nodes. A leader replaced on storage whose lock did not hold stops writing; a node turns it away.
 

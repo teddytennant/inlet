@@ -52,6 +52,9 @@ pub fn daemon_log(home: &Path) -> PathBuf {
 pub fn node(home: &Path) -> PathBuf {
     home.join("run/node")
 }
+pub fn epoch(home: &Path) -> PathBuf {
+    home.join("ledger/epoch")
+}
 pub fn lease(home: &Path) -> PathBuf {
     home.join("run/lease")
 }

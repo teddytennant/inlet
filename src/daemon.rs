@@ -180,6 +180,12 @@ struct Daemon {
     stale_asked: HashMap<String, Instant>,
     /// This daemon's name as a leader.
     me: String,
+    /// Which leader of this home it is, by count. A higher number on disk,
+    /// or in a node's mouth, means another has taken over.
+    epoch: u64,
+    epoch_seen: Instant,
+    /// On a node: the newest epoch heard from each leader.
+    epochs: HashMap<String, u64>,
 }
 
 pub fn serve(home: &Path, foreground: bool, standby: bool) -> Result<()> {
@@ -301,6 +307,7 @@ fn run(home: &Path, standby: bool) -> Result<()> {
             None => return Err(err("another inlet is holding the ledger")),
         }
     };
+    let epoch = snap::bump_epoch(home)?;
     let mut policy = load_signed(home)?;
     guard_ro(home, &mut policy);
     let node = snap::node_id(home)?;
@@ -413,6 +420,9 @@ fn run(home: &Path, standby: bool) -> Result<()> {
         last_pump: Instant::now(),
         stale_asked: HashMap::new(),
         me: node.clone(),
+        epoch,
+        epoch_seen: Instant::now(),
+        epochs: HashMap::new(),
     };
     daemon.sync_nodes();
     // A swarm that stalled before the restart already said so.
@@ -767,8 +777,26 @@ impl Daemon {
         (kept, finished, recheck)
     }
 
+    fn deposed(&mut self) -> crate::error::Error {
+        // Nothing more is written, not even what was waiting to be.
+        self.soft.clear();
+        err("another leader has taken this home; stopping without writing")
+    }
+
+    /// Still the leader, by the count on disk. Looked at before anything is
+    /// made durable: a lock can be lost on storage that only pretends to
+    /// lock, and two daemons appending to one log is the end of the log.
+    fn still_leader(&mut self) -> Result<()> {
+        self.epoch_seen = Instant::now();
+        if snap::read_epoch(&self.home) > self.epoch {
+            return Err(self.deposed());
+        }
+        Ok(())
+    }
+
     fn commit(&mut self, recs: &[Record], hard: bool) -> Result<()> {
         if hard {
+            self.still_leader()?;
             self.flush_soft()?;
             self.ledger.append_all(recs, true)?;
         } else {
@@ -794,6 +822,9 @@ impl Daemon {
     fn pump(&mut self) -> Result<()> {
         // If this loop itself stood still, on a slow fsync say, a leader's
         // calls were queueing unanswered. That silence is not the leader's.
+        if self.epoch_seen.elapsed() >= Duration::from_millis(500) {
+            self.still_leader()?;
+        }
         let gap = self.last_pump.elapsed();
         if gap >= Duration::from_millis(500) {
             self.born += gap;
@@ -1331,7 +1362,7 @@ impl Daemon {
                 cfg.cmd.clone(),
                 self.node_tx.clone(),
                 self.policy.cfg.node_grace_ms,
-                self.me.clone(),
+                format!("{}@{}", self.me, self.epoch),
             );
         }
     }
@@ -1349,7 +1380,7 @@ impl Daemon {
         let mut tags: Vec<String> = task
             .tags
             .iter()
-            .filter(|t| !t.starts_with("inlet:"))
+            .filter(|t| !t.starts_with("inlet:") && !t.starts_with("epoch:"))
             .cloned()
             .collect();
         tags.push(node::tag(id));
@@ -1359,6 +1390,7 @@ impl Daemon {
             self.policy.cfg.node_grace_ms / 2,
             self.me
         ));
+        tags.push(format!("epoch:{}", self.epoch));
         let verifier = task.verifier.clone().filter(|v| !v.is_empty());
         let spec = json!({
             "worker": task.worker,
@@ -1410,6 +1442,7 @@ impl Daemon {
                 }
                 return Ok(());
             }
+            node::Msg::Deposed => return Err(self.deposed()),
             node::Msg::Status { node, tasks } => (node, tasks),
         };
         let mine: Vec<(String, u64)> = self
@@ -2308,7 +2341,21 @@ impl Daemon {
         match req {
             Request::Status { brief, leader } => {
                 if let Some(leader) = leader {
-                    self.leaders.insert(leader, Instant::now());
+                    // `name@epoch`. An older epoch of a name already heard
+                    // is a leader that has been replaced and does not know.
+                    let (name, epoch) = match leader.rsplit_once('@') {
+                        Some((name, n)) => (name.to_string(), n.parse().unwrap_or(0)),
+                        None => (leader, 0),
+                    };
+                    let newest = self.epochs.entry(name.clone()).or_insert(epoch);
+                    if epoch < *newest {
+                        let mut v = self.status_json(true);
+                        v["deposed"] = json!(true);
+                        self.reply(id, v);
+                        return Ok(());
+                    }
+                    *newest = epoch;
+                    self.leaders.insert(name, Instant::now());
                 }
                 self.reply(id, self.status_json(brief))
             }
@@ -2825,6 +2872,16 @@ impl Daemon {
         // that is unsure whether an add arrived sends it again. The second
         // one finds the first and is that task, not another.
         if let [task] = tasks {
+            let tagged = |prefix: &str| task.tags.iter().find_map(|t| t.strip_prefix(prefix));
+            let from = tagged("lease:")
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, name)| name);
+            let epoch = tagged("epoch:").and_then(|n| n.parse::<u64>().ok());
+            if let (Some(from), Some(epoch)) = (from, epoch) {
+                if self.epochs.get(from).is_some_and(|newest| epoch < *newest) {
+                    return Err(err("a newer leader has this home"));
+                }
+            }
             if let Some(tag) = task.tags.iter().find(|t| t.starts_with("inlet:")) {
                 if let Some(first) = self.state.tasks.values().find(|t| t.tags.contains(tag)) {
                     return Ok(vec![first.id.clone()]);

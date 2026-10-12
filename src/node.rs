@@ -37,6 +37,8 @@ pub enum Msg {
         node: String,
         tasks: Option<Vec<Remote>>,
     },
+    /// A node has heard from a newer leader of the same home.
+    Deposed,
     Added {
         id: String,
         ok: bool,
@@ -119,6 +121,10 @@ pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64, me:
             None,
             limit,
         );
+        if raw.as_deref().is_some_and(deposed) {
+            let _ = tx.send(Msg::Deposed);
+            return;
+        }
         let tasks = raw.and_then(|out| parse(&out));
         if tx
             .send(Msg::Status {
@@ -131,6 +137,10 @@ pub fn watch(name: String, cmd: Vec<String>, tx: Sender<Msg>, grace_ms: u64, me:
         }
         thread::sleep(every);
     });
+}
+
+fn deposed(out: &str) -> bool {
+    serde_json::from_str::<Value>(out).is_ok_and(|v| v["deposed"] == true)
 }
 
 fn parse(out: &str) -> Option<Vec<Remote>> {
