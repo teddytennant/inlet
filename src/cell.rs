@@ -137,8 +137,10 @@ struct Raw {
     keep: bool,
     log_fd: i32,
     status_fd: i32,
-    cap: u64,
-    deadline: u64,
+    argv_keep_pivot: *const *const libc::c_char,
+    argv_keep_host: *const *const libc::c_char,
+    keep_log_arg: *mut libc::c_char,
+    keep_status_arg: *mut libc::c_char,
 }
 
 /// Host paths every cell sees read-only: `/usr`, the top-level dirs a
@@ -448,6 +450,38 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         None => None,
     };
 
+    // `inlet door keep <log fd> <status fd> <cap> <deadline> -- cmd...`. The
+    // child fills in the two descriptor numbers once it knows them.
+    let mut fd_args = ([0u8; 12], [0u8; 12]);
+    let keep_tail = c_strings(&[
+        req.keep.as_ref().map_or(0, |k| k.cap).to_string(),
+        req.keep.as_ref().map_or(0, |k| k.deadline).to_string(),
+        "--".to_string(),
+    ])?;
+    let keep_head = c_strings(&["door".to_string(), "keep".to_string()])?;
+    let keep_bin = (
+        c"/run/inlet".to_owned(),
+        match &exe {
+            Some(exe) => c(exe)?,
+            None => c"/run/inlet".to_owned(),
+        },
+    );
+    if req.keep.is_some() && exe.is_none() {
+        return Err(err("a kept worker needs the door"));
+    }
+    let keep_argv = |bin: &CString| {
+        let mut out: Vec<*const libc::c_char> = vec![bin.as_ptr()];
+        out.extend(keep_head.iter().map(|s| s.as_ptr()));
+        out.push(fd_args.0.as_ptr().cast());
+        out.push(fd_args.1.as_ptr().cast());
+        out.extend(keep_tail.iter().map(|s| s.as_ptr()));
+        out.extend(argv_c.iter().map(|s| s.as_ptr()));
+        out.push(ptr::null());
+        out
+    };
+    let keep_pivot = keep_argv(&keep_bin.0);
+    let keep_host = keep_argv(&keep_bin.1);
+
     let mut raw = Raw {
         parent: unsafe { libc::getpid() },
         ready_w: ready_w.0,
@@ -485,8 +519,10 @@ pub fn spawn(req: &SpawnRequest) -> Result<Spawned> {
         keep: kept.is_some(),
         log_fd: kept.as_ref().map_or(-1, |k| k.0 .0),
         status_fd: kept.as_ref().map_or(-1, |k| k.1 .0),
-        cap: req.keep.as_ref().map_or(0, |k| k.cap),
-        deadline: req.keep.as_ref().map_or(0, |k| k.deadline),
+        argv_keep_pivot: keep_pivot.as_ptr(),
+        argv_keep_host: keep_host.as_ptr(),
+        keep_log_arg: fd_args.0.as_mut_ptr().cast(),
+        keep_status_arg: fd_args.1.as_mut_ptr().cast(),
     };
 
     let stack = map_stack()?;
@@ -595,11 +631,19 @@ fn prepare_root(root: &Path, ro: &[PathBuf]) -> Result<()> {
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
     ] {
-        if let Ok(pem) = fs::read(bundle) {
-            fs::create_dir_all(root.join("etc/ssl/certs"))?;
-            fs::write(root.join("etc/ssl/certs/ca-certificates.crt"), pem)?;
-            break;
+        let Ok(real) = fs::canonicalize(bundle) else {
+            continue;
+        };
+        fs::create_dir_all(root.join("etc/ssl/certs"))?;
+        let dst = root.join("etc/ssl/certs/ca-certificates.crt");
+        // Half a megabyte per spawn adds up. Where the file already sits on a
+        // path the cell can see, a link is enough.
+        if ro.iter().any(|dir| real.starts_with(dir)) {
+            std::os::unix::fs::symlink(&real, &dst)?;
+        } else {
+            fs::copy(&real, &dst)?;
         }
+        break;
     }
     Ok(())
 }
@@ -625,7 +669,7 @@ fn env_strings(req: &SpawnRequest, path: &str, pivoted: bool, exe: Option<&Path>
         "TMPDIR=/tmp".into(),
         "LANG=C".into(),
     ];
-    if req.root.join("etc/ssl/certs/ca-certificates.crt").exists() {
+    if fs::symlink_metadata(req.root.join("etc/ssl/certs/ca-certificates.crt")).is_ok() {
         env.push(format!("SSL_CERT_FILE={etc}/ssl/certs/ca-certificates.crt"));
     }
     if req.door {
@@ -715,23 +759,6 @@ unsafe fn child_entry(a: &Raw) -> ! {
     set_limits(a.memory_mb, a.pids, a.seconds);
     let _ = libc::chdir(if pivoted { c"/work".as_ptr() } else { a.work });
 
-    let mut out = a.out_w;
-    if a.keep {
-        let mut ends = [0i32; 2];
-        if libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
-            fail(a.err_w, errno());
-        }
-        let worker = libc::fork();
-        if worker < 0 {
-            fail(a.err_w, errno());
-        }
-        if worker > 0 {
-            libc::close(ends[1]);
-            keeper(a, worker, ends[0]);
-        }
-        out = ends[1];
-    }
-
     let input = if pivoted { a.stdin_pivot } else { a.stdin_host };
     let mut stdin = -1;
     if !input.is_null() {
@@ -744,98 +771,62 @@ unsafe fn child_entry(a: &Raw) -> ! {
         libc::dup2(stdin, 0);
         libc::close(stdin);
     }
-    libc::dup2(out, 1);
-    libc::dup2(out, 2);
-    close_except(a.err_w);
     let envp = if pivoted { a.envp_pivot } else { a.envp_host };
+    if a.keep {
+        // The keeper is this binary, exec'd fresh. A fork that stayed would
+        // carry the daemon's memory and environment into the cell.
+        let log = libc::fcntl(a.log_fd, libc::F_DUPFD, 3);
+        let status = libc::fcntl(a.status_fd, libc::F_DUPFD, 3);
+        if log < 0 || status < 0 {
+            fail(a.err_w, errno());
+        }
+        libc::dup2(log, 1);
+        libc::dup2(log, 2);
+        let mut held = [a.err_w, log, status];
+        held.sort_unstable();
+        let mut from = 3u32;
+        for fd in held {
+            if fd as u32 > from {
+                libc::syscall(libc::SYS_close_range, from, fd as u32 - 1, 0);
+            }
+            from = fd as u32 + 1;
+        }
+        libc::syscall(libc::SYS_close_range, from, u32::MAX, 0);
+        // The two numbers go in as the last arguments before `--`.
+        write_fd(a.keep_log_arg, log);
+        write_fd(a.keep_status_arg, status);
+        let argv = if pivoted {
+            a.argv_keep_pivot
+        } else {
+            a.argv_keep_host
+        };
+        libc::execve(argv.read(), argv, envp);
+        fail(a.err_w, errno());
+    }
+    libc::dup2(a.out_w, 1);
+    libc::dup2(a.out_w, 2);
+    close_except(a.err_w);
     libc::execve(a.argv.read(), a.argv, envp);
     fail(a.err_w, errno());
 }
 
-/// The kept worker's parent. Holds nothing of the daemon's: not its lock on
-/// the ledger, not its sockets. Copies output to the log, waits, records the
-/// status, and leaves. No allocation; this runs in a forked child.
-unsafe fn keeper(a: &Raw, worker: i32, pipe: i32) -> ! {
-    // Move the three descriptors it needs out of the way, then close the rest.
-    let pipe = libc::fcntl(pipe, libc::F_DUPFD_CLOEXEC, 3);
-    let log = libc::fcntl(a.log_fd, libc::F_DUPFD_CLOEXEC, 3);
-    let status = libc::fcntl(a.status_fd, libc::F_DUPFD_CLOEXEC, 3);
-    let mut held = [pipe, log, status];
-    held.sort_unstable();
-    if held[0] < 3 {
-        libc::_exit(127);
-    }
-    let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-    for fd in 0..3 {
-        if null >= 0 {
-            libc::dup2(null, fd);
-        }
-    }
-    // The setup pipe closes here. The daemon's read of it ends when the
-    // worker's copy does, on exec or on failure.
-    let mut from = 3u32;
-    for fd in held {
-        if fd as u32 > from {
-            libc::syscall(libc::SYS_close_range, from, fd as u32 - 1, 0);
-        }
-        from = fd as u32 + 1;
-    }
-    libc::syscall(libc::SYS_close_range, from, u32::MAX, 0);
-    let flags = libc::fcntl(pipe, libc::F_GETFL);
-    libc::fcntl(pipe, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
-    let mut started: libc::timespec = std::mem::zeroed();
-    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut started);
-    let mut written = 0u64;
-    let mut buf = [0u8; 8192];
-    let mut code = -1;
-    let mut done = false;
+/// Write a descriptor number into an argument the parent left room for.
+unsafe fn write_fd(slot: *mut libc::c_char, fd: i32) {
+    let mut digits = [0u8; 10];
+    let mut n = fd.max(0) as u32;
+    let mut len = 0;
     loop {
-        loop {
-            let n = libc::read(pipe, buf.as_mut_ptr().cast(), buf.len());
-            if n <= 0 {
-                break;
-            }
-            let room = a.cap.saturating_sub(written).min(n as u64) as usize;
-            let mut put = 0;
-            while put < room {
-                let w = libc::write(log, buf[put..].as_ptr().cast(), room - put);
-                if w <= 0 {
-                    break;
-                }
-                put += w as usize;
-            }
-            written += room as u64;
-        }
-        if done {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
             break;
         }
-        if libc::waitpid(worker, &mut code, libc::WNOHANG) == worker {
-            // One more pass for what it printed last.
-            done = true;
-            continue;
-        }
-        if a.deadline > 0 {
-            let mut now: libc::timespec = std::mem::zeroed();
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
-            if (now.tv_sec - started.tv_sec) as u64 > a.deadline {
-                libc::kill(worker, libc::SIGKILL);
-            }
-        }
-        let nap = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 20_000_000,
-        };
-        libc::nanosleep(&nap, ptr::null_mut());
     }
-    let bytes = code.to_ne_bytes();
-    libc::write(status, bytes.as_ptr().cast(), 4);
-    libc::fsync(status);
-    libc::_exit(if libc::WIFEXITED(code) {
-        libc::WEXITSTATUS(code)
-    } else {
-        128 + libc::WTERMSIG(code)
-    });
+    for i in 0..len {
+        *slot.add(i) = digits[len - 1 - i] as libc::c_char;
+    }
+    *slot.add(len) = 0;
 }
 
 unsafe fn pivot(a: &Raw) -> i32 {
@@ -969,14 +960,16 @@ unsafe fn landlock(rules: &[Rule]) -> i32 {
 }
 
 unsafe fn set_limits(memory_mb: u64, pids: u64, seconds: u64) {
-    // The dynamic linker needs address space. Below 64MB the cap is a lie, so floor it.
+    // Writable private memory, not address space. Node, the JVM, and Go reserve
+    // gigabytes they never touch, and a cap on address space kills them at start.
+    // Below 64MB the cap is a lie, so floor it.
     // RLIMIT_NPROC is per uid, not per worker. The cgroup pids controller is the real cap.
     let mem = memory_mb.saturating_mul(1024 * 1024).max(64 * 1024 * 1024);
-    let as_lim = libc::rlimit {
+    let data_lim = libc::rlimit {
         rlim_cur: mem,
         rlim_max: mem,
     };
-    libc::setrlimit(libc::RLIMIT_AS, &as_lim);
+    libc::setrlimit(libc::RLIMIT_DATA, &data_lim);
     let nofile = libc::rlimit {
         rlim_cur: 1024,
         rlim_max: 1024,

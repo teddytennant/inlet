@@ -62,11 +62,26 @@ The prompt is the preamble, the goal, the verifier that will judge it, and on a 
     cell    = { ro = { "/path/to/inlet/examples" } }
     workers = { agent = { cmd = { "python3", "/path/to/inlet/examples/agent.py" } } }
 
+Pi runs as a worker the same way, with no network at all. Its model calls go out through `door run`:
+
+    cell    = { ro = { "/path/to/node_modules/@earendil-works" } }
+    workers = {
+      pi = { cmd = { "/bin/sh", "-c",
+               "exec \"$INLET_BIN\" door run --port 18400 -- node /path/to/pi-coding-agent/dist/bundle/cli.js -p --no-session --provider inlet --model worker \"$1\"",
+               "sh", "{prompt}" },
+             net = "none" },
+    }
+
+and a seed directory holding `.pi/agent/models.json`, passed with `--seed` or `"seed"` in a template:
+
+    {"providers": {"inlet": {"baseUrl": "http://127.0.0.1:18400/v1", "api": "openai-completions",
+      "apiKey": "$INLET_TOKEN", "models": [{"id": "worker", "contextWindow": 200000, "maxTokens": 8000}]}}}
+
 A worker's binary has to be somewhere the cell can see: `/usr`, `/bin`, `/nix/store`, or a path listed in `cell = { ro = { ... } }`.
 
 ## when the daemon dies
 
-Nothing has to be done. `kill -9` the daemon and its workers keep running. `inlet up` takes them back: same task, same attempt. One that finished in between is settled from the status its keeper wrote down. A model call that was in flight is lost, so a harness should retry a refused proxy connection for a minute, as `examples/agent.py` does. `adopt = false` in the policy turns this off, and then a dead daemon takes its workers with it.
+Nothing has to be done. `kill -9` the daemon, or stop it with SIGTERM, and its workers keep running. Ctrl-C on a foreground daemon is the one that stops them. `inlet up` takes them back: same task, same attempt. One that finished in between is settled from the status its keeper wrote down. A model call that was in flight is lost, so a harness should retry a refused proxy connection for a minute, as `examples/agent.py` does. `adopt = false` in the policy turns this off, and then a dead daemon takes its workers with it.
 
 ## operator skill
 

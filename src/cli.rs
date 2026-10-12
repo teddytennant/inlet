@@ -809,6 +809,177 @@ fn delete(home: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The parent a kept worker runs under, started by the cell and by nothing
+/// else. It copies the worker's output to the transcript and writes the wait
+/// status down, so neither needs the daemon to be alive.
+fn door_keep(args: &[String]) -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let usage = "inlet door keep is run by the cell";
+    let num = |i: usize| -> Result<u64> { parse_u64(args.get(i).ok_or_else(|| err(usage))?) };
+    let (log_fd, status_fd, cap, deadline) = (num(0)?, num(1)?, num(2)?, num(3)?);
+    if args.get(4).map(String::as_str) != Some("--")
+        || args.len() < 6
+        || log_fd < 3
+        || status_fd < 3
+    {
+        return Err(err(usage));
+    }
+    let mut log = unsafe { fs::File::from_raw_fd(log_fd as i32) };
+    let mut status = unsafe { fs::File::from_raw_fd(status_fd as i32) };
+    let mut ends = [0i32; 2];
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(err("pipe"));
+    }
+    let (mut read, write) = unsafe {
+        (
+            fs::File::from_raw_fd(ends[0]),
+            OwnedFd::from_raw_fd(ends[1]),
+        )
+    };
+    let mut child = Command::new(&args[5])
+        .args(&args[6..])
+        .stdout(Stdio::from(write.try_clone()?))
+        .stderr(Stdio::from(write))
+        .spawn();
+    let code = match &mut child {
+        Ok(child) => {
+            unsafe {
+                let flags = libc::fcntl(ends[0], libc::F_GETFL);
+                libc::fcntl(ends[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let started = std::time::Instant::now();
+            let mut written = 0u64;
+            let mut buf = [0u8; 8192];
+            let mut pump = |log: &mut fs::File| {
+                while let Ok(n) = read.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = cap.saturating_sub(written).min(n as u64) as usize;
+                    let _ = log.write_all(&buf[..room]);
+                    written += room as u64;
+                }
+            };
+            loop {
+                pump(&mut log);
+                if let Ok(Some(done)) = child.try_wait() {
+                    // Once more for what it printed last.
+                    pump(&mut log);
+                    break done.into_raw();
+                }
+                // With no daemon left to time it out, this is the clock.
+                if deadline > 0 && started.elapsed() > Duration::from_secs(deadline) {
+                    let _ = child.kill();
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(log, "inlet: {}: {e}", args[5]);
+            127 << 8
+        }
+    };
+    status.write_all(&code.to_ne_bytes())?;
+    status.sync_all()?;
+    std::process::exit(if libc::WIFEXITED(code) {
+        libc::WEXITSTATUS(code)
+    } else {
+        128 + libc::WTERMSIG(code)
+    });
+}
+
+/// Most harnesses want a base URL, not a unix socket. This puts the proxy on
+/// a loopback port for one command and gets out of the way.
+fn door_run(args: &[String]) -> Result<()> {
+    use std::net::{Shutdown, TcpListener};
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::ExitStatusExt;
+
+    // A fixed port suits a config file that cannot read the environment. Give
+    // such a worker `net = "none"`, so each has the port to itself.
+    let (port, args) = match args.first().map(String::as_str) {
+        Some("--port") => (
+            parse_u64(args.get(1).ok_or_else(|| err("--port needs a number"))?)? as u16,
+            &args[2..],
+        ),
+        _ => (0, args),
+    };
+    let cmd = match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
+    };
+    let Some(program) = cmd.first() else {
+        return Err(err("usage: inlet door run [--port N] -- CMD..."));
+    };
+    let sock = std::env::var("INLET_PROXY_SOCK").map_err(|_| err("INLET_PROXY_SOCK is not set"))?;
+    loopback_up();
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let port = listener.local_addr()?.port();
+    thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let sock = sock.clone();
+            thread::spawn(move || {
+                // A refusal is the daemon restarting. Hold the caller, do not fail it.
+                let started = std::time::Instant::now();
+                let upstream = loop {
+                    match UnixStream::connect(&sock) {
+                        Ok(stream) => break stream,
+                        Err(_) if started.elapsed() > Duration::from_secs(60) => return,
+                        Err(_) => thread::sleep(Duration::from_millis(250)),
+                    }
+                };
+                let (Ok(mut client_r), Ok(mut upstream_w)) =
+                    (client.try_clone(), upstream.try_clone())
+                else {
+                    return;
+                };
+                let up = thread::spawn(move || {
+                    let _ = io::copy(&mut client_r, &mut upstream_w);
+                    let _ = upstream_w.shutdown(Shutdown::Write);
+                });
+                let (mut upstream_r, mut client_w) = (upstream, client);
+                let _ = io::copy(&mut upstream_r, &mut client_w);
+                let _ = client_w.shutdown(Shutdown::Both);
+                let _ = up.join();
+            });
+        }
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let status = std::process::Command::new(program)
+        .args(&cmd[1..])
+        .env("INLET_PROXY_URL", &base)
+        .env("OPENAI_BASE_URL", format!("{base}/v1"))
+        .env("OPENAI_API_BASE", format!("{base}/v1"))
+        .status()
+        .map_err(|e| err(format!("{program}: {e}")))?;
+    std::process::exit(
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+    );
+}
+
+/// A cell with `net = "none"` has a loopback that was never brought up.
+fn loopback_up() {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return;
+        }
+        let mut req: libc::ifreq = std::mem::zeroed();
+        req.ifr_name[0] = b'l' as libc::c_char;
+        req.ifr_name[1] = b'o' as libc::c_char;
+        if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut req) == 0 {
+            req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &req);
+        }
+        libc::close(fd);
+    }
+}
+
 /// The worker's side of the worker socket. Reads `INLET_SOCK` and `INLET_TOKEN`.
 fn door(args: &[String]) -> Result<()> {
     const USAGE: &str = "\
@@ -818,7 +989,14 @@ inlet door spawn -w W -g GOAL --verify CMD [--tokens N] [--seconds N] [--retries
 inlet door children
 inlet door wait [--timeout SECONDS]
 inlet door draft <name> --run FILE --verify CMD [-t TAG]...
-inlet door vote <target> <choice> [--channel NAME]";
+inlet door vote <target> <choice> [--channel NAME]
+inlet door run [--port N] -- CMD...   run CMD with the proxy on a local port, OPENAI_BASE_URL set";
+    if args.first().map(String::as_str) == Some("run") {
+        return door_run(args.get(1..).unwrap_or(&[]));
+    }
+    if args.first().map(String::as_str) == Some("keep") {
+        return door_keep(args.get(1..).unwrap_or(&[]));
+    }
     let sock = std::env::var("INLET_SOCK").map_err(|_| err("INLET_SOCK is not set"))?;
     let token = std::env::var("INLET_TOKEN").map_err(|_| err("INLET_TOKEN is not set"))?;
     let call = |mut body: Value| -> Result<Value> {

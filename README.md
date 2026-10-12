@@ -16,13 +16,15 @@ Say what should be running. inlet keeps it running: a failed task is tried again
     {"kind": "swarm", "name": "sweep", "replicas": 4, "completions": 200,
      "template": {"worker": "prover", "goal": "attempt {index}", "verify": "./check"}}
 
-- one static binary, 3.14MB
+- one static binary, 3.16MB
 - scheduler, reconciler, ledger, token proxy, board, tui
-- 16,799 lines in src/
+- 17,002 lines in src/
 - 2.5MB RSS, empty
-- 133 tests
+- 135 tests
 
-Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file.
+Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file, and `inlet door run` gives it the metered proxy as a base URL.
+
+A 10,000-task swarm with one failure in ten and a `kill -9` halfway: all done, nothing held, 15MB RSS. Twelve Pi agents in cells with no network, daemon killed mid-run: four taken back, twelve done.
 
 SPEC.md
 

@@ -62,6 +62,13 @@ fn policy(home: &Path, body: &str) {
     fs::write(home.join("policy.lua"), body).unwrap();
 }
 
+/// These tests are about a daemon that takes its workers down with it.
+fn dies_with_daemon(home: &Path) {
+    let path = home.join("policy.lua");
+    let body = fs::read_to_string(&path).unwrap();
+    fs::write(path, format!("{body}\nadopt = false\n")).unwrap();
+}
+
 fn base_policy(extra_workers: &str, admit: &str, caps: &str, proxy: &str) -> String {
     format!(
         r#"
@@ -81,7 +88,6 @@ min_ev = 0
 value = 400000
 debug = 1
 unattended = false
-adopt = false
 retry = {{ max = 0, backoff = 0 }}
 default_budget = {{ tokens = 200, seconds = 30, memory_mb = 64, pids = 8 }}
 proxy = {{ {proxy} }}
@@ -346,6 +352,7 @@ fn kill9_charges_the_slice_once() {
         &home,
         &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
     );
+    dies_with_daemon(&home);
     let mut daemon = start(&home);
     inlet(
         &home,
@@ -920,12 +927,18 @@ fn watch_prints_a_post() {
 }
 
 fn token_of(pid: i64) -> String {
-    let env = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-    let env = String::from_utf8_lossy(&env);
-    env.split('\0')
-        .find_map(|e| e.strip_prefix("INLET_TOKEN="))
-        .unwrap_or("")
-        .to_string()
+    // With a keeper, the task's pid is the keeper and the worker is its child.
+    let kids = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+    let mut pids = vec![pid.to_string()];
+    pids.extend(kids.split_whitespace().map(str::to_string));
+    for pid in pids {
+        let env = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        let env = String::from_utf8_lossy(&env);
+        if let Some(token) = env.split('\0').find_map(|e| e.strip_prefix("INLET_TOKEN=")) {
+            return token.to_string();
+        }
+    }
+    String::new()
 }
 
 fn worker_rpc(home: &Path, body: Value) -> Value {
@@ -2888,6 +2901,7 @@ fn constraint_and_purse_survive_kill9() {
         &home,
         &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
     );
+    dies_with_daemon(&home);
     let mut daemon = start(&home);
     inlet(
         &home,
@@ -3367,6 +3381,7 @@ fn snap_kill9_purse_matches_the_ledger() {
         &home,
         &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
     );
+    dies_with_daemon(&home);
     let mut daemon = start(&home);
     inlet(
         &home,
@@ -3561,6 +3576,7 @@ fn follower_pulls_the_snapshot_and_does_not_admit() {
         &home,
         &base_policy("", r#"return "allow""#, "max_tokens = 1000,", ""),
     );
+    dies_with_daemon(&home);
     let mut daemon = start(&home);
     inlet(
         &home,

@@ -33,7 +33,7 @@ inlet supervisor
           +-- may request a child, which gets a slice of the parent
 ```
 
-Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. A daemon that dies without that chance leaves its workers running, and the next one takes them back. See Desired state.
+Quit the TUI and the supervisor stays up. The TUI is a client of the socket even when it runs in the same process. `inlet up` is the daemon. `inlet` is `inlet attach`. Ctrl-C on an attached TUI detaches. Ctrl-C on the daemon stops workers, writes their exits, fsyncs, exits. SIGTERM is the daemon going away, not the work: it fsyncs and exits, and the workers stay up for the next one. A daemon that dies without that chance leaves its workers running, and the next one takes them back. See Desired state.
 
 There are two first-class ways in. The group chat (the TUI, and later a bridge) is where humans and agents talk. The operator agent (Pi or Wizard with the skill) is how a human drives the CLI without living in that room. Both speak the operator socket. Neither is linked into the binary.
 
@@ -82,11 +82,11 @@ A stamped task carries the swarm's name in `plan`. Its own retries run first. A 
 
 `inlet scale` writes the same record with a new `replicas`. It changes how many run at once, not how many run in total. `inlet delete` stops the stamping, and with `--kill` stops what was stamped. Tasks left running no longer belong to a swarm, so a later one of the same name starts from zero. Applying a name again replaces the spec and keeps the counts. Tasks already stamped keep the old template.
 
-Adoption. The control plane can die without taking the work with it. Each worker runs under a keeper, a parent that stays in the cell with it and holds nothing of the daemon's: not the ledger lock, not a socket. The keeper copies the worker's output to the transcript, and when the worker exits it writes the wait status to `run/exit/<id>`. The daemon notes pid, start time, and token in `run/live/<id>`, mode 0600, outside every cell.
+Adoption. The control plane can die without taking the work with it. Each worker runs under a keeper, a parent that stays in the cell with it and holds nothing of the daemon's: not the ledger lock, not a socket, not its memory or environment. The keeper is this binary exec'd fresh inside the cell, never a fork left running. The keeper copies the worker's output to the transcript, and when the worker exits it writes the wait status to `run/exit/<id>`. The daemon notes pid, start time, and token in `run/live/<id>`, mode 0600, outside every cell.
 
 A new daemon reads those notes before it calls anything a crash. A worker still running is taken back: same task, same attempt, same token, with its spend so far read from the ledger. One that finished while nobody watched is settled from its recorded status, and its verifier runs. A task whose verifier was running gets the verifier again. Only a task with no process and no status is a `crash`, and then the two loops do the rest: chains with attempts left retry, and swarms stamp replacements. A child whose parent did not make it is killed.
 
-The sockets are mounted into a cell by directory, read-only, so a kept worker finds the socket the new daemon binds. A model call in flight when the daemon dies is lost, and until the new daemon is up the proxy refuses connections. `inlet door` retries for a minute. A harness should do the same for its model calls, and the preamble says so. With no daemon there is no proxy, so an orphan spends nothing, and its keeper kills it 15 seconds past its `seconds`. Cost records are soft appends, so a crash can lose the last 50ms of a kept worker's spend from its meter. `adopt = false` goes back to `PR_SET_PDEATHSIG`: the workers die with the daemon.
+The sockets are mounted into a cell by directory, read-only, so a kept worker finds the socket the new daemon binds. A model call in flight when the daemon dies is lost, and until the new daemon is up the proxy refuses connections. `inlet door` retries for a minute. A harness should do the same for its model calls, and the preamble says so. With no daemon there is no proxy, so an orphan spends nothing, and its keeper kills it 15 seconds past its `seconds`. A kept worker's meter is rebuilt from `cost` records, so with adoption on they are durable appends, not soft ones. `adopt = false` goes back to `PR_SET_PDEATHSIG`: the workers die with the daemon.
 
 ## Ledger
 
@@ -123,7 +123,7 @@ Isolator, picked in config, falling back to rlimit when cgroup writes are refuse
 | name | what it does | when |
 |---|---|---|
 | cgroup | cgroup v2: memory, pids, cpu.max | default where the user slice is delegated |
-| rlimit | nofile, nproc, cpu nice | fallback when cgroup writes are refused |
+| rlimit | data, nofile, nproc, cpu nice | fallback when cgroup writes are refused |
 | slurm | one job per worker, the job is the cgroup | cluster |
 
 An isolator bounds resources. It hides nothing from a process running as the same uid. That is the cell's job, and every worker runs in one, under any isolator. The cell is built from Rust before exec, no helper binary:
@@ -237,6 +237,12 @@ It reaches the worker every way a harness might want, so the task record never h
 | `/etc/preamble` | the preamble alone |
 
 `env` on a worker adds variables, with `env:NAME` read from the daemon's environment. `stall` on a worker stops one that has printed nothing and made no model call for that long, reason `stall`. A worker waiting on a child is not stalled.
+
+The memory rlimit is `RLIMIT_DATA`, writable private memory, not address space. Node, the JVM, and Go reserve gigabytes they never touch, and a cap on address space kills them before they start.
+
+A harness that wants a base URL and not a unix socket runs under `$INLET_BIN door run -- CMD`. That puts the proxy on a loopback port for the life of the command and sets `OPENAI_BASE_URL`. `--port N` fixes the port, for a harness whose config file cannot read the environment; give that worker `net = "none"` so each has the port to itself. A cell with no network still has its own loopback.
+
+When a task settles its cell root and scratch are removed. The workdir and the transcripts are the record.
 
 `$INLET_BIN` is this binary, bound into the cell. `inlet door` reads `INLET_SOCK` and `INLET_TOKEN`. A result travels up as the child's last post, which `door wait` returns to the parent. A parent never reads a child's workdir.
 

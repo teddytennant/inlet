@@ -655,7 +655,7 @@ fn a_daemon_stop_reruns_what_it_interrupted() {
         "",
     )
     .unwrap();
-    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) };
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGINT) };
     daemon.child.wait().unwrap();
 
     let daemon = start(&home);
@@ -810,4 +810,137 @@ fn a_kept_worker_cannot_outrun_its_clock_or_a_kill() {
         let live = home.join("run/live").join(task["id"].as_str().unwrap());
         assert!(!live.exists(), "{}", live.display());
     }
+}
+
+/// An upstream that answers every post with the same completion and usage.
+fn fake_upstream() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = conn.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(head) = text.find("\r\n\r\n") {
+                    let want = text
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|rest| rest.lines().next().map(|n| n.trim().to_string()))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + want {
+                        break;
+                    }
+                }
+            }
+            if !raw.starts_with(b"POST ") {
+                continue;
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"from-upstream"}}],"usage":{"total_tokens":22}}"#;
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn a_harness_that_wants_a_base_url_gets_the_metered_proxy() {
+    let home = scratch("baseurl");
+    let port = fake_upstream();
+    // What any OpenAI client does: post to $OPENAI_BASE_URL with $OPENAI_API_KEY.
+    let seed = home.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    fs::write(
+        seed.join("client.py"),
+        r#"import os, urllib.request
+req = urllib.request.Request(
+    os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+    data=b'{"messages": [], "max_tokens": 10}',
+    headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"], "Content-Type": "application/json"},
+)
+open("reply", "w").write(urllib.request.urlopen(req).read().decode())
+"#,
+    )
+    .unwrap();
+    let cmd = r#"cmd = { "/bin/sh", "-c", "exec \"$INLET_BIN\" door run -- python3 client.py" }"#;
+    policy(
+        &home,
+        &format!(r#"open = {{ {cmd}, net = "host" }}, shut = {{ {cmd}, net = "none" }},"#),
+        &format!(r#"proxy = {{ upstream = "http://127.0.0.1:{port}", key = "k" }}"#),
+    );
+    let daemon = start(&home);
+    for worker in ["open", "shut"] {
+        inlet(
+            &home,
+            &[
+                "add",
+                "-w",
+                worker,
+                "-g",
+                "call the model",
+                "--seed",
+                seed.to_str().unwrap(),
+                "--verify",
+                "grep -q from-upstream reply",
+            ],
+        );
+    }
+    let st = wait(&home, &daemon, |v| {
+        tasks(v)
+            .iter()
+            .all(|t| t["state"] == "done" || t["state"] == "failed")
+    });
+    for task in tasks(&st) {
+        assert_eq!(task["state"], "done", "{st} {}", daemon.log());
+    }
+    // Both calls went through the purse: 22 tokens each, the rest refunded.
+    assert_eq!(st["available"], 10000 - 44, "{st}");
+}
+
+#[test]
+fn sigterm_leaves_the_work_running() {
+    let home = scratch("term");
+    policy(
+        &home,
+        r#"slow = { cmd = { "/bin/sh", "-c", "echo up > up; sleep 1.2; touch made" } },"#,
+        "",
+    );
+    let mut daemon = start(&home);
+    inlet(
+        &home,
+        &[
+            "add",
+            "-w",
+            "slow",
+            "-g",
+            "keep going",
+            "--verify",
+            "test -f made",
+        ],
+    );
+    let st = wait(&home, &daemon, |v| v["live"] == 1);
+    let id = tasks(&st)[0]["id"].clone();
+    while work(&home, &id, "up").is_empty() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) };
+    assert!(daemon.child.wait().unwrap().success());
+
+    let daemon = start(&home);
+    let st = wait(&home, &daemon, |v| tasks(v)[0]["state"] != "running");
+    assert_eq!(tasks(&st).len(), 1, "{st}");
+    assert_eq!(tasks(&st)[0]["state"], "done", "{st} {}", daemon.log());
+    assert_eq!(st["available"], 10000, "{st}");
 }

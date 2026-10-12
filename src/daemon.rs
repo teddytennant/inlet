@@ -61,7 +61,7 @@ enum Incoming {
         line: String,
     },
     Gone(u64),
-    Signal,
+    Signal(i32),
 }
 
 struct Client {
@@ -342,8 +342,15 @@ fn run(home: &Path) -> Result<()> {
                 daemon.clients.remove(&id);
                 daemon.hub.set_debug(daemon.max_debug());
             }
-            Ok(Incoming::Signal) => {
-                daemon.shutdown()?;
+            Ok(Incoming::Signal(sig)) => {
+                // SIGTERM is the daemon going away: a restart, an upgrade. The
+                // work stays up and the next daemon takes it back. Ctrl-C is a
+                // person saying stop.
+                if sig == libc::SIGTERM && daemon.workers.iter().all(|w| w.kept) {
+                    daemon.detach()?;
+                } else {
+                    daemon.shutdown()?;
+                }
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -375,8 +382,8 @@ fn install_signals(tx: Sender<Incoming>) -> Result<()> {
         loop {
             let n = unsafe { libc::read(read, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                for _ in 0..n {
-                    let _ = tx.send(Incoming::Signal);
+                for sig in &buf[..n as usize] {
+                    let _ = tx.send(Incoming::Signal(i32::from(*sig)));
                 }
             } else if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -650,13 +657,15 @@ impl Daemon {
                 if let Some(worker) = self.workers.iter_mut().find(|w| w.id == id) {
                     worker.last_io = Instant::now();
                 }
+                // A kept worker's meter is rebuilt from these after a crash,
+                // so they cannot wait for the next soft flush.
                 self.commit(
                     &[Record::Cost {
                         id,
                         tokens,
                         ts: now_ms(),
                     }],
-                    false,
+                    self.policy.cfg.adopt,
                 )?;
             }
             Note::Empty { id } => {
@@ -827,6 +836,10 @@ impl Daemon {
             return Ok(());
         }
         let queued: Vec<String> = self.state.queue.iter().cloned().collect();
+        if queued.is_empty() {
+            return Ok(());
+        }
+        let live = self.state.live();
         let now = now_ms();
         let mut batch: Vec<Record> = Vec::new();
         let mut chosen: Vec<String> = Vec::new();
@@ -835,7 +848,7 @@ impl Daemon {
         let mut hold_pids = 0u64;
         let mut child_hold: HashMap<String, (u64, u64, u64)> = HashMap::new();
         for id in queued {
-            if self.state.live() + chosen.len() >= self.policy.cfg.caps.max_live {
+            if live + chosen.len() >= self.policy.cfg.caps.max_live {
                 break;
             }
             let Some(task) = self.state.tasks.get(&id).cloned() else {
@@ -863,7 +876,7 @@ impl Daemon {
             let depth = depth_of(&self.state, task.parent.as_deref());
             let lua = self.policy.admit(&AdmitCtx {
                 depth,
-                live: self.state.live() + chosen.len(),
+                live: live + chosen.len(),
                 queued: self.state.queue.len(),
                 worker: &task.worker,
                 goal: &task.goal,
@@ -903,7 +916,7 @@ impl Daemon {
                     cfg: &self.policy.cfg,
                     purse: &self.state.purse,
                     samples: &self.state.samples,
-                    live: self.state.live() + chosen.len(),
+                    live: live + chosen.len(),
                     depth,
                     cell_ok: self.cell_ok,
                     lua_says: lua,
@@ -1414,6 +1427,11 @@ impl Daemon {
         self.workers.retain(|w| w.id != id);
         let _ = fs::remove_file(paths::live_file(&self.home, id));
         let _ = fs::remove_file(paths::exit_file(&self.home, id));
+        // The cell was scaffolding. The workdir and the transcripts are the record.
+        let _ = fs::remove_dir_all(paths::cell_root(&self.home, id));
+        let _ = fs::remove_dir_all(paths::cell_root(&self.home, &format!("{id}-check")));
+        let _ = fs::remove_dir_all(paths::scratch(&self.home, id));
+        let _ = fs::remove_dir_all(self.home.join("run/checks").join(id));
         if reason == "killed" {
             self.commit(
                 &[Record::Kill {
@@ -1442,17 +1460,16 @@ impl Daemon {
 
     fn timeouts(&mut self) -> Result<()> {
         let now = now_ms();
+        // Only what has a process. A walk over every header each pass is what
+        // slows a swarm down as its history grows.
         let due: Vec<String> = self
-            .state
-            .tasks
-            .values()
+            .workers
+            .iter()
+            .filter_map(|w| self.state.tasks.get(&w.id))
             .filter(|t| {
-                t.state.is_live()
-                    && t.admit_ms
-                        .map(|start| {
-                            now.saturating_sub(start) >= t.budget.seconds.saturating_mul(1000)
-                        })
-                        .unwrap_or(false)
+                t.admit_ms
+                    .map(|start| now.saturating_sub(start) >= t.budget.seconds.saturating_mul(1000))
+                    .unwrap_or(false)
             })
             .map(|t| t.id.clone())
             .collect();
@@ -2690,6 +2707,21 @@ impl Daemon {
             .map(|c| c.debug)
             .max()
             .unwrap_or(self.policy.cfg.debug)
+    }
+
+    /// Leave without stopping a worker. Each has a keeper and a note on disk.
+    fn detach(&mut self) -> Result<()> {
+        self.shutting_down = true;
+        // A verifier is cheap to run again, and its note says to.
+        for check in std::mem::take(&mut self.checks) {
+            unsafe {
+                libc::kill(check.pid, libc::SIGKILL);
+                libc::waitpid(check.pid, std::ptr::null_mut(), 0);
+            }
+        }
+        self.flush_soft()?;
+        let _ = fs::remove_file(paths::pid_file(&self.home));
+        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<()> {
