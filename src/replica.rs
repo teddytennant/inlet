@@ -839,6 +839,18 @@ impl Links {
         self.shared.0.lock().unwrap().alive = Instant::now();
     }
 
+    /// How much of the log each other replica is known to hold, by name.
+    pub fn progress(&self) -> Vec<(String, u64)> {
+        let shared = self.shared.0.lock().unwrap();
+        let mut all: Vec<(String, u64)> = shared
+            .acked
+            .iter()
+            .map(|(name, acked)| (name.clone(), acked.0))
+            .collect();
+        all.sort();
+        all
+    }
+
     pub fn deposed(&self) -> bool {
         self.shared.0.lock().unwrap().deposed
     }
@@ -1277,6 +1289,13 @@ mod tests {
         stuck: bool,
         /// Leaders let go of the log behind a snapshot now and then.
         compacts: bool,
+        /// Which homes each home's policy names as replicas, and what every
+        /// policy is on its way to saying. One home's policy is changed at
+        /// a time, and the set by one member at a time.
+        views: Vec<Vec<bool>>,
+        target: Vec<bool>,
+        grows: bool,
+        changes: usize,
     }
 
     struct Lead {
@@ -1288,13 +1307,26 @@ mod tests {
         acked: Vec<u64>,
         /// The newest snapshot each peer is known to hold.
         snapped: Vec<u64>,
+        /// The replicas as this leader last read them from its policy.
+        set: Vec<bool>,
     }
 
     impl Sim {
         fn new(tag: &str, n: usize, seed: u64) -> Sim {
+            // With a changing set there are homes in waiting, empty, that
+            // no policy names yet.
+            let grows = tag.starts_with('m');
+            let slots = if grows { 5 } else { n };
+            let target: Vec<bool> = (0..slots).map(|i| i < n).collect();
             Sim {
-                homes: (0..n).map(|i| home(&format!("{tag}-{seed}-{i}"))).collect(),
-                leaders: (0..n).map(|_| None).collect(),
+                views: vec![target.clone(); slots],
+                target,
+                grows,
+                changes: 0,
+                homes: (0..slots)
+                    .map(|i| home(&format!("{tag}-{seed}-{i}")))
+                    .collect(),
+                leaders: (0..slots).map(|_| None).collect(),
                 kept: Vec::new(),
                 won: Default::default(),
                 rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
@@ -1347,8 +1379,120 @@ mod tests {
             snap::CRASH_IN.with(|c| c.set(-1));
         }
 
+        /// What `sync_replicas` does: the leader reads its policy again.
+        fn sync(&mut self, i: usize) {
+            let view = self.views[i].clone();
+            let Some(lead) = &mut self.leaders[i] else {
+                return;
+            };
+            if lead.set == view {
+                return;
+            }
+            let changed = (0..view.len()).filter(|k| view[*k] != lead.set[*k]).count();
+            if changed > 1 || !view[i] {
+                self.leaders[i] = None;
+                return;
+            }
+            for (k, member) in view.iter().enumerate() {
+                if *member && !lead.set[k] {
+                    lead.theirs[k] = None;
+                    lead.acked[k] = 0;
+                    lead.snapped[k] = 0;
+                }
+            }
+            lead.set = view;
+        }
+
+        /// One step of a change to the set: begin one, or carry the one in
+        /// hand to one more home's policy.
+        fn reshape(&mut self) {
+            let slots = self.homes.len();
+            if let Some(k) = (0..slots).find(|k| self.views[*k] != self.target) {
+                let late: Vec<usize> = (k..slots)
+                    .filter(|k| self.views[*k] != self.target)
+                    .collect();
+                let pick = late[self.roll(late.len() as u64) as usize];
+                self.views[pick] = self.target.clone();
+                return;
+            }
+            let members: Vec<usize> = (0..slots).filter(|k| self.target[*k]).collect();
+            // The next change waits for the last one to be finished: every
+            // policy the same, which was just seen, and every replica full.
+            // A set changed again while a new member is still empty can be
+            // left with too few homes that hold the ledger.
+            let full = members.iter().map(|k| self.len(*k)).max().unwrap_or(0);
+            let led = members.iter().any(|k| self.leaders[*k].is_some());
+            let behind = members
+                .iter()
+                .any(|k| self.len(*k) < full || filling(&self.homes[*k]));
+            // Not at every chance: a few changes in a run, with long
+            // stretches of trouble between them.
+            if self.roll(8) != 0 || ((full == 0 || !led || behind) && !self.calm(&members)) {
+                return;
+            }
+            let spare = (0..slots).find(|k| !self.target[*k] && log_len(&self.homes[*k]) == 0);
+            match spare {
+                Some(new) if members.len() < 5 && self.roll(2) == 0 => {
+                    self.target[new] = true;
+                    self.changes += 1;
+                }
+                _ if members.len() > 3 => {
+                    let out = members[self.roll(members.len() as u64) as usize];
+                    if self.leaders[out].is_none() {
+                        self.target[out] = false;
+                        self.changes += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// The operator waits for a quiet moment before changing the set: a
+        /// leader up, and every replica holding all of the ledger. Here the
+        /// quiet is arranged. What follows it, while the change makes its
+        /// way from one policy to the next, is as rough as the rest.
+        fn calm(&mut self, members: &[usize]) -> bool {
+            let all = vec![true; self.homes.len()];
+            for round in 0..25 {
+                let leading: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|i| self.leaders[*i].is_some())
+                    .collect();
+                for i in &leading {
+                    self.write(*i);
+                    for _ in 0..15 {
+                        for j in members.iter().copied().filter(|j| j != i) {
+                            self.send(*i, j, u64::MAX);
+                        }
+                    }
+                    self.answer(*i);
+                }
+                if let [i] = leading[..] {
+                    let full = self.len(i);
+                    let done = self.leaders[i].is_some()
+                        && full > 0
+                        && self.kept.len() as u64 == full
+                        && members
+                            .iter()
+                            .all(|k| self.len(*k) == full && !filling(&self.homes[*k]));
+                    if done {
+                        return true;
+                    }
+                    continue;
+                }
+                for k in members.iter().copied() {
+                    if self.leaders[k].is_none() {
+                        self.quiet(k);
+                    }
+                }
+                self.elect(members[round % members.len()], &all, u64::MAX);
+            }
+            false
+        }
+
         fn elect(&mut self, i: usize, up: &[bool], faults: u64) {
-            if self.leaders[i].is_some() {
+            if self.leaders[i].is_some() || !self.views[i][i] {
                 return;
             }
             let home = self.homes[i].clone();
@@ -1360,10 +1504,12 @@ mod tests {
             }
             let n = self.homes.len();
             let homes = self.homes.clone();
+            let set = self.views[i].clone();
+            let peers = set.iter().filter(|m| **m).count() - 1;
             let ask = |req: &Value| -> Tally {
                 let (mut yes, mut newest) = (0, 0);
                 for (j, peer) in homes.iter().enumerate() {
-                    if j == i || !up[j] {
+                    if j == i || !up[j] || !set[j] {
                         continue;
                     }
                     let Ok(v) = answer_vote(peer, req) else {
@@ -1377,7 +1523,7 @@ mod tests {
                 (yes, newest)
             };
             self.arm(faults);
-            let won = campaign(&home, &format!("r{i}"), "sim", most(n - 1), &ask);
+            let won = campaign(&home, &format!("r{i}"), "sim", most(peers), &ask);
             let Ok(Some(term)) = won else {
                 self.disarm();
                 return;
@@ -1396,6 +1542,7 @@ mod tests {
                     theirs: vec![None; n],
                     acked: vec![0; n],
                     snapped: vec![0; n],
+                    set: set.clone(),
                 })
             })();
             self.disarm();
@@ -1418,6 +1565,7 @@ mod tests {
 
         /// The leader on `i` appends a record to its own log.
         fn write(&mut self, i: usize) {
+            self.sync(i);
             let home = self.homes[i].clone();
             self.stamp = self.stamp.wrapping_add(1);
             let (stamp, n) = (self.stamp, 20 + self.roll(60) as usize);
@@ -1439,6 +1587,10 @@ mod tests {
             let (home, peer) = (self.homes[i].clone(), self.homes[j].clone());
             let want = self.len(i);
             let chunk = 1 + self.roll(120);
+            self.sync(i);
+            if self.leaders[i].as_ref().is_none_or(|lead| !lead.set[j]) {
+                return;
+            }
             self.arm(faults);
             let Some(lead) = &mut self.leaders[i] else {
                 self.disarm();
@@ -1496,13 +1648,17 @@ mod tests {
         /// What `ship` does: if most replicas hold the log, and this home
         /// has not voted for another meanwhile, the client is answered.
         fn answer(&mut self, i: usize) {
+            self.sync(i);
             let home = self.homes[i].clone();
             let Some(lead) = &self.leaders[i] else {
                 return;
             };
             let len = self.len(i);
-            let have = 1 + lead.acked.iter().filter(|a| **a >= len).count();
-            if have < most(self.homes.len() - 1) {
+            let others: Vec<usize> = (0..lead.set.len())
+                .filter(|k| lead.set[*k] && *k != i)
+                .collect();
+            let have = 1 + others.iter().filter(|k| lead.acked[**k] >= len).count();
+            if have < most(others.len()) {
                 return;
             }
             let _guard = guard(&home).unwrap();
@@ -1535,7 +1691,7 @@ mod tests {
         /// The disk under a home is replaced. Everything it held is gone,
         /// what it had promised included.
         fn wipe(&mut self, i: usize) {
-            if self.leaders[i].is_some() {
+            if self.leaders[i].is_some() || !self.target[i] {
                 return;
             }
             let _ = fs::remove_dir_all(self.homes[i].join("ledger"));
@@ -1549,6 +1705,9 @@ mod tests {
                 if self.wipes > 0 && step > 50 && self.wiped < self.wipes && self.roll(150) == 0 {
                     let i = self.roll(n as u64) as usize;
                     self.wipe(i);
+                }
+                if self.grows && self.roll(12) == 0 {
+                    self.reshape();
                 }
                 let i = self.roll(n as u64) as usize;
                 let j = self.roll(n as u64) as usize;
@@ -1580,21 +1739,31 @@ mod tests {
             let n = self.homes.len();
             self.disarm();
             let all = vec![true; n];
+            // Every policy says the same thing by now.
+            self.views = vec![self.target.clone(); n];
+            let members: Vec<usize> = (0..n).filter(|k| self.target[*k]).collect();
+            for i in 0..n {
+                self.sync(i);
+            }
             for round in 0..200 {
                 let leading: Vec<usize> = (0..n).filter(|i| self.leaders[*i].is_some()).collect();
                 if let [i] = leading[..] {
                     self.write(i);
                     for _ in 0..40 {
-                        for j in (0..n).filter(|j| *j != i) {
+                        for j in members.iter().copied().filter(|j| *j != i) {
                             self.send(i, j, u64::MAX);
                         }
                     }
                     self.answer(i);
-                    let same = (0..n).all(|j| self.len(j) == self.len(i));
+                    let same = members.iter().all(|j| self.len(*j) == self.len(i));
                     if self.leaders[i].is_some() && same && self.kept.len() as u64 == self.len(i) {
-                        let top = self.homes.iter().map(|h| floor(h)).max().unwrap() as usize;
+                        let top = members
+                            .iter()
+                            .map(|j| floor(&self.homes[*j]))
+                            .max()
+                            .unwrap() as usize;
                         let log = fs::read(paths::ledger(&self.homes[i])).unwrap();
-                        for (j, home) in self.homes.iter().enumerate() {
+                        for (j, home) in members.iter().map(|j| (*j, &self.homes[*j])) {
                             assert_eq!(fs::read(paths::ledger(home)).unwrap()[top..], log[top..]);
                             assert!(self.holds_kept(j), "r{j} ended without what was kept");
                             assert!(
@@ -1609,16 +1778,16 @@ mod tests {
                 // None, or more than one that has not yet learned better.
                 for i in leading {
                     self.write(i);
-                    for j in (0..n).filter(|j| *j != i) {
+                    for j in members.iter().copied().filter(|j| *j != i) {
                         self.send(i, j, u64::MAX);
                     }
                 }
-                for k in 0..n {
+                for k in members.iter().copied() {
                     if self.leaders[k].is_none() {
                         self.quiet(k);
                     }
                 }
-                self.elect(round % n, &all, u64::MAX);
+                self.elect(members[round % members.len()], &all, u64::MAX);
             }
             let state: Vec<String> = (0..n)
                 .map(|i| {
@@ -1665,7 +1834,7 @@ mod tests {
         faults: u64,
         wipes: usize,
     ) {
-        let mut stuck = 0;
+        let (mut stuck, mut changes) = (0, 0);
         let runs = seeds.end - seeds.start;
         for seed in seeds {
             let mut sim = Sim::new(tag, n, seed);
@@ -1674,8 +1843,14 @@ mod tests {
             sim.run(steps, faults);
             sim.settle();
             stuck += sim.stuck as u64;
+            changes += sim.changes as u64;
             sim.done();
         }
+        // A run of changing sets in which no set changed has tested nothing.
+        assert!(
+            !tag.starts_with('m') || changes >= runs,
+            "only {changes} changes of set in {runs} runs"
+        );
         // Stuck is allowed after a lost disk, but it must be the exception.
         assert!(
             stuck * 4 <= runs,
@@ -1707,6 +1882,13 @@ mod tests {
         storm("ck3", 3, 0..40, 500, 6);
         // And with a disk lost.
         storm_with("cw3", 3, 0..30, 500, u64::MAX, 1);
+    }
+
+    #[test]
+    fn a_set_that_grows_and_shrinks_loses_nothing_kept() {
+        storm("m3", 3, 0..25, 500, u64::MAX);
+        // And with kills between durable writes.
+        storm("mk3", 3, 0..20, 500, 6);
     }
 
     #[test]

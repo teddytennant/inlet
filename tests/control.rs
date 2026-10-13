@@ -2526,6 +2526,23 @@ fn a_replica_is_added_and_another_taken_out_while_the_work_goes_on() {
         );
         thread::sleep(Duration::from_millis(100));
     }
+    // The leader says when the new one is full, which is when the next
+    // change may be made.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = status(&homes[first]);
+        let d_row = st["replicas"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["name"] == "d").cloned());
+        if d_row.is_some_and(|r| r["held"].as_u64() >= r["ledger"].as_u64() && r["held"] != 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader never saw d full: {st}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     // One of the first three, not the leader, is taken out and switched off.
     let gone = (0..3).find(|i| *i != first).unwrap();
     let stay: Vec<(&str, &Path)> = (0..3)

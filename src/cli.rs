@@ -809,7 +809,12 @@ fn get(home: &Path, args: &[String]) -> Result<()> {
         "tasks" | "task" => "tasks",
         "swarms" | "swarm" => "swarms",
         "nodes" | "node" => "nodes",
-        _ => return Err(err("usage: inlet get [tasks|swarms|nodes] [--json]")),
+        "replicas" | "replica" => "replicas",
+        _ => {
+            return Err(err(
+                "usage: inlet get [tasks|swarms|nodes|replicas] [--json]",
+            ))
+        }
     };
     let v = checked(
         proto::rpc(home, json!({"op":"status","brief": key != "tasks"}))?,
@@ -826,6 +831,19 @@ fn get(home: &Path, args: &[String]) -> Result<()> {
     }
     let text = |row: &Value, field: &str| row[field].as_str().unwrap_or("").to_string();
     let num = |row: &Value, field: &str| row[field].as_u64().unwrap_or(0);
+    if key == "replicas" {
+        println!("{:<20}  {:<10}  {:>12}", "NAME", "STATE", "HELD");
+        for row in &rows {
+            let (held, ledger) = (num(row, "held"), num(row, "ledger"));
+            println!(
+                "{:<20}  {:<10}  {:>12}",
+                text(row, "name"),
+                if held >= ledger { "full" } else { "filling" },
+                format!("{held}/{ledger}"),
+            );
+        }
+        return Ok(());
+    }
     if key == "nodes" {
         println!("{:<20}  {:<9}  {:>8}", "NAME", "STATE", "PLACED");
         for row in &rows {

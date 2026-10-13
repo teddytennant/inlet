@@ -3538,6 +3538,13 @@ impl Daemon {
                 "slots": cfg.slots,
                 "placed": self.state.placed.values().filter(|(node, _)| node == name).count(),
             })).collect::<Vec<_>>(),
+            // The other replicas, and how much of the ledger each holds. A
+            // new one is full when its figure reaches the ledger's length.
+            "replicas": self.links.as_ref().map(|links| links.progress()).unwrap_or_default().iter().map(|(name, held)| json!({
+                "name": name,
+                "held": held,
+                "ledger": self.ledger.len(),
+            })).collect::<Vec<_>>(),
             "unattended": self.policy.cfg.unattended,
             "lease": self.holder,
             "fence": self.fence,
