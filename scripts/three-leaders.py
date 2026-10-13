@@ -22,6 +22,8 @@ ap.add_argument("--key", default="")
 ap.add_argument("--dir", default="/tmp/inlet-3l")
 ap.add_argument("--upstream", default="", help="a model endpoint on this machine. The node then runs here, and the tasks are examples/agent.py asking a model")
 ap.add_argument("--model", default="grok-4.5")
+ap.add_argument("--rounds", type=int, default=4, help="how many times the leader is killed")
+ap.add_argument("--batch", type=int, default=12, help="adds while each leader leads")
 ap.add_argument("--compact", type=int, default=0, help="replicas let go of the log every this many bytes")
 args = ap.parse_args()
 binary = os.path.abspath(args.inlet)
@@ -255,9 +257,9 @@ try:
     where = {"a": "here", "b": b_name, "c": args.c}
     who, _ = leader()
     assert who, "nobody was elected"
-    for round in range(4):
+    for round in range(args.rounds):
         led.append(who)
-        print("%s (%s) leads: %d adds answered" % (who, where[who], adds(12)), flush=True)
+        print("%s (%s) leads: %d adds answered" % (who, where[who], adds(args.batch)), flush=True)
         down(who)
         nxt, _ = leader(skip=who)
         if not nxt or nxt == who:
@@ -275,7 +277,7 @@ try:
                 print("  probe %s (%.1fs): %s %s" % (n, time.time() - t0, out.stdout.replace("\n", " | ")[:400], out.stderr[:200]), flush=True)
             back(who)
             break
-        print("  killed on its own machine and held down. %s (%s) took over: %d adds" % (nxt, where[nxt], adds(6)), flush=True)
+        print("  killed on its own machine and held down. %s (%s) took over: %d adds" % (nxt, where[nxt], adds(args.batch // 2)), flush=True)
         back(who)
         who = nxt
     led.append(who)
@@ -283,7 +285,7 @@ try:
     if len(set(led)) < 2:
         problems.append("the lead only ever sat on %s" % sorted(set(led)))
     sums = {}
-    end = time.time() + (1200 if args.upstream else 240)
+    end = time.time() + (2400 if args.upstream else 240)
     while time.time() < end:
         who, st = leader()
         if st and st["live"] == 0 and st["queued"] == 0:
