@@ -2457,3 +2457,154 @@ fn replicas_let_go_of_the_log_and_a_new_leader_starts_from_the_snapshot() {
     };
     assert_eq!(tail(&homes[third]), tail(&homes[second]));
 }
+
+/// Write a policy naming exactly these replicas into each of their homes.
+fn replica_set(members: &[(&str, &Path)], workers: &str) {
+    let list: String = members
+        .iter()
+        .map(|(name, home)| {
+            format!(
+                r#"{name} = {{ cmd = {{ "{}", "--home", "{}" }} }},"#,
+                bin().display(),
+                home.display()
+            )
+        })
+        .collect();
+    for (_, home) in members {
+        policy(home, workers, &format!("replicas = {{ {list} }}"));
+    }
+}
+
+#[test]
+fn a_replica_is_added_and_another_taken_out_while_the_work_goes_on() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 0.2; echo hi > out" } },"#;
+    let homes = replica_homes("grow", job, "");
+    let names = ["a", "b", "c"];
+    let mut daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica(home, name))
+        .collect();
+    let first = leader_of(&homes, None);
+    manifest(
+        &homes[first],
+        r#"{"kind":"swarm","name":"many","replicas":2,"completions":60,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&homes[first], &daemons[first], |v| {
+        swarm(v, "many")["done"].as_u64().unwrap_or(0) >= 5
+    });
+    // A fourth home, empty. Every policy is told of it, and nothing restarts.
+    let d = scratch("growd");
+    thread::sleep(Duration::from_millis(1100));
+    replica_set(
+        &[
+            ("a", &homes[0]),
+            ("b", &homes[1]),
+            ("c", &homes[2]),
+            ("d", &d),
+        ],
+        job,
+    );
+    let d_daemon = replica(&d, "d");
+    let len = |home: &Path| {
+        fs::metadata(home.join("ledger/log"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !daemons[first].log().contains("replicas are now a, b, c, d")
+        || len(&d) == 0
+        || len(&d) + 4000 < len(&homes[first])
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the new replica was never filled: {} of {}: {}",
+            len(&d),
+            len(&homes[first]),
+            daemons[first].log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // One of the first three, not the leader, is taken out and switched off.
+    let gone = (0..3).find(|i| *i != first).unwrap();
+    let stay: Vec<(&str, &Path)> = (0..3)
+        .filter(|i| *i != gone)
+        .map(|i| (names[i], homes[i].as_path()))
+        .chain([("d", d.as_path())])
+        .collect();
+    thread::sleep(Duration::from_millis(1100));
+    replica_set(&stay, job);
+    kill9(&mut daemons[gone]);
+    fs::remove_dir_all(&homes[gone]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !daemons[first].log().contains("replicas are now")
+        || daemons[first].log().matches("replicas are now").count() < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the leader never took the smaller set: {}",
+            daemons[first].log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Now the leader dies. Of the first three only one is left: it cannot
+    // lead, or be led, without the replica that was added.
+    kill9(&mut daemons[first]);
+    let left: Vec<PathBuf> = stay
+        .iter()
+        .filter(|(name, _)| *name != names[first])
+        .map(|(_, home)| home.to_path_buf())
+        .collect();
+    assert_eq!(left.len(), 2);
+    let next = leader_of(&left, None);
+    let other = (0..3).find(|i| *i != gone && *i != first).unwrap();
+    let watching = if left[next] == d {
+        &d_daemon
+    } else {
+        &daemons[other]
+    };
+    let st = wait(&left[next], watching, |v| {
+        swarm(v, "many")["phase"] == "done"
+    });
+    assert_eq!(swarm(&st, "many")["done"], 60, "{st}");
+}
+
+#[test]
+fn replicas_change_one_at_a_time_or_not_at_all() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#;
+    let homes = replica_homes("leap", job, "");
+    let names = ["a", "b", "c"];
+    let daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica(home, name))
+        .collect();
+    let first = leader_of(&homes, None);
+    let (d, e) = (scratch("leapd"), scratch("leape"));
+    thread::sleep(Duration::from_millis(1100));
+    replica_set(
+        &[
+            ("a", &homes[0]),
+            ("b", &homes[1]),
+            ("c", &homes[2]),
+            ("d", &d),
+            ("e", &e),
+        ],
+        job,
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !daemons[first]
+        .log()
+        .contains("replicas change one at a time")
+    {
+        assert!(Instant::now() < deadline, "{}", daemons[first].log());
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Still leading, with the set it had.
+    inlet(
+        &homes[first],
+        &["add", "-w", "job", "-g", "a", "--no-verify"],
+    );
+    assert!(!daemons[first].log().contains("replicas are now"));
+}

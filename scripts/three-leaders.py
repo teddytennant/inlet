@@ -20,6 +20,7 @@ ap.add_argument("b")
 ap.add_argument("c", help="C's host name as B knows it")
 ap.add_argument("--key", default="")
 ap.add_argument("--dir", default="/tmp/inlet-3l")
+ap.add_argument("--compact", type=int, default=0, help="replicas let go of the log every this many bytes")
 args = ap.parse_args()
 binary = os.path.abspath(args.inlet)
 root = tempfile.mkdtemp(prefix="inlet-3l-", dir=os.path.expanduser("~/.cache"))
@@ -117,7 +118,8 @@ def policy(me, b_name):
         "".join("  %s = { cmd = { %s } },\n" % (r, quote(view[r])) for r in "abc"), quote(view["n0"]))
 
 
-LOOP = "cd %s && rm -f stop hold && nohup sh -c 'while [ ! -e stop ]; do while [ -e hold ]; do sleep 1; done; ./inlet --home %s up -f --replica %s >> %s.log 2>&1; sleep 0.5; done' > /dev/null 2>&1 &"
+LOOP = "cd %s && rm -f stop hold && nohup sh -c 'while [ ! -e stop ]; do while [ -e hold ]; do sleep 1; done; ENV ./inlet --home %s up -f --replica %s >> %s.log 2>&1; sleep 0.5; done' > /dev/null 2>&1 &"
+LOOP = LOOP.replace("ENV", "INLET_ROTATE_BYTES=%d" % args.compact if args.compact else "")
 KILL = "touch %s/hold; for p in $(pgrep -x inlet); do grep -qa -- --replica /proc/$p/cmdline && kill -9 $p; done; true" % D
 procs = {}
 hold = {"a": False}
@@ -150,7 +152,8 @@ try:
             if hold["a"]:
                 time.sleep(0.5)
                 continue
-            procs["a"] = subprocess.Popen([binary, "--home", HOME["a"], "up", "-f", "--replica", "a"], stdout=log, stderr=log)
+            env = dict(os.environ, INLET_ROTATE_BYTES=str(args.compact)) if args.compact else None
+            procs["a"] = subprocess.Popen([binary, "--home", HOME["a"], "up", "-f", "--replica", "a"], stdout=log, stderr=log, env=env)
             procs["a"].wait()
             time.sleep(0.5)
     threading.Thread(target=keep_a, daemon=True).start()
@@ -225,10 +228,15 @@ try:
     while time.time() < end:
         who, st = leader()
         if st and st["live"] == 0 and st["queued"] == 0:
-            sums = {"a": hashlib.sha256(open(HOME["a"] + "/ledger/log", "rb").read()).hexdigest()}
-            for n in ("b", "c"):
-                sums[n] = rsh(n, "sha256sum %s/ledger/log" % HOME[n]).stdout.split(" ")[0]
-            if len(set(sums.values())) == 1:
+            # Below a replica's floor its log is a hole. Compare what is past the highest.
+            floors = {}
+            for n in "abc":
+                out = rsh(n, "cat %s/ledger/floor 2>/dev/null || echo 0" % HOME[n]).stdout.strip()
+                floors[n] = int(out) if out.isdigit() else 0
+            top = max(floors.values())
+            sums = {n: rsh(n, "tail -c +%d %s/ledger/log | sha256sum; stat -c %%s %s/ledger/log" % (top + 1, HOME[n], HOME[n])).stdout.split() for n in "abc"}
+            sums = {n: "%s %s" % (v[0], v[-1]) if v else "" for n, v in sums.items()}
+            if len(set(sums.values())) == 1 and (not args.compact or min(floors.values()) > 0):
                 break
         time.sleep(3)
     else:
@@ -247,16 +255,21 @@ try:
         problems.append("%d answered adds are not in the ledger" % len(lost))
     if done != len(acked):
         problems.append("%d done of %d answered" % (done, len(acked)))
-    print("led in turn by %s. %d answered adds, %d done. sha256 %s on all three machines" % (
-        " ".join(led), len(acked), done, sums.get("a", "")[:16]))
+    print("led in turn by %s. %d answered adds, %d done. floors %s. past them, sha256 %s on all three machines" % (
+        " ".join(led), len(acked), done, sorted(floors.values()), sums.get("a", "")[:16]))
 finally:
     hold["stop"] = True
     if procs.get("a") and procs["a"].poll() is None:
         procs["a"].send_signal(signal.SIGTERM)
     for n in ("b", "c"):
         rsh(n, "touch %s/stop; for p in $(pgrep -x inlet); do grep -qa -- --replica /proc/$p/cmdline && kill $p; done; true" % D)
-    rsh("b", "%s/inlet --home %s/n0 down; sleep 1; rm -rf %s" % (D, D, D))
-    rsh("c", "sleep 1; rm -rf %s" % D)
+    rsh("b", "%s/inlet --home %s/n0 down; sleep 1" % (D, D))
+    if problems:
+        for n in ("b", "c"):
+            print("== %s" % n)
+            print(rsh(n, "cd %s; tail -6 %s.log; for f in epoch vote floor terms; do printf '%%s: ' $f; cat %s/ledger/$f 2>/dev/null; echo; done; stat -c %%s %s/ledger/log" % (D, n, HOME[n], HOME[n])).stdout)
+    for n in ("b", "c"):
+        rsh(n, "rm -rf %s" % D)
     if tunnel:
         tunnel.terminate()
 if problems:

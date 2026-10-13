@@ -186,6 +186,10 @@ struct Daemon {
     epoch: u64,
     /// The other replicas of the ledger, when there are any.
     links: Option<replica::Links>,
+    /// This replica's name, and the set it last gave its links.
+    replica: Option<String>,
+    replicas: Vec<String>,
+    policy_seen: Option<std::time::SystemTime>,
     /// Set when this daemon may not go on: replaced, or without most of its
     /// replicas. An error on the way to a client is not enough to stop it.
     fatal: Option<String>,
@@ -293,24 +297,14 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     let mut peers = Vec::new();
     let mut elected = None;
     if let Some(me) = &replica {
-        let cfg = load_signed(home)?.cfg;
-        if !cfg.replicas.contains_key(me) {
-            return Err(err(format!("the policy's replicas do not name {me}")));
-        }
-        peers = cfg
-            .replicas
-            .iter()
-            .filter(|(name, _)| *name != me)
-            .map(|(name, cmd)| replica::Peer {
-                name: name.clone(),
-                cmd: cmd.clone(),
-            })
-            .collect();
+        let read = || peers_of(home, me);
+        read()?;
         // Work this home started when it last led belongs to no leader now.
         // Whoever leads next counts those tasks as crashed and runs them
         // again; left alone they would be done twice.
         stop_leftover(home);
-        elected = Some(replica::stand_by(home, me, &peers)?);
+        elected = Some(replica::stand_by(home, me, &read)?);
+        peers = read()?;
     }
     // The lock first, and nothing read until it is held. A standby waits
     // here for the leader's process to go, which is when the kernel lets the
@@ -368,6 +362,7 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         ));
     }
     let opened = ledger::open_file(file, snap_offset)?;
+    let replica_names: Vec<String> = policy.cfg.replicas.keys().cloned().collect();
     let links = match elected {
         Some(term) => {
             let len = opened.ledger.len();
@@ -485,6 +480,11 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         me,
         epoch,
         links,
+        replicas: replica_names,
+        replica: replica.clone(),
+        policy_seen: fs::metadata(paths::policy(home))
+            .and_then(|m| m.modified())
+            .ok(),
         fatal: None,
         epoch_seen: Instant::now(),
         epochs: HashMap::new(),
@@ -557,6 +557,23 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     }
     daemon.flush_soft()?;
     Ok(())
+}
+
+/// The other replicas, as the policy on disk has them now.
+fn peers_of(home: &Path, me: &str) -> Result<Vec<replica::Peer>> {
+    let cfg = load_signed(home)?.cfg;
+    if !cfg.replicas.contains_key(me) {
+        return Err(err(format!("the policy's replicas do not name {me}")));
+    }
+    Ok(cfg
+        .replicas
+        .iter()
+        .filter(|(name, _)| *name != me)
+        .map(|(name, cmd)| replica::Peer {
+            name: name.clone(),
+            cmd: cmd.clone(),
+        })
+        .collect())
 }
 
 fn stop_leftover(home: &Path) {
@@ -906,8 +923,59 @@ impl Daemon {
         if self.links.is_some() {
             // This home's own standby patience, and a vote asked of it.
             replica::touch(&self.home);
+            self.sync_replicas();
         }
         Ok(())
+    }
+
+    /// The set of replicas is the policy file's, and may be changed while
+    /// this leads: one replica added or one taken out at a time, on every
+    /// replica's policy. Any majority of the old set and any of the new then
+    /// share a member, which is what keeps two leaders from both being right.
+    fn sync_replicas(&mut self) {
+        let seen = fs::metadata(paths::policy(&self.home))
+            .and_then(|m| m.modified())
+            .ok();
+        if seen == self.policy_seen {
+            return;
+        }
+        self.policy_seen = seen;
+        let (Some(me), Some(links)) = (self.replica.clone(), &self.links) else {
+            return;
+        };
+        let Ok(cfg) = load_signed(&self.home).map(|p| p.cfg) else {
+            eprintln!("inlet: the policy on disk does not load; keeping the replicas as they were");
+            return;
+        };
+        let now: Vec<String> = cfg.replicas.keys().cloned().collect();
+        if now == self.replicas {
+            return;
+        }
+        let changed = now.iter().filter(|n| !self.replicas.contains(n)).count()
+            + self.replicas.iter().filter(|n| !now.contains(n)).count();
+        if changed > 1 {
+            eprintln!(
+                "inlet: replicas change one at a time; keeping {}",
+                self.replicas.join(", ")
+            );
+            return;
+        }
+        if !now.contains(&me) {
+            self.fatal = Some("this replica has been taken out of the policy".into());
+            return;
+        }
+        let peers: Vec<replica::Peer> = cfg
+            .replicas
+            .iter()
+            .filter(|(name, _)| **name != me)
+            .map(|(name, cmd)| replica::Peer {
+                name: name.clone(),
+                cmd: cmd.clone(),
+            })
+            .collect();
+        links.set_peers(&peers);
+        eprintln!("inlet: replicas are now {}", now.join(", "));
+        self.replicas = now;
     }
 
     /// With replicas, written is not kept until most of them have it.

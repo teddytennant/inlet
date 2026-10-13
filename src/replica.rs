@@ -220,12 +220,13 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     let mine = terms(home);
     let mut len = file.metadata()?.len();
     let same = agreed(&mine, len, &theirs, u64::MAX);
-    if at <= floor(home) {
+    let whole = usable(home);
+    if at <= floor(home) && whole {
         // Already have one at least as new.
         return Ok(json!({"ok": true, "len": len.min(same.max(floor(home)))}));
     }
     snap::durable(&paths::snap_index(home), bytes)?;
-    if same < at {
+    if same < at || !whole {
         // Too far behind, or on a branch the leader's history did not take.
         // The snapshot is what was before `at`; the log starts over there.
         file.set_len(at)?;
@@ -397,8 +398,7 @@ fn poll(peers: &[Peer], req: &Value) -> (usize, u64) {
 }
 
 /// Wait, as a standby, until this replica is elected. Returns its term.
-pub fn stand_by(home: &Path, me: &str, peers: &[Peer]) -> Result<u64> {
-    let most = most(peers.len());
+pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) -> Result<u64> {
     eprintln!("inlet: replica {me} standing by");
     // Patience counted from now: a replica that just started has heard
     // nobody, and that is not the same as the leader being gone.
@@ -416,14 +416,26 @@ pub fn stand_by(home: &Path, me: &str, peers: &[Peer]) -> Result<u64> {
             continue;
         }
         patience = QUIET_MS + jitter(QUIET_MS);
+        // Read again each time: the set of replicas is the policy's, and
+        // the policy may have changed since this one sat down.
+        let peers = &peers()?;
+        let most = most(peers.len());
         let last = |home: &Path| (terms(home).last().map_or(0, |t| t.0), log_len(home));
         let (last_term, len) = last(home);
         let next = snap::read_epoch(home) + 1;
         let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre});
         // First whether a vote could be won, without disturbing anybody. A
         // replica cut off from the rest asks for ever and changes nothing.
-        let (yes, _) = poll(peers, &ask(next, true));
+        let (yes, newest) = poll(peers, &ask(next, true));
         if yes + 1 < most {
+            if newest >= next {
+                // They are in a later term than this replica knew of. Asking
+                // again for the same one would be refused for ever.
+                let _guard = guard(home)?;
+                if newest > snap::read_epoch(home) {
+                    set_epoch(home, newest)?;
+                }
+            }
             touch(home);
             continue;
         }
@@ -471,14 +483,18 @@ struct Shared {
     /// Followers behind this are sent the snapshot, not bytes.
     floor: u64,
     want: u64,
-    acked: Vec<u64>,
+    /// How much of the log each peer is known to hold. A peer with no
+    /// entry here has been taken out of the set, and its link ends.
+    acked: std::collections::HashMap<String, (u64, Vec<String>)>,
     deposed: bool,
 }
 
 /// The leader's side: one thread and one long-lived command per peer.
 pub struct Links {
     shared: Arc<(Mutex<Shared>, Condvar)>,
-    most: usize,
+    home: PathBuf,
+    term: u64,
+    terms: Terms,
 }
 
 impl Links {
@@ -487,26 +503,53 @@ impl Links {
             Mutex::new(Shared {
                 floor: floor(home),
                 want: len,
-                acked: vec![0; peers.len()],
+                acked: Default::default(),
                 deposed: false,
             }),
             Condvar::new(),
         ));
-        for (i, peer) in peers.iter().enumerate() {
-            let (shared, peer, terms) = (shared.clone(), peer.clone(), terms.clone());
-            let log = paths::ledger(home);
-            let index = paths::snap_index(home);
+        let links = Links {
+            shared,
+            home: home.to_path_buf(),
+            term,
+            terms,
+        };
+        links.set_peers(peers);
+        links
+    }
+
+    /// The set of replicas, less this one. Called again when the policy
+    /// changes it: a new peer gets a link and is brought up to date, and one
+    /// taken out stops counting at once.
+    pub fn set_peers(&self, peers: &[Peer]) {
+        let (lock, wake) = &*self.shared;
+        let mut shared = lock.lock().unwrap();
+        shared
+            .acked
+            .retain(|name, (_, cmd)| peers.iter().any(|p| &p.name == name && &p.cmd == cmd));
+        for peer in peers {
+            if shared.acked.contains_key(&peer.name) {
+                continue;
+            }
+            shared
+                .acked
+                .insert(peer.name.clone(), (0, peer.cmd.clone()));
+            let (shared, peer, terms, term) = (
+                self.shared.clone(),
+                peer.clone(),
+                self.terms.clone(),
+                self.term,
+            );
+            let log = paths::ledger(&self.home);
+            let index = paths::snap_index(&self.home);
             thread::spawn(move || loop {
-                if link(&shared, i, &peer, term, &terms, &log, &index) {
+                if link(&shared, &peer, term, &terms, &log, &index) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(300));
             });
         }
-        Links {
-            shared,
-            most: most(peers.len()),
-        }
+        wake.notify_all();
     }
 
     /// Block until most replicas have the log up to `len`.
@@ -522,8 +565,8 @@ impl Links {
                     "another leader has taken this home; stopping without writing",
                 ));
             }
-            let have = 1 + shared.acked.iter().filter(|a| **a >= len).count();
-            if have >= self.most {
+            let have = 1 + shared.acked.values().filter(|a| a.0 >= len).count();
+            if have >= most(shared.acked.len()) {
                 return Ok(());
             }
             let left = QUORUM_WAIT.saturating_sub(started.elapsed());
@@ -554,7 +597,6 @@ impl Links {
 /// link should not come back.
 fn link(
     shared: &Arc<(Mutex<Shared>, Condvar)>,
-    i: usize,
     peer: &Peer,
     term: u64,
     terms: &Terms,
@@ -604,6 +646,10 @@ fn link(
     loop {
         let (want, floor) = {
             let shared = lock.lock().unwrap();
+            if shared.acked.get(&peer.name).is_none_or(|a| a.1 != peer.cmd) {
+                drop(shared);
+                return done(&mut child, true);
+            }
             (shared.want, shared.floor)
         };
         let at = theirs.unwrap_or(want).min(want);
@@ -652,9 +698,19 @@ fn link(
             theirs = Some(len);
             let mut shared = lock.lock().unwrap();
             // More than the leader has is a log this leader has not vouched for.
-            if len <= shared.want && len > shared.acked[i] {
-                shared.acked[i] = len;
-                wake.notify_all();
+            let want = shared.want;
+            match shared.acked.get_mut(&peer.name) {
+                Some(acked) if acked.1 == peer.cmd => {
+                    if len <= want && len > acked.0 {
+                        acked.0 = len;
+                        wake.notify_all();
+                    }
+                }
+                // No longer one of the replicas, or reached another way now.
+                _ => {
+                    drop(shared);
+                    return done(&mut child, true);
+                }
             }
         } else if let Some(need) = reply["need"].as_u64() {
             theirs = Some(need);
