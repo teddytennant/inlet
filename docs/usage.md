@@ -98,7 +98,7 @@ The worker `pi` is defined in east's policy. Tasks for it are placed on the node
 
 ## More than one leader machine
 
-Two ways. With a home both machines can reach, run `inlet up -f --standby` on the second: it waits for the first to die and takes over. With no shared storage, list three or five homes under `replicas` in every policy and run `inlet up -f --replica <name>` on each. They elect a leader, every write waits for most of them, and losing fewer than half loses nothing. Talk to whichever one answers `inlet status`. Put the workers on nodes: work in a dead leader's own cells does not move with the ledger.
+Two ways. With a home both machines can reach, run `inlet up -f --standby` on the second: it waits for the first to die and takes over. With no shared storage, list three or five homes under `replicas` in every policy and run `inlet up -f --replica <name>` on each. They elect a leader, every write waits for most of them, and losing fewer than half loses nothing. Talk to whichever one answers `inlet status`. Put the workers on nodes: work in a dead leader's own cells does not move with the ledger. Replicas and nodes are reached by starting a command each time, so over ssh give that command a shared connection (`-o ControlMaster=auto -o ControlPersist=120 -o ControlPath=...`): a server that limits new connections will otherwise drop some, and a dropped vote is a vote not given.
 
 ## keeping the daemon up
 

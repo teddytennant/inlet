@@ -25,12 +25,16 @@ args = ap.parse_args()
 binary = os.path.abspath(args.inlet)
 root = tempfile.mkdtemp(prefix="inlet-3l-", dir=os.path.expanduser("~/.cache"))
 D = args.dir
-BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlPath=none"]
+# One connection to each host, shared by every call. A login node counts new
+# ssh connections and resets them past some rate, and a vote that is reset
+# is a vote not given.
+SHARE = ["-o", "ControlMaster=auto", "-o", "ControlPersist=120"]
+BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"] + SHARE + ["-o", "ControlPath=%s/cm-%%C" % root]
 if args.key:
     BASE += ["-i", args.key, "-o", "IdentitiesOnly=yes"]
 # C is reached from here as the same user B is.
 user = [l.split()[1] for l in subprocess.run(["ssh", "-G", args.b], capture_output=True, text=True).stdout.splitlines() if l.startswith("user ")][0]
-TO = {"b": BASE + [args.b], "c": BASE + ["-o", "ProxyCommand=ssh -o BatchMode=yes -o ControlPath=none -W %%h:%%p %s" % args.b, "%s@%s" % (user, args.c)]}
+TO = {"b": BASE + [args.b], "c": BASE + ["-o", "ProxyCommand=ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=%s/cm-%%%%C -W %%h:%%p %s" % (root, args.b), "%s@%s" % (user, args.c)]}
 HOME = {"a": root + "/a", "b": D + "/b", "c": D + "/c"}
 BIN = {"a": binary, "b": D + "/inlet", "c": D + "/inlet"}
 os.makedirs(HOME["a"] + "/ledger")
@@ -38,10 +42,18 @@ os.makedirs(HOME["a"] + "/ledger")
 
 def rsh(name, script, limit=40, stdin=None):
     cmd = ["sh", "-c", script] if name == "a" else TO[name] + [script]
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=limit, stdin=stdin)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+    for attempt in range(3):
+        if stdin is not None:
+            stdin.seek(0)
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=limit, stdin=stdin)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+        # 255 is ssh itself failing, not the command. Worth another go.
+        if out.returncode != 255 or name == "a":
+            return out
+        time.sleep(2)
+    return out
 
 
 def inlet(name, *argv, limit=40):
@@ -95,7 +107,7 @@ while True:
     os.write(1, b)
 """
 quote = lambda argv: ", ".join('"%s"' % a.replace('"', '\\"') for a in argv)
-plain = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+plain = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"] + SHARE + ["-o", "ControlPath=%s/cm-%%C" % D]
 VIEW = {  # how each machine reaches each replica, and the node
     "a": {"a": [binary, "--home", HOME["a"]], "b": TO["b"] + [BIN["b"], "--home", HOME["b"]], "c": TO["c"] + [BIN["c"], "--home", HOME["c"]],
           "n0": TO["b"] + [D + "/inlet", "--home", D + "/n0"]},
@@ -146,7 +158,8 @@ try:
             open(tmp, "w").write(text)
             assert rsh(n, "cat > %s/%s" % (D, path), stdin=open(tmp)).returncode == 0
     open(HOME["a"] + "/policy.lua", "w").write(policy("a", b_name))
-    tunnel = subprocess.Popen(BASE + ["-N", "-o", "StreamLocalBindUnlink=yes", "-o", "ExitOnForwardFailure=yes",
+    # A connection of its own: the shared one may go, and this must not.
+    tunnel = subprocess.Popen(BASE + ["-o", "ControlMaster=no", "-o", "ControlPath=none", "-N", "-o", "StreamLocalBindUnlink=yes", "-o", "ExitOnForwardFailure=yes",
                                       "-R", "%s/a.sock:127.0.0.1:%d" % (D, PORT), args.b])
     time.sleep(3)
     assert tunnel.poll() is None, "the way back to A would not open"
@@ -220,6 +233,17 @@ try:
         nxt, _ = leader(skip=who)
         if not nxt or nxt == who:
             problems.append("nobody else took over from %s" % who)
+            # Why not: ask each home, as a candidate would, and time it.
+            try:
+                ident = open(HOME["a"] + "/ledger/cluster").read().strip()
+            except OSError:
+                ident = None
+            ask = json.dumps({"term": 9999, "candidate": "probe", "last_term": 9999, "len": 10**12, "pre": True, "id": ident})
+            for n in "abc":
+                t0 = time.time()
+                out = rsh(n, "echo %s | %s --home %s replica vote; echo heard $(( $(date +%%s) - $(stat -c %%Y %s/ledger/heard) ))s ago; cat %s/ledger/epoch; echo; tail -3 %s 2>/dev/null" % (
+                    shlex.quote(ask), BIN[n], HOME[n], HOME[n], HOME[n], (root + "/a.log") if n == "a" else (D + "/" + n + ".log")), limit=30)
+                print("  probe %s (%.1fs): %s %s" % (n, time.time() - t0, out.stdout.replace("\n", " | ")[:400], out.stderr[:200]), flush=True)
             back(who)
             break
         print("  killed on its own machine and held down. %s (%s) took over: %d adds" % (nxt, where[nxt], adds(6)), flush=True)
