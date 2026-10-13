@@ -489,6 +489,28 @@ A second leader is a standby. `inlet up -f --standby` on the same home waits for
 
 The lock is the kernel's word on one machine. On shared storage it is the storage's word, and some storage lies. So a leader also counts itself in: `ledger/epoch` goes up by one each time a daemon takes the home, and a leader reads it before every durable write and twice a second besides. A number that is not its own means another has taken over, and it stops without writing another byte. The count goes to the nodes too, in the status call and on every task handed over. A node that has heard a newer leader of the same home tells an older one so, takes no tasks from it, and does not count its calls toward any lease.
 
+## Replicas
+
+A standby on the same home needs storage both machines can reach. Replicas do not. Each has a home and a disk of its own, and the ledger is on all of them.
+
+```lua
+replicas = {
+  a = { cmd = { "ssh", "a.internal", "inlet", "--home", "/srv/inlet" } },
+  b = { cmd = { "ssh", "b.internal", "inlet", "--home", "/srv/inlet" } },
+  c = { cmd = { "ssh", "c.internal", "inlet", "--home", "/srv/inlet" } },
+}
+```
+
+The same table in every replica's policy, and `inlet up -f --replica a` on each, under something that starts it again when it exits. One leads. It appends to its own log, sends the same bytes down a long-lived command to each of the others, and a write is kept once more than half of all replicas have it on disk. Until then nothing is done on the strength of it, and the caller is not answered. A leader that cannot reach most of the others for 15 seconds stops: what it cannot promise it does not say.
+
+The rest stand by. One that has heard no leader for four to eight seconds asks the others whether they would vote for it, which changes nothing, and if most would, takes the next term and asks for real. A replica votes once in a term, never for a candidate whose log ends before its own, and not at all while it can still hear a leader. The winner takes its home's lock, replays, writes a `term` record, and leads once most replicas hold that record. This is Raft, with byte offsets where Raft has entries: `ledger/terms` says at which offset each term's bytes begin, and two logs that agree on that agree on the bytes. A replica whose log has a tail the leader's does not, written by a leader that never got most replicas to take it, cuts it off.
+
+`inlet replica serve` and `inlet replica vote` are what the commands run. They work on the home directly and need no daemon there, so a machine counts toward a majority as long as its disk and its ssh do.
+
+The term is the epoch. A leader replaced reads a higher one, from its own disk or from a replica's answer, and stops; a node turns it away. Every replica answers to nodes under one name, so a node's leases and its tasks carry across a change of leader.
+
+What is not replicated: workdirs, transcripts, drafts, and workers running on the leader's own machine. With replicas, put the work on nodes (`on = "nodes"`); a task that ran in the old leader's cells is a crash to the new one. The log is not rotated while there are replicas. The set of replicas is the policy's and changes by changing every policy and restarting.
+
 ## Scaling
 
 Same binary. The setup field selects caps and the isolator. Nothing else changes.
@@ -555,4 +577,6 @@ Each step is usable before the next one exists.
 23. A real network. `scripts/netns-nodes.py` gives each node its own network namespace, address and sshd, and the leader reaches it by ssh over TCP through a link with 60ms delay and 10% loss. It cuts one node off past `node_grace`, kills the leader, and cuts another for 3s. Needs root, so it is run by hand, not in CI. The node cut off stops its own work, a short cut moves nothing, and the purses add up. Goals a node finished while cut off, whose replacements had also finished before the link came back, were done twice: 3 to 5 in 100 in these runs. With `--wait` it sets `node_loss = "wait"` and fails if any goal is finished twice; none were.
 24. Fencing. `ledger/epoch`, checked before every fsync and carried to nodes. A leader replaced on storage whose lock did not hold stops writing; a node turns it away.
 25. Two machines. `scripts/remote-node.py` puts one node on another host over ssh and one here, then drops the leader's own ssh packets with an iptables rule that matches only their DSCP mark. Run by hand against a login node 0.6s away by ssh: 100 tasks, a 35s cut, a leader kill, a 3s cut. The far node let go on its own, the short cut moved nothing, nothing was left running there. With `--wait`, no goal was finished twice; without, 5 were.
+26. Replicas. `src/replica.rs`: the log on three homes, a write kept by a majority, elections with a pre-vote. `scripts/chaos-replicas.py` kills, freezes and restarts replicas while a client adds tasks, and checks that every answered add is in the ledger and done, that the three logs end as the same bytes, and that no term had two leaders. 300 adds, 25 faults, a link that drops one start in ten: held.
+27. A provider. 500 tasks on Grok 4.5 through the proxy, `examples/agent.py` in cells with no network, six at a time, the daemon killed six times: 500 done, 11 attempts retried, 1,908,150 tokens charged of an 8M cap, nothing held.
 

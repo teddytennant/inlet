@@ -29,6 +29,7 @@ use crate::prompt;
 use crate::proto::{self, NewTask, Request, SwarmSpec};
 use crate::proxy::{self, Hub, Note};
 use crate::registry;
+use crate::replica;
 use crate::snap;
 use crate::state::{PostView, State};
 use crate::text::mentions;
@@ -183,12 +184,17 @@ struct Daemon {
     /// Which leader of this home it is, by count. A higher number on disk,
     /// or in a node's mouth, means another has taken over.
     epoch: u64,
+    /// The other replicas of the ledger, when there are any.
+    links: Option<replica::Links>,
+    /// Set when this daemon may not go on: replaced, or without most of its
+    /// replicas. An error on the way to a client is not enough to stop it.
+    fatal: Option<String>,
     epoch_seen: Instant,
     /// On a node: the newest epoch heard from each leader.
     epochs: HashMap<String, u64>,
 }
 
-pub fn serve(home: &Path, foreground: bool, standby: bool) -> Result<()> {
+pub fn serve(home: &Path, foreground: bool, standby: bool, replica: Option<String>) -> Result<()> {
     fs::create_dir_all(home.join("run"))?;
     fs::create_dir_all(home.join("proxy"))?;
     fs::create_dir_all(home.join("work"))?;
@@ -196,7 +202,7 @@ pub fn serve(home: &Path, foreground: bool, standby: bool) -> Result<()> {
     if !foreground {
         return daemonize(home);
     }
-    run(home, standby)
+    run(home, standby, replica)
 }
 
 fn daemonize(home: &Path) -> Result<()> {
@@ -242,7 +248,7 @@ fn daemonize(home: &Path) -> Result<()> {
             libc::close(devnull);
         }
     }
-    match run(home, false) {
+    match run(home, false, None) {
         Ok(()) => unsafe { libc::_exit(0) },
         Err(e) => {
             eprintln!("inlet: {e}");
@@ -281,7 +287,27 @@ fn guard_ro(home: &Path, policy: &mut Policy) {
     });
 }
 
-fn run(home: &Path, standby: bool) -> Result<()> {
+fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
+    // One of several homes that each keep the ledger. Nothing is led, and
+    // nothing here is read, until the others have voted this one in.
+    let mut peers = Vec::new();
+    let mut elected = None;
+    if let Some(me) = &replica {
+        let cfg = load_signed(home)?.cfg;
+        if !cfg.replicas.contains_key(me) {
+            return Err(err(format!("the policy's replicas do not name {me}")));
+        }
+        peers = cfg
+            .replicas
+            .iter()
+            .filter(|(name, _)| *name != me)
+            .map(|(name, cmd)| replica::Peer {
+                name: name.clone(),
+                cmd: cmd.clone(),
+            })
+            .collect();
+        elected = Some(replica::stand_by(home, me, &peers)?);
+    }
     // The lock first, and nothing read until it is held. A standby waits
     // here for the leader's process to go, which is when the kernel lets the
     // lock go. Only then are the policy, the index, and the log looked at,
@@ -297,6 +323,8 @@ fn run(home: &Path, standby: bool) -> Result<()> {
                 }
                 break file;
             }
+            // A link from the last leader may be mid-append on this log.
+            None if elected.is_some() => thread::sleep(Duration::from_millis(50)),
             None if standby => {
                 if !waiting {
                     eprintln!("inlet: standing by");
@@ -307,7 +335,10 @@ fn run(home: &Path, standby: bool) -> Result<()> {
             None => return Err(err("another inlet is holding the ledger")),
         }
     };
-    let epoch = snap::bump_epoch(home)?;
+    let epoch = match elected {
+        Some(term) => term,
+        None => snap::bump_epoch(home)?,
+    };
     let mut policy = load_signed(home)?;
     guard_ro(home, &mut policy);
     let node = snap::node_id(home)?;
@@ -328,7 +359,30 @@ fn run(home: &Path, standby: bool) -> Result<()> {
     }
     let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
     let opened = ledger::open_file(file, snap_offset)?;
+    let links = match elected {
+        Some(term) => {
+            let len = opened.ledger.len();
+            let terms = replica::begin_term(home, term, len)?;
+            Some(replica::Links::start(home, term, &peers, terms, len))
+        }
+        None => None,
+    };
     let node = snap::node_id(home)?;
+    // Every replica answers to the same name, so a node keeps its leases
+    // and knows an old leader from a new one across a change of leader.
+    let me = match &replica {
+        Some(_) => format!(
+            "replicas:{}",
+            policy
+                .cfg
+                .replicas
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => node.clone(),
+    };
     let mut state = State::new(&policy.cfg);
     state.fence = lease.gen;
     if let Some(saved) = &index {
@@ -419,11 +473,24 @@ fn run(home: &Path, standby: bool) -> Result<()> {
         born: Instant::now(),
         last_pump: Instant::now(),
         stale_asked: HashMap::new(),
-        me: node.clone(),
+        me,
         epoch,
+        links,
+        fatal: None,
         epoch_seen: Instant::now(),
         epochs: HashMap::new(),
     };
+    if daemon.links.is_some() {
+        // The term's own record. Until most replicas hold it, nothing from
+        // an earlier term is known to be kept either.
+        daemon.commit(
+            &[Record::Term {
+                term: epoch,
+                ts: now_ms(),
+            }],
+            true,
+        )?;
+    }
     daemon.sync_nodes();
     // A swarm that stalled before the restart already said so.
     daemon.told = daemon
@@ -471,7 +538,13 @@ fn run(home: &Path, standby: bool) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if let Some(msg) = daemon.fatal.take() {
+            return Err(err(msg));
+        }
         daemon.pump()?;
+        if let Some(msg) = daemon.fatal.take() {
+            return Err(err(msg));
+        }
     }
     daemon.flush_soft()?;
     Ok(())
@@ -780,7 +853,9 @@ impl Daemon {
     fn deposed(&mut self) -> crate::error::Error {
         // Nothing more is written, not even what was waiting to be.
         self.soft.clear();
-        err("another leader has taken this home; stopping without writing")
+        let msg = "another leader has taken this home; stopping without writing";
+        self.fatal = Some(msg.into());
+        err(msg)
     }
 
     /// Still the leader, by the count on disk. Looked at before anything is
@@ -788,8 +863,27 @@ impl Daemon {
     /// lock, and two daemons appending to one log is the end of the log.
     fn still_leader(&mut self) -> Result<()> {
         self.epoch_seen = Instant::now();
-        if snap::read_epoch(&self.home) > self.epoch {
+        if snap::read_epoch(&self.home) > self.epoch
+            || self.links.as_ref().is_some_and(|l| l.deposed())
+        {
             return Err(self.deposed());
+        }
+        if self.links.is_some() {
+            // This home's own standby patience, and a vote asked of it.
+            replica::touch(&self.home);
+        }
+        Ok(())
+    }
+
+    /// With replicas, written is not kept until most of them have it.
+    fn ship(&mut self) -> Result<()> {
+        let Some(links) = &self.links else {
+            return Ok(());
+        };
+        if let Err(e) = links.commit(self.ledger.len()) {
+            self.soft.clear();
+            self.fatal = Some(e.to_string());
+            return Err(e);
         }
         Ok(())
     }
@@ -799,6 +893,7 @@ impl Daemon {
             self.still_leader()?;
             self.flush_soft()?;
             self.ledger.append_all(recs, true)?;
+            self.ship()?;
         } else {
             self.soft.extend(recs.iter().cloned());
         }
@@ -817,6 +912,7 @@ impl Daemon {
         self.still_leader()?;
         let batch = std::mem::take(&mut self.soft);
         self.ledger.append_all(&batch, true)?;
+        self.ship()?;
         self.last_flush = Instant::now();
         Ok(())
     }
@@ -1331,7 +1427,8 @@ impl Daemon {
             .ok()
             .and_then(|n| n.parse().ok())
             .unwrap_or(ROTATE_BYTES);
-        let rotate = self.ledger.len() >= rotate_at;
+        // Replicas count in offsets from the start of one log.
+        let rotate = self.ledger.len() >= rotate_at && self.links.is_none();
         if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate {
             // The index and a rotation are writes a replaced leader must not make.
             self.still_leader()?;
@@ -3544,6 +3641,7 @@ impl Daemon {
             ),
             Record::Clear { id, ts } => (0, json!({"ev":"clear","id":id,"ts":ts})),
             Record::Sign { ts } => (1, json!({"ev":"sign","ts":ts})),
+            Record::Term { term, ts } => (1, json!({"ev":"term","term":term,"ts":ts})),
             Record::Vote {
                 id,
                 voter,

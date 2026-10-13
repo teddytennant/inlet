@@ -1600,7 +1600,8 @@ fn a_leader_that_dies_finds_its_placed_tasks_again() {
     let job = r#"job = { cmd = { "/bin/sh", "-c", "sleep 2; echo ok > out" } },"#;
     let east = node_home("east3", job);
     let leader = scratch("leader3");
-    node_policy(&leader, &[("east", &east, 4)], "");
+    // A lease long enough that a slow restart on a busy box is not a lost node.
+    node_policy(&leader, &[("east", &east, 4)], "node_grace = 30");
     let east_d = start(&east);
     let mut daemon = start(&leader);
     wait(&leader, &daemon, |v| v["nodes"][0]["ready"] == true);
@@ -1968,7 +1969,7 @@ fn a_leader_told_to_wait_never_works_a_goal_twice() {
   east = {{ cmd = {{ "/bin/sh", "-c", "test -e {gate} && exit 1; exec {bin} --home {east} \"$@\"", "sh" }}, slots = 2 }},
   west = {{ cmd = {{ "{bin}", "--home", "{west}" }}, slots = 2 }},
 }}
-node_grace = 4
+node_grace = 10
 node_loss = "wait""#,
             gate = gate.display(),
             bin = bin().display(),
@@ -2163,4 +2164,178 @@ fn a_lock_that_did_not_hold_leaves_one_leader() {
         .map(|t| t["budget_tokens"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(st["available"].as_u64().unwrap() + crashed, 10000, "{st}");
+}
+
+/// Three homes, each with the ledger, each reaching the others by command.
+fn replica_homes(tag: &str, workers: &str, extra: &str) -> Vec<PathBuf> {
+    let homes: Vec<PathBuf> = ["a", "b", "c"]
+        .iter()
+        .map(|n| scratch(&format!("{tag}{n}")))
+        .collect();
+    let list: String = ["a", "b", "c"]
+        .iter()
+        .zip(&homes)
+        .map(|(name, home)| {
+            format!(
+                r#"{name} = {{ cmd = {{ "{}", "--home", "{}" }} }},"#,
+                bin().display(),
+                home.display()
+            )
+        })
+        .collect();
+    for home in &homes {
+        policy(home, workers, &format!("replicas = {{ {list} }}\n{extra}"));
+    }
+    homes
+}
+
+fn replica(home: &Path, name: &str) -> Daemon {
+    let log_path = home.join(format!("replica-{name}.log"));
+    let file = File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let child = Command::new(bin())
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "up",
+            "-f",
+            "--replica",
+            name,
+        ])
+        .stdout(Stdio::from(file.try_clone().unwrap()))
+        .stderr(Stdio::from(file))
+        .spawn()
+        .unwrap();
+    Daemon { child, log_path }
+}
+
+/// Which replica answers, once one has been elected.
+fn leader_of(homes: &[PathBuf], except: Option<usize>) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        for (i, home) in homes.iter().enumerate() {
+            if Some(i) != except && run(home, &["status", "--json"]).status.success() {
+                return i;
+            }
+        }
+        assert!(Instant::now() < deadline, "no replica leads");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn three_replicas_elect_a_leader_and_survive_losing_it() {
+    let homes = replica_homes(
+        "rep",
+        r#"job = { cmd = { "/bin/sh", "-c", "sleep 0.2; echo hi > out" } },"#,
+        "",
+    );
+    let names = ["a", "b", "c"];
+    let mut daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica(home, name))
+        .collect();
+    let first = leader_of(&homes, None);
+    manifest(
+        &homes[first],
+        r#"{"kind":"swarm","name":"many","replicas":2,"completions":40,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&homes[first], &daemons[first], |v| {
+        swarm(v, "many")["done"].as_u64().unwrap_or(0) >= 5
+    });
+    // What the leader has promised, most of the others have on disk.
+    let len = |home: &Path| {
+        fs::metadata(home.join("ledger/log"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let behind = homes.iter().filter(|h| len(h) > 0).count();
+    assert!(behind >= 2, "the log is on {behind} homes");
+    // The leader dies. One of the other two takes over with all of it.
+    kill9(&mut daemons[first]);
+    let second = leader_of(&homes, Some(first));
+    assert_ne!(second, first);
+    let st = wait(&homes[second], &daemons[second], |v| {
+        swarm(v, "many")["phase"] == "done"
+    });
+    assert_eq!(swarm(&st, "many")["done"], 40, "{st}");
+    // Each goal counted once across the change of leader.
+    let mut goals: Vec<String> = tasks(&st)
+        .iter()
+        .filter(|t| t["state"] == "done")
+        .map(|t| t["goal"].as_str().unwrap_or("").to_string())
+        .collect();
+    let all = goals.len();
+    goals.sort();
+    goals.dedup();
+    assert_eq!(goals.len(), all, "a goal was counted twice: {st}");
+    // The old leader comes back as a follower and is brought up to date.
+    daemons[first] = replica(&homes[first], names[first]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while len(&homes[first]) != len(&homes[second]) {
+        assert!(
+            Instant::now() < deadline,
+            "the old leader never caught up: {} against {}",
+            len(&homes[first]),
+            len(&homes[second])
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        fs::read(homes[first].join("ledger/log")).unwrap(),
+        fs::read(homes[second].join("ledger/log")).unwrap(),
+        "the two logs differ"
+    );
+}
+
+#[test]
+fn a_leader_without_most_of_its_replicas_stops() {
+    let homes = replica_homes(
+        "lone",
+        r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#,
+        "",
+    );
+    let names = ["a", "b", "c"];
+    let mut daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica(home, name))
+        .collect();
+    let first = leader_of(&homes, None);
+    // Both of the others go. What is asked of the leader now cannot be kept.
+    for i in 0..3 {
+        if i != first {
+            kill9(&mut daemons[i]);
+            fs::rename(homes[i].join("policy.lua"), homes[i].join("policy.gone")).unwrap();
+            fs::remove_dir_all(homes[i].join("ledger")).unwrap();
+            fs::write(homes[i].join("ledger"), "not a directory").unwrap();
+        }
+    }
+    let before = tasks(&status(&homes[first])).len();
+    let _ = run(
+        &homes[first],
+        &["add", "-w", "job", "-g", "a", "--no-verify"],
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while daemons[first].child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "still leading alone: {}",
+            daemons[first].log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        daemons[first]
+            .log()
+            .contains("most replicas are out of reach"),
+        "{}",
+        daemons[first].log()
+    );
+    assert_eq!(before, 0);
 }

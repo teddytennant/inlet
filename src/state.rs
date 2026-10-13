@@ -596,6 +596,7 @@ impl State {
             Record::Reset { .. }
             | Record::Result { .. }
             | Record::Promote { .. }
+            | Record::Term { .. }
             | Record::Sign { .. } => {}
         }
         if let Record::Reset { ts, .. } = rec {

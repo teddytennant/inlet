@@ -96,6 +96,10 @@ A second leader waits its turn: `inlet up -f --standby` on the same home takes o
 
 The worker `pi` is defined in east's policy. Tasks for it are placed on the node with the most room, run there in cells, and are retried there. `inlet get nodes` shows who is answering. A node silent for `node_grace` (a minute by default) loses its tasks to another. That can do a goal twice if the node had finished it and nobody heard. Set `node_loss = "wait"` and the tasks stay with the node until it answers again, so nothing is worked twice.
 
+## More than one leader machine
+
+Two ways. With a home both machines can reach, run `inlet up -f --standby` on the second: it waits for the first to die and takes over. With no shared storage, list three or five homes under `replicas` in every policy and run `inlet up -f --replica <name>` on each. They elect a leader, every write waits for most of them, and losing fewer than half loses nothing. Talk to whichever one answers `inlet status`. Put the workers on nodes: work in a dead leader's own cells does not move with the ledger.
+
 ## keeping the daemon up
 
 inlet does not supervise itself. Put it under whatever supervises the box:

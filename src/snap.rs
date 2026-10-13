@@ -675,7 +675,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn durable(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn durable(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

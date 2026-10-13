@@ -36,22 +36,30 @@ pub fn run() -> Result<()> {
         Some("up") => {
             let foreground = args.iter().any(|a| a == "-f" || a == "--foreground");
             let standby = args.iter().any(|a| a == "--standby");
-            if standby && !foreground {
+            let replica = flag(&args, "--replica");
+            if (standby || replica.is_some()) && !foreground {
                 return Err(err(
-                    "--standby runs in the foreground: inlet up -f --standby",
+                    "--standby and --replica run in the foreground: inlet up -f --standby",
                 ));
             }
             if foreground {
-                daemon::serve(&home, true, standby)?;
+                daemon::serve(&home, true, standby, replica)?;
             } else {
                 {
                     let _hold = crate::spin::Hold::start(&crate::spin::UP)?;
-                    daemon::serve(&home, false, false)?;
+                    daemon::serve(&home, false, false, None)?;
                 }
                 println!("inlet up");
             }
             Ok(())
         }
+        Some("replica") => match args.get(1).map(String::as_str) {
+            Some("serve") => crate::replica::serve(&home),
+            Some("vote") => crate::replica::vote(&home),
+            _ => Err(err(
+                "usage: inlet replica serve|vote (run by other replicas)",
+            )),
+        },
         Some("doctor") => doctor(&home),
         Some("down") => down(&home, args.iter().any(|a| a == "--keep")),
         Some("init") => crate::setup::init(&home, &args[1..]),

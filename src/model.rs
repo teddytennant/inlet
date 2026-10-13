@@ -231,6 +231,12 @@ pub enum Record {
         tokens: u64,
         ts: u64,
     },
+    /// A leader's first word in its term. Nothing changes; it is there so
+    /// that the term has a record most replicas hold.
+    Term {
+        term: u64,
+        ts: u64,
+    },
     /// The task goes to this node. Written before the node is asked, so a
     /// leader that dies in between knows where to look.
     Place {
@@ -281,7 +287,7 @@ pub fn decode_record(value: serde_json::Value) -> Result<Decoded> {
     match kind {
         "task" | "admit" | "deny" | "spawn" | "exit" | "post" | "cost" | "gate" | "kill"
         | "reset" | "result" | "promote" | "bind" | "clear" | "sign" | "vote" | "moderation"
-        | "swarm" | "swarm_delete" | "place" | "charge" => {
+        | "swarm" | "swarm_delete" | "place" | "charge" | "term" => {
             Ok(Decoded::Rec(Box::new(serde_json::from_value(value)?)))
         }
         _ => Ok(Decoded::Opaque),

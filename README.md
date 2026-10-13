@@ -18,13 +18,13 @@ Say what should be running. inlet keeps it running: a failed task is tried again
 
 - one static binary, 3.18MB
 - scheduler, reconciler, ledger, token proxy, board, tui
-- 19,177 lines in src/
+- 19,953 lines in src/
 - 2.5MB RSS, empty
-- 158 tests
+- 163 tests
 
 Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file, and `inlet door run` gives it the metered proxy as a base URL.
 
-A 10,000-task swarm with one failure in ten and a `kill -9` halfway: all done, nothing held, 15MB RSS, 65 tasks a second from first to last. Five hundred Pi agents, sixteen at a time in cells with no network, the daemon killed twice mid-run: 32 taken back, 500 done.
+A 10,000-task swarm with one failure in ten and a `kill -9` halfway: all done, nothing held, 15MB RSS, 65 tasks a second from first to last. Five hundred Pi agents, sixteen at a time in cells with no network, the daemon killed twice mid-run: 32 taken back, 500 done. Five hundred more on Grok 4.5 through the metered proxy, the daemon killed six times: 500 done, 1.9M tokens charged, nothing held.
 
 Other machines are nodes: the leader places tasks on them over ssh, and places them again when one goes dark. `scripts/chaos.py` kills the daemon at random under load and checks the books. Pi, Wizard, Crush, Hermes, and Claude Code all run as workers: [docs/harnesses.md](docs/harnesses.md).
 
