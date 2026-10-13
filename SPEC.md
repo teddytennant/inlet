@@ -509,7 +509,9 @@ The rest stand by. One that has heard no leader for four to eight seconds asks t
 
 The term is the epoch. A leader replaced reads a higher one, from its own disk or from a replica's answer, and stops; a node turns it away. Every replica answers to nodes under one name, so a node's leases and its tasks carry across a change of leader.
 
-What is not replicated: workdirs, transcripts, drafts, and workers running on the leader's own machine. With replicas, put the work on nodes (`on = "nodes"`); a task that ran in the old leader's cells is a crash to the new one. The log is not rotated while there are replicas. The set of replicas is the policy's and changes by changing every policy and restarting.
+The log is never renamed while there are replicas, so an offset means the same thing on every one of them for ever. It is kept from growing without end another way. Every 256MB the leader takes its snapshot, writes the offset it stands for to `ledger/floor`, and punches the log before that offset out: the same length, the same offsets, no disk. It sends the snapshot to each follower, which does the same. A follower too far behind to be sent bytes that no longer exist, or one that has lost its disk, is sent the snapshot and carries on from there. A home whose snapshot does not reach its floor cannot be replayed; it does not stand for election, and a daemon will not start on it.
+
+What is not replicated: workdirs, transcripts, drafts, and workers running on the leader's own machine. With replicas, put the work on nodes (`on = "nodes"`); a task that ran in the old leader's cells is a crash to the new one, and a replica that comes back as a follower stops what its home was running. The set of replicas is the policy's and changes by changing every policy and restarting.
 
 ## Scaling
 

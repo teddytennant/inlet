@@ -2190,6 +2190,10 @@ fn replica_homes(tag: &str, workers: &str, extra: &str) -> Vec<PathBuf> {
 }
 
 fn replica(home: &Path, name: &str) -> Daemon {
+    replica_env(home, name, "")
+}
+
+fn replica_env(home: &Path, name: &str, compact_at: &str) -> Daemon {
     let log_path = home.join(format!("replica-{name}.log"));
     let file = File::options()
         .create(true)
@@ -2205,6 +2209,7 @@ fn replica(home: &Path, name: &str) -> Daemon {
             "--replica",
             name,
         ])
+        .envs((!compact_at.is_empty()).then_some(("INLET_ROTATE_BYTES", compact_at)))
         .stdout(Stdio::from(file.try_clone().unwrap()))
         .stderr(Stdio::from(file))
         .spawn()
@@ -2378,4 +2383,77 @@ fn work_a_replica_started_stops_when_it_no_longer_leads() {
         assert!(Instant::now() < deadline, "the old leader's worker ran on");
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn replicas_let_go_of_the_log_and_a_new_leader_starts_from_the_snapshot() {
+    let homes = replica_homes(
+        "comp",
+        r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#,
+        "retain = 1",
+    );
+    let names = ["a", "b", "c"];
+    let mut daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica_env(home, name, "3000"))
+        .collect();
+    let first = leader_of(&homes, None);
+    manifest(
+        &homes[first],
+        r#"{"kind":"swarm","name":"many","replicas":3,"completions":60,
+            "template":{"worker":"job","goal":"g {index}","verify":"test -s out"}}"#,
+    );
+    wait(&homes[first], &daemons[first], |v| {
+        swarm(v, "many")["done"].as_u64().unwrap_or(0) >= 30
+    });
+    let floor = |home: &Path| -> u64 {
+        fs::read_to_string(home.join("ledger/floor"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    // Every replica has a snapshot and has dropped the log behind it.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !homes.iter().all(|h| floor(h) > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "floors {:?}: {}",
+            homes.iter().map(|h| floor(h)).collect::<Vec<_>>(),
+            daemons[first].log()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    // The leader dies. The next one has no log from before its floor, only
+    // the snapshot, and the count carries on from where it was.
+    kill9(&mut daemons[first]);
+    let second = leader_of(&homes, Some(first));
+    let st = wait(&homes[second], &daemons[second], |v| {
+        swarm(v, "many")["phase"] == "done"
+    });
+    assert_eq!(swarm(&st, "many")["done"], 60, "{st}");
+    // A replica that lost everything is given the snapshot and the rest.
+    let third = (0..3).find(|i| *i != first && *i != second).unwrap();
+    kill9(&mut daemons[third]);
+    fs::remove_dir_all(homes[third].join("ledger")).unwrap();
+    let _ = fs::remove_dir_all(homes[third].join("snap"));
+    daemons[third] = replica_env(&homes[third], names[third], "3000");
+    let len = |home: &Path| {
+        fs::metadata(home.join("ledger/log"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while len(&homes[third]) != len(&homes[second]) || floor(&homes[third]) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the empty replica was never filled"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let tail = |home: &Path| {
+        let from = floor(&homes[second]).max(floor(&homes[third])) as usize;
+        fs::read(home.join("ledger/log")).unwrap()[from..].to_vec()
+    };
+    assert_eq!(tail(&homes[third]), tail(&homes[second]));
 }

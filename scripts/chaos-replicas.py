@@ -27,6 +27,7 @@ ap.add_argument("--tasks", type=int, default=150)
 ap.add_argument("--seconds", type=int, default=120)
 ap.add_argument("--seed", type=int, default=int(time.time()))
 ap.add_argument("--home", default="")
+ap.add_argument("--compact", type=int, default=0, help="replicas let go of the log every this many bytes")
 ap.add_argument("--flaky", action="store_true", help="replicas reach each other over a link that drops and delays")
 args = ap.parse_args()
 rng = random.Random(args.seed)
@@ -83,7 +84,8 @@ def keep(name):
     """What systemd would do: when the replica exits, start it again."""
     log = open(os.path.join(root, name + ".log"), "a")
     while not stopping:
-        p = subprocess.Popen([binary, "--home", homes[name], "up", "-f", "--replica", name], stdout=log, stderr=log)
+        env = dict(os.environ, INLET_ROTATE_BYTES=str(args.compact)) if args.compact else None
+        p = subprocess.Popen([binary, "--home", homes[name], "up", "-f", "--replica", name], stdout=log, stderr=log, env=env)
         with guard:
             procs[name] = p
         p.wait()
@@ -105,6 +107,13 @@ def leader():
             except ValueError:
                 pass
     return None, None
+
+
+def floor(r):
+    try:
+        return int(open(homes[r] + "/ledger/floor").read())
+    except (OSError, ValueError):
+        return 0
 
 
 acked, unsure = {}, 0
@@ -170,7 +179,7 @@ while time.time() < deadline:
     who, st = leader()
     if st and st["live"] == 0 and st["queued"] == 0 and all(t["state"] in ("done", "failed", "killed") for t in st["tasks"]):
         lens = {r: os.path.getsize(homes[r] + "/ledger/log") for r in reps}
-        if len(set(lens.values())) == 1:
+        if len(set(lens.values())) == 1 and (not args.compact or all(floor(r) > 0 for r in reps)):
             break
     time.sleep(1)
 for _ in range(60):
@@ -196,8 +205,13 @@ if st:
     undone = [i for i in acked if i in tasks and end(i)["state"] != "done"]
     check(not undone, "%d answered adds did not end done: %s" % (len(undone), [(end(i)["state"], end(i)["reason"]) for i in undone[:3]]))
     check(st["held"] == 0 and st["live"] == 0, "held %s live %s" % (st["held"], st["live"]))
+# Below a replica's floor its log is a hole. Past the highest floor they must match.
+floors = {r: floor(r) for r in reps}
 logs = {r: open(homes[r] + "/ledger/log", "rb").read() for r in reps}
-check(len(set(logs.values())) == 1, "the logs differ: %s bytes" % {r: len(b) for r, b in logs.items()})
+check(len({len(b) for b in logs.values()}) == 1 and len({b[max(floors.values()):] for b in logs.values()}) == 1,
+      "the logs differ: %s bytes, floors %s" % ({r: len(b) for r, b in logs.items()}, floors))
+if args.compact:
+    check(all(f > 0 for f in floors.values()), "a replica never let go of any log: %s" % floors)
 terms = [int(n) for n in re.findall(rb'\{"kind":"term","term":(\d+)', logs[reps[0]])]
 check(terms == sorted(set(terms)), "terms in the log are not strictly rising: %s" % terms)
 elected = collections.defaultdict(set)
@@ -226,7 +240,7 @@ for _ in range(30):
     time.sleep(0.5)
 check(not left, "processes left: %s" % [cmdline(p)[-80:] for p in left[:6]])
 print("seed %d  %s" % (args.seed, dict(kills)))
-print("adds answered %d  unsure %d  terms %s  log %d bytes" % (len(acked), unsure, terms, len(logs[reps[0]])))
+print("adds answered %d  unsure %d  terms %s  log %d bytes  floors %s" % (len(acked), unsure, terms, len(logs[reps[0]]), sorted(floors.values())))
 if problems:
     print("FAILED")
     for p in problems:

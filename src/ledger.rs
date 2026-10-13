@@ -188,6 +188,13 @@ impl Ledger {
         Ok(())
     }
 
+    /// Give the disk back everything before `upto`. The file keeps its
+    /// length and every later byte keeps its offset; what was there reads as
+    /// zeros. False when the filesystem cannot, and then nothing changed.
+    pub fn punch(&self, upto: u64) -> bool {
+        punch(&self.file, upto)
+    }
+
     pub fn lock(&self) -> Result<()> {
         let rc = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -218,6 +225,14 @@ impl Ledger {
     pub fn append(&mut self, rec: &Record, sync: bool) -> Result<()> {
         self.append_all(std::slice::from_ref(rec), sync)
     }
+}
+
+pub fn punch(file: &File, upto: u64) -> bool {
+    if upto == 0 {
+        return true;
+    }
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    unsafe { libc::fallocate(file.as_raw_fd(), mode, 0, upto as libc::off_t) == 0 }
 }
 
 pub fn crc32(data: &[u8]) -> u32 {

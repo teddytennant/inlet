@@ -13,7 +13,15 @@
 //!   vote    whom it voted for in which term
 //!   terms   [[term, offset], ...]
 //!   heard   touched whenever a leader is heard from
+//!   floor   the offset below which the log has been given back to the disk
 //!   log     the ledger
+//!
+//! The log is never renamed or restarted, so an offset means the same thing
+//! on every replica for ever. To keep it from growing without end the leader
+//! sends its snapshot, which stands for everything before some offset, and
+//! each replica then punches that part of its own log out: same length, same
+//! offsets, no disk. A replica too far behind to be sent bytes that no longer
+//! exist is sent the snapshot and carries on from there.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -50,6 +58,33 @@ fn vote_path(home: &Path) -> PathBuf {
 }
 fn heard_path(home: &Path) -> PathBuf {
     home.join("ledger/heard")
+}
+
+fn floor_path(home: &Path) -> PathBuf {
+    home.join("ledger/floor")
+}
+
+/// Below this the log reads as zeros and only a snapshot will do.
+pub fn floor(home: &Path) -> u64 {
+    fs::read_to_string(floor_path(home))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn set_floor(home: &Path, at: u64) -> Result<()> {
+    snap::durable(&floor_path(home), at.to_string().as_bytes())
+}
+
+fn snapshot_at(home: &Path) -> Option<u64> {
+    let bytes = fs::read(paths::snap_index(home)).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()?["offset"].as_u64()
+}
+
+/// Whether this home could be replayed: its snapshot reaches the floor.
+pub fn usable(home: &Path) -> bool {
+    let floor = floor(home);
+    floor == 0 || snapshot_at(home).is_some_and(|at| at >= floor && at <= log_len(home))
 }
 
 pub fn terms(home: &Path) -> Terms {
@@ -153,10 +188,59 @@ pub fn serve(home: &Path) -> Result<()> {
         };
         let mut bytes = vec![0u8; req["n"].as_u64().unwrap_or(0) as usize];
         input.read_exact(&mut bytes)?;
-        let reply = append(home, &req, &bytes)?;
+        let reply = if req["op"] == "snap" {
+            install(home, &req, &bytes)?
+        } else {
+            append(home, &req, &bytes)?
+        };
         writeln!(out, "{reply}")?;
         out.flush()?;
     }
+}
+
+/// Take the leader's snapshot: everything before `at`, in one piece. Then
+/// the log before `at` is not needed here, and is given back to the disk.
+fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
+    let _guard = guard(home)?;
+    let term = req["term"].as_u64().unwrap_or(0);
+    let current = snap::read_epoch(home);
+    if term < current {
+        return Ok(json!({"ok": false, "term": current}));
+    }
+    if term > current {
+        set_epoch(home, term)?;
+    }
+    touch(home);
+    let path = paths::ledger(home);
+    let Some(file) = ledger::try_lock(&path, true)? else {
+        return Ok(json!({"ok": false, "busy": true}));
+    };
+    let at = req["at"].as_u64().unwrap_or(0);
+    let theirs = pairs(&req["terms"]);
+    let mine = terms(home);
+    let mut len = file.metadata()?.len();
+    let same = agreed(&mine, len, &theirs, u64::MAX);
+    if at <= floor(home) {
+        // Already have one at least as new.
+        return Ok(json!({"ok": true, "len": len.min(same.max(floor(home)))}));
+    }
+    snap::durable(&paths::snap_index(home), bytes)?;
+    if same < at {
+        // Too far behind, or on a branch the leader's history did not take.
+        // The snapshot is what was before `at`; the log starts over there.
+        file.set_len(at)?;
+        file.sync_all()?;
+        len = at;
+        let known: Terms = theirs
+            .into_iter()
+            .filter(|(_, start)| *start <= at)
+            .collect();
+        store_terms(home, &known)?;
+    }
+    set_floor(home, at)?;
+    ledger::punch(&file, at);
+    touch(home);
+    Ok(json!({"ok": true, "len": len.min(same.max(at))}))
 }
 
 fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
@@ -190,7 +274,13 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         mine.retain(|(_, start)| *start < same);
         store_terms(home, &mine)?;
         // A snapshot taken while leading may cover what was just cut.
-        let _ = fs::remove_file(paths::snap_index(home));
+        if snapshot_at(home).is_some_and(|at| at > same) {
+            let _ = fs::remove_file(paths::snap_index(home));
+        }
+    }
+    if !usable(home) {
+        // Nothing here to build on. Ask for all of it.
+        return Ok(json!({"ok": false, "need": 0}));
     }
     if at > len {
         return Ok(json!({"ok": false, "need": len}));
@@ -319,6 +409,12 @@ pub fn stand_by(home: &Path, me: &str, peers: &[Peer]) -> Result<u64> {
         if quiet_for(home) < Duration::from_millis(patience) {
             continue;
         }
+        if !usable(home) {
+            // A home that could not be replayed cannot lead. A leader will
+            // send it what it is missing.
+            touch(home);
+            continue;
+        }
         patience = QUIET_MS + jitter(QUIET_MS);
         let last = |home: &Path| (terms(home).last().map_or(0, |t| t.0), log_len(home));
         let (last_term, len) = last(home);
@@ -372,6 +468,8 @@ pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
 }
 
 struct Shared {
+    /// Followers behind this are sent the snapshot, not bytes.
+    floor: u64,
     want: u64,
     acked: Vec<u64>,
     deposed: bool,
@@ -387,6 +485,7 @@ impl Links {
     pub fn start(home: &Path, term: u64, peers: &[Peer], terms: Terms, len: u64) -> Links {
         let shared = Arc::new((
             Mutex::new(Shared {
+                floor: floor(home),
                 want: len,
                 acked: vec![0; peers.len()],
                 deposed: false,
@@ -396,8 +495,9 @@ impl Links {
         for (i, peer) in peers.iter().enumerate() {
             let (shared, peer, terms) = (shared.clone(), peer.clone(), terms.clone());
             let log = paths::ledger(home);
+            let index = paths::snap_index(home);
             thread::spawn(move || loop {
-                if link(&shared, i, &peer, term, &terms, &log) {
+                if link(&shared, i, &peer, term, &terms, &log, &index) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -436,6 +536,15 @@ impl Links {
         }
     }
 
+    /// The leader has a snapshot at `at` and has let go of the log before
+    /// it. Every follower is sent the snapshot so it can do the same.
+    pub fn set_floor(&self, at: u64) {
+        let (lock, wake) = &*self.shared;
+        let mut shared = lock.lock().unwrap();
+        shared.floor = shared.floor.max(at);
+        wake.notify_all();
+    }
+
     pub fn deposed(&self) -> bool {
         self.shared.0.lock().unwrap().deposed
     }
@@ -450,6 +559,7 @@ fn link(
     term: u64,
     terms: &Terms,
     log: &Path,
+    index: &Path,
 ) -> bool {
     let Some((program, rest)) = peer.cmd.split_first() else {
         return true;
@@ -489,15 +599,42 @@ fn link(
     // Where the peer's log ends. Unknown at first: an empty append at the
     // leader's own end makes the peer say.
     let mut theirs: Option<u64> = None;
+    // The newest snapshot this peer is known to hold.
+    let mut snapped = 0u64;
     loop {
-        let want = lock.lock().unwrap().want;
+        let (want, floor) = {
+            let shared = lock.lock().unwrap();
+            (shared.want, shared.floor)
+        };
         let at = theirs.unwrap_or(want).min(want);
-        let n = (want - at).min(CHUNK);
-        let mut bytes = vec![0u8; n as usize];
-        if file.seek(SeekFrom::Start(at)).is_err() || file.read_exact(&mut bytes).is_err() {
-            return done(&mut child, false);
-        }
-        let header = json!({"term": term, "at": at, "n": n, "terms": terms});
+        let (header, bytes) = if theirs.is_some() && snapped < floor {
+            // Bytes before the floor are gone from here, and the peer may
+            // let go of its own once it has what stands for them.
+            let Ok(bytes) = fs::read(index) else {
+                return done(&mut child, false);
+            };
+            let Some(covers) = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| v["offset"].as_u64())
+                .filter(|covers| *covers >= floor)
+            else {
+                return done(&mut child, false);
+            };
+            snapped = covers;
+            let header =
+                json!({"op": "snap", "term": term, "at": covers, "n": bytes.len(), "terms": terms});
+            (header, bytes)
+        } else {
+            let n = (want - at).min(CHUNK);
+            let mut bytes = vec![0u8; n as usize];
+            if file.seek(SeekFrom::Start(at)).is_err() || file.read_exact(&mut bytes).is_err() {
+                return done(&mut child, false);
+            }
+            (
+                json!({"term": term, "at": at, "n": n, "terms": terms}),
+                bytes,
+            )
+        };
         if writeln!(stdin, "{header}").is_err()
             || stdin.write_all(&bytes).is_err()
             || stdin.flush().is_err()
@@ -521,6 +658,10 @@ fn link(
             }
         } else if let Some(need) = reply["need"].as_u64() {
             theirs = Some(need);
+            if need < floor {
+                // It has lost what it was sent, or never had it.
+                snapped = 0;
+            }
             continue;
         } else if reply["term"].as_u64().is_some_and(|t| t > term) {
             lock.lock().unwrap().deposed = true;
@@ -535,7 +676,7 @@ fn link(
         if shared.deposed {
             return done(&mut child, true);
         }
-        if theirs == Some(shared.want) {
+        if theirs == Some(shared.want) && snapped >= shared.floor {
             let _ = wake.wait_timeout(shared, BEAT).unwrap();
         }
     }

@@ -37,7 +37,7 @@ jobs:
       - name: chaos across nodes
         run: python3 scripts/chaos-nodes.py target/x86_64-unknown-linux-musl/release/inlet --nodes 2 --tasks 120 --seconds 90 --seed 7 --flaky --standby
       - name: chaos across replicas
-        run: python3 scripts/chaos-replicas.py target/x86_64-unknown-linux-musl/release/inlet --tasks 80 --seconds 70 --seed 7 --flaky
+        run: python3 scripts/chaos-replicas.py target/x86_64-unknown-linux-musl/release/inlet --tasks 80 --seconds 70 --seed 7 --flaky --compact 6000
       - name: release RSS
         run: cargo test --release --test live empty_daemon_rss_when_asked -- --exact
         env:

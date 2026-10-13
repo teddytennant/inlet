@@ -362,6 +362,11 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         }
     }
     let snap_offset = index.as_ref().map(|saved| saved.offset).unwrap_or(0);
+    if snap_offset < replica::floor(home) {
+        return Err(err(
+            "the log before its floor is gone and no snapshot reaches that far; restore snap/index.json",
+        ));
+    }
     let opened = ledger::open_file(file, snap_offset)?;
     let links = match elected {
         Some(term) => {
@@ -1459,13 +1464,27 @@ impl Daemon {
             .unwrap_or(ROTATE_BYTES);
         // Replicas count in offsets from the start of one log.
         let rotate = self.ledger.len() >= rotate_at && self.links.is_none();
-        if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate {
+        // With replicas the log keeps its offsets and gives up its past.
+        let compact = self.links.is_some()
+            && self.ledger.len().saturating_sub(replica::floor(&self.home)) >= rotate_at;
+        if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate || compact {
             // The index and a rotation are writes a replaced leader must not make.
             self.still_leader()?;
             self.flush_soft()?;
             let offset = self.ledger.len();
             snap::store(&self.home, &snap::checkpoint(&self.state, offset))?;
             self.snap_offset = offset;
+            if compact {
+                // The snapshot is on disk and stands for everything before
+                // it. The floor is written first: a log with a hole in it
+                // and nothing saying so would be read as a log.
+                replica::set_floor(&self.home, offset)?;
+                self.ledger.punch(offset);
+                if let Some(links) = &self.links {
+                    links.set_floor(offset);
+                }
+                eprintln!("inlet: let go of the ledger before {offset}");
+            }
             if rotate {
                 // The checkpoint holds everything the log said. A crash after
                 // the rename and before the second index finds an empty log
