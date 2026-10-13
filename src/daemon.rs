@@ -954,10 +954,13 @@ impl Daemon {
         let changed = now.iter().filter(|n| !self.replicas.contains(n)).count()
             + self.replicas.iter().filter(|n| !now.contains(n)).count();
         if changed > 1 {
-            eprintln!(
-                "inlet: replicas change one at a time; keeping {}",
+            // The standbys read the same file and will count majorities of
+            // the new set. Leading on with the old one would be two sets,
+            // each with a majority of its own.
+            self.fatal = Some(format!(
+                "replicas change one at a time, and the policy changes more than one of {}; stopping",
                 self.replicas.join(", ")
-            );
+            ));
             return;
         }
         if !now.contains(&me) {
@@ -987,6 +990,12 @@ impl Daemon {
             self.soft.clear();
             self.fatal = Some(e.to_string());
             return Err(e);
+        }
+        // The wait may have been long, and this home may have voted for
+        // another in the meantime. Then its own copy does not count, and
+        // what looked like most replicas was not.
+        if snap::read_epoch(&self.home) > self.epoch {
+            return Err(self.deposed());
         }
         Ok(())
     }
@@ -1547,10 +1556,10 @@ impl Daemon {
                 // it. The floor is written first: a log with a hole in it
                 // and nothing saying so would be read as a log.
                 replica::set_floor(&self.home, offset)?;
-                self.ledger.punch(offset);
                 if let Some(links) = &self.links {
                     links.set_floor(offset);
                 }
+                self.ledger.punch(offset);
                 eprintln!("inlet: let go of the ledger before {offset}");
             }
             if rotate {

@@ -87,6 +87,18 @@ pub fn usable(home: &Path) -> bool {
     floor == 0 || snapshot_at(home).is_some_and(|at| at >= floor && at <= log_len(home))
 }
 
+/// The term of the last byte in the log, and where the log ends. A term
+/// noted down whose bytes never arrived does not count.
+fn last(home: &Path) -> (u64, u64) {
+    let len = log_len(home);
+    let term = terms(home)
+        .iter()
+        .rev()
+        .find(|(_, start)| *start < len)
+        .map_or(0, |t| t.0);
+    (term, len)
+}
+
 pub fn terms(home: &Path) -> Terms {
     fs::read(terms_path(home))
         .ok()
@@ -229,6 +241,13 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     if same < at || !whole {
         // Too far behind, or on a branch the leader's history did not take.
         // The snapshot is what was before `at`; the log starts over there.
+        // No moment may leave bytes above the floor that are not log. A
+        // floor going up is written before the file is stretched over the
+        // gap; one coming down, after the file has been cut back to it.
+        let old = floor(home);
+        if at > old {
+            set_floor(home, at)?;
+        }
         file.set_len(at)?;
         file.sync_all()?;
         len = at;
@@ -237,8 +256,12 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
             .filter(|(_, start)| *start <= at)
             .collect();
         store_terms(home, &known)?;
+        if at < old {
+            set_floor(home, at)?;
+        }
+    } else {
+        set_floor(home, at)?;
     }
-    set_floor(home, at)?;
     ledger::punch(&file, at);
     touch(home);
     Ok(json!({"ok": true, "len": len.min(same.max(at))}))
@@ -287,18 +310,22 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         return Ok(json!({"ok": false, "need": len}));
     }
     let skip = (len - at) as usize;
-    if skip < bytes.len() {
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&bytes[skip..])?;
-        file.sync_all()?;
-        len += (bytes.len() - skip) as u64;
-    }
+    let more = bytes.len().saturating_sub(skip) as u64;
+    // Which terms the bytes belong to is written down before the bytes are.
+    // The other way round, a crash in between leaves bytes of a new term
+    // filed under an old one, and the next leader would take them for its own.
     let known: Terms = theirs
         .into_iter()
-        .filter(|(_, start)| *start <= len)
+        .filter(|(_, start)| *start <= len + more)
         .collect();
     if known != mine {
         store_terms(home, &known)?;
+    }
+    if more > 0 {
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&bytes[skip..])?;
+        file.sync_all()?;
+        len += more;
     }
     // Again, now that the disk has been waited on: a slow fsync is not the
     // leader going quiet.
@@ -321,8 +348,7 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     let candidate = req["candidate"].as_str().unwrap_or("");
     let dry = req["pre"] == true;
     let current = snap::read_epoch(home);
-    let mine = terms(home);
-    let my_last = (mine.last().map_or(0, |t| t.0), log_len(home));
+    let my_last = last(home);
     let their_last = (
         req["last_term"].as_u64().unwrap_or(0),
         req["len"].as_u64().unwrap_or(0),
@@ -420,7 +446,6 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
         // the policy may have changed since this one sat down.
         let peers = &peers()?;
         let most = most(peers.len());
-        let last = |home: &Path| (terms(home).last().map_or(0, |t| t.0), log_len(home));
         let (last_term, len) = last(home);
         let next = snap::read_epoch(home) + 1;
         let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre});
@@ -640,6 +665,10 @@ fn link(
     let (lock, wake) = &**shared;
     // Where the peer's log ends. Unknown at first: an empty append at the
     // leader's own end makes the peer say.
+    if let Some(acked) = lock.lock().unwrap().acked.get_mut(&peer.name) {
+        // A new connection knows nothing of what the peer holds.
+        acked.0 = 0;
+    }
     let mut theirs: Option<u64> = None;
     // The newest snapshot this peer is known to hold.
     let mut snapped = 0u64;
@@ -676,6 +705,11 @@ fn link(
             if file.seek(SeekFrom::Start(at)).is_err() || file.read_exact(&mut bytes).is_err() {
                 return done(&mut child, false);
             }
+            if n > 0 && at < lock.lock().unwrap().floor {
+                // The leader let go of this part of the log while it was
+                // being read. What was read may be the hole.
+                continue;
+            }
             (
                 json!({"term": term, "at": at, "n": n, "terms": terms}),
                 bytes,
@@ -701,7 +735,9 @@ fn link(
             let want = shared.want;
             match shared.acked.get_mut(&peer.name) {
                 Some(acked) if acked.1 == peer.cmd => {
-                    if len <= want && len > acked.0 {
+                    // Down as well as up: a peer that lost its disk no
+                    // longer has what it once said it had.
+                    if len <= want && len != acked.0 {
                         acked.0 = len;
                         wake.notify_all();
                     }
@@ -839,6 +875,21 @@ mod tests {
         assert_eq!(snap::read_epoch(&home), 3);
         assert!(!ask(3, "c", 1, 60, false));
         assert!(ask(3, "b", 1, 60, false));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_term_whose_bytes_never_came_does_not_count() {
+        let home = home("last");
+        send(&home, 1, 0, &vec![(1, 0)], &[b'a'; 60]);
+        // What a crash leaves between noting a term and writing its bytes.
+        store_terms(&home, &vec![(1, 0), (5, 60)]).unwrap();
+        assert_eq!(last(&home), (1, 60));
+        // A leader of term 3 that never knew of 5 is not fooled by the note.
+        let t3 = vec![(1, 0), (3, 60)];
+        assert_eq!(send(&home, 5, 60, &t3, &[b'b'; 10])["len"], 70);
+        assert_eq!(last(&home), (3, 70));
+        assert_eq!(terms(&home), t3);
         let _ = fs::remove_dir_all(&home);
     }
 }

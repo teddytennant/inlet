@@ -2571,7 +2571,7 @@ fn a_replica_is_added_and_another_taken_out_while_the_work_goes_on() {
 }
 
 #[test]
-fn replicas_change_one_at_a_time_or_not_at_all() {
+fn replicas_change_one_at_a_time_or_the_leader_stops() {
     let job = r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#;
     let homes = replica_homes("leap", job, "");
     let names = ["a", "b", "c"];
@@ -2601,10 +2601,16 @@ fn replicas_change_one_at_a_time_or_not_at_all() {
         assert!(Instant::now() < deadline, "{}", daemons[first].log());
         thread::sleep(Duration::from_millis(100));
     }
-    // Still leading, with the set it had.
-    inlet(
-        &homes[first],
-        &["add", "-w", "job", "-g", "a", "--no-verify"],
-    );
+    // It does not lead on with a set the standbys no longer count by.
     assert!(!daemons[first].log().contains("replicas are now"));
+    let mut daemons = daemons;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while daemons[first].child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "still leading: {}",
+            daemons[first].log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
