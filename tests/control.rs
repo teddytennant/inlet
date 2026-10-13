@@ -2614,3 +2614,47 @@ fn replicas_change_one_at_a_time_or_the_leader_stops() {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn one_replica_grows_to_two_and_can_still_be_chosen() {
+    let job = r#"job = { cmd = { "/bin/sh", "-c", "echo hi > out" } },"#;
+    let (a, b) = (scratch("paira"), scratch("pairb"));
+    // Alone first: a set of one elects itself.
+    replica_set(&[("a", &a)], job);
+    let mut first = replica(&a, "a");
+    leader_of(std::slice::from_ref(&a), None);
+    inlet(
+        &a,
+        &["add", "-w", "job", "-g", "one", "--verify", "test -s out"],
+    );
+    wait(&a, &first, |v| {
+        tasks(v).iter().any(|t| t["state"] == "done")
+    });
+    // Now two, by the policy, and the second has never been reached. The
+    // first is killed before it fills it: an empty home and a full one.
+    thread::sleep(Duration::from_millis(1100));
+    replica_set(&[("a", &a), ("b", &b)], job);
+    kill9(&mut first);
+    let first = replica(&a, "a");
+    // The empty one says yes: in a pair, the other is missing nothing.
+    leader_of(std::slice::from_ref(&a), None);
+    inlet(
+        &a,
+        &["add", "-w", "job", "-g", "two", "--verify", "test -s out"],
+    );
+    let st = wait(&a, &first, |v| {
+        tasks(v).iter().filter(|t| t["state"] == "done").count() == 2
+    });
+    assert_eq!(tasks(&st).len(), 2, "{st}");
+    // And the second now holds the ledger too.
+    let len = |home: &Path| {
+        fs::metadata(home.join("ledger/log"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while len(&b) != len(&a) {
+        assert!(Instant::now() < deadline, "{} of {}", len(&b), len(&a));
+        thread::sleep(Duration::from_millis(100));
+    }
+}

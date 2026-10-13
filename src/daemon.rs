@@ -585,6 +585,12 @@ fn peers_of(home: &Path, me: &str) -> Result<Vec<replica::Peer>> {
         .collect())
 }
 
+/// How many replicas this home's policy names. 0 when it names none or
+/// cannot be read.
+pub fn replica_count(home: &Path) -> usize {
+    load_signed(home).map_or(0, |p| p.cfg.replicas.len())
+}
+
 fn names(replicas: &[(String, Vec<String>)]) -> String {
     let names: Vec<&str> = replicas.iter().map(|(name, _)| name.as_str()).collect();
     names.join(", ")
@@ -935,6 +941,7 @@ impl Daemon {
             return Err(self.deposed());
         }
         if let Some(links) = &self.links {
+            links.beat();
             if links.alone_for() >= replica::QUORUM_WAIT {
                 let msg = "most replicas are out of reach; stopping rather than lead alone";
                 self.soft.clear();

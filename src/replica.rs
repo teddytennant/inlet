@@ -413,7 +413,9 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
 pub fn vote(home: &Path) -> Result<()> {
     let mut text = String::new();
     std::io::stdin().read_to_string(&mut text)?;
-    let req: Value = serde_json::from_str(&text).map_err(|_| err("replica: bad vote"))?;
+    let mut req: Value = serde_json::from_str(&text).map_err(|_| err("replica: bad vote"))?;
+    // This home's own count of the replicas, never the candidate's word.
+    req["pair"] = json!(crate::daemon::replica_count(home) == 2);
     println!("{}", answer_vote(home, &req)?);
     Ok(())
 }
@@ -445,7 +447,12 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     // vote could elect a replica that is missing some of it. It votes only
     // when there is no history anywhere: the first election there ever is.
     let blank = my_last.1 == 0;
-    let fresh = their_last >= my_last && (!blank || their_last == (0, 0));
+    // But in a set of two a write is kept only when both have it, so the
+    // other one is missing nothing, and an empty home may say so. Without
+    // this, two replicas of which one is new or has lost its disk could
+    // never choose between themselves again.
+    let pair = req["pair"] == true;
+    let fresh = their_last >= my_last && (!blank || pair || their_last == (0, 0));
     if dry {
         // Would it be granted. Nothing is written down for a question.
         let granted = term > current && fresh && leaderless;
@@ -606,6 +613,9 @@ pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
 }
 
 struct Shared {
+    /// When the leader's own loop last came round. Links go quiet when it
+    /// has not: a leader that is stuck must not sound like one that is well.
+    alive: Instant,
     /// When each peer last answered.
     seen: std::collections::HashMap<String, Instant>,
     /// Followers behind this are sent the snapshot, not bytes.
@@ -633,6 +643,7 @@ impl Links {
                 want: len,
                 acked: Default::default(),
                 seen: Default::default(),
+                alive: Instant::now(),
                 deposed: false,
             }),
             Condvar::new(),
@@ -705,7 +716,9 @@ impl Links {
                     "most replicas are out of reach; stopping rather than promise what cannot be kept",
                 ));
             }
-            shared = wake.wait_timeout(shared, left).unwrap().0;
+            // Waiting here is the loop being busy, not stuck.
+            shared.alive = Instant::now();
+            shared = wake.wait_timeout(shared, left.min(BEAT)).unwrap().0;
         }
     }
 
@@ -738,6 +751,11 @@ impl Links {
             .collect();
         ages.sort();
         ages[need - 1]
+    }
+
+    /// The leader's loop is turning.
+    pub fn beat(&self) {
+        self.shared.0.lock().unwrap().alive = Instant::now();
     }
 
     pub fn deposed(&self) -> bool {
@@ -810,6 +828,13 @@ fn link(
                 drop(shared);
                 return done(&mut child, true);
             }
+            if shared.alive.elapsed() > Duration::from_secs(3) {
+                // Say nothing. The followers will take the silence for what
+                // it is and choose another.
+                drop(shared);
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             (shared.want, shared.floor)
         };
         let at = theirs.unwrap_or(want).min(want);
@@ -855,7 +880,13 @@ fn link(
         }
         // A snapshot is large and is fsynced more than once at the far end.
         let limit = if header["op"] == "snap" {
-            CALL * 15
+            // It answered a moment ago to be sent this at all. The time a
+            // big snapshot takes to cross and be synced is not it going away.
+            lock.lock()
+                .unwrap()
+                .seen
+                .insert(peer.name.clone(), Instant::now() + Duration::from_secs(600));
+            Duration::from_secs(600)
         } else {
             CALL
         };
