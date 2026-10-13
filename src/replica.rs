@@ -103,6 +103,62 @@ fn last(home: &Path) -> (u64, u64) {
     (term, len)
 }
 
+fn refill_path(home: &Path) -> PathBuf {
+    home.join("ledger/refill")
+}
+
+/// A home that had nothing when a leader first reached it is being filled
+/// up to here. Until its log is that long it knows less than it may once
+/// have promised, and it neither votes nor stands.
+fn refill(home: &Path) -> u64 {
+    fs::read_to_string(refill_path(home))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn filling(home: &Path) -> bool {
+    refill(home) > log_len(home)
+}
+
+/// Note, on first contact, how far an empty home has to be filled.
+fn mark_refill(home: &Path, upto: u64) -> Result<()> {
+    if upto > 0 && log_len(home) == 0 && refill(home) < upto {
+        snap::durable(&refill_path(home), upto.to_string().as_bytes())?;
+    }
+    Ok(())
+}
+
+fn id_path(home: &Path) -> PathBuf {
+    home.join("ledger/cluster")
+}
+
+/// Which set of replicas this home belongs to: a number made up by the
+/// first leader there ever was and handed on with everything it sends.
+pub fn cluster(home: &Path) -> Option<String> {
+    let id = fs::read_to_string(id_path(home)).ok()?;
+    Some(id.trim().to_string()).filter(|id| !id.is_empty())
+}
+
+/// Whether a request comes from another set of replicas altogether: a
+/// daemon left running from an older cluster, or a policy pointed at the
+/// wrong machine. Such a one is not obeyed, however high its term.
+fn foreign(home: &Path, req: &Value) -> bool {
+    match (cluster(home), req["id"].as_str()) {
+        (Some(mine), Some(theirs)) => mine != theirs,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// A home that belonged to nobody belongs to the first leader to fill it.
+fn adopt(home: &Path, req: &Value) -> Result<()> {
+    if let (None, Some(id)) = (cluster(home), req["id"].as_str()) {
+        snap::durable(&id_path(home), id.as_bytes())?;
+    }
+    Ok(())
+}
+
 pub fn terms(home: &Path) -> Terms {
     fs::read(terms_path(home))
         .ok()
@@ -218,11 +274,16 @@ pub fn serve(home: &Path) -> Result<()> {
 /// the log before `at` is not needed here, and is given back to the disk.
 fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     let _guard = guard(home)?;
+    if foreign(home, req) {
+        return Ok(json!({"ok": false, "foreign": true}));
+    }
     let term = req["term"].as_u64().unwrap_or(0);
     let current = snap::read_epoch(home);
     if term < current {
         return Ok(json!({"ok": false, "term": current}));
     }
+    adopt(home, req)?;
+    mark_refill(home, req["at"].as_u64().unwrap_or(0))?;
     if term > current {
         set_epoch(home, term)?;
     }
@@ -267,17 +328,25 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         set_floor(home, at)?;
     }
     ledger::punch(&file, at);
+    if refill(home) > 0 && len >= refill(home) {
+        let _ = fs::remove_file(refill_path(home));
+    }
     touch(home);
     Ok(json!({"ok": true, "len": len.min(same.max(at))}))
 }
 
 fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     let _guard = guard(home)?;
+    if foreign(home, req) {
+        return Ok(json!({"ok": false, "foreign": true}));
+    }
     let term = req["term"].as_u64().unwrap_or(0);
     let current = snap::read_epoch(home);
     if term < current {
         return Ok(json!({"ok": false, "term": current}));
     }
+    adopt(home, req)?;
+    mark_refill(home, req["at"].as_u64().unwrap_or(0))?;
     if term > current {
         // A daemon here that led an older term reads this and stops.
         set_epoch(home, term)?;
@@ -331,6 +400,9 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         file.sync_all()?;
         len += more;
     }
+    if refill(home) > 0 && len >= refill(home) {
+        let _ = fs::remove_file(refill_path(home));
+    }
     // Again, now that the disk has been waited on: a slow fsync is not the
     // leader going quiet.
     touch(home);
@@ -348,6 +420,13 @@ pub fn vote(home: &Path) -> Result<()> {
 
 fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     let _guard = guard(home)?;
+    if cluster(home).is_some() && req["id"].is_string() && foreign(home, req) {
+        return Ok(json!({"granted": false, "term": 0}));
+    }
+    if filling(home) || !usable(home) {
+        // Half filled, or half way through taking a snapshot.
+        return Ok(json!({"granted": false, "term": 0}));
+    }
     let term = req["term"].as_u64().unwrap_or(0);
     let candidate = req["candidate"].as_str().unwrap_or("");
     let dry = req["pre"] == true;
@@ -365,7 +444,7 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     // its disk. Either way it knows nothing of what was promised, and its
     // vote could elect a replica that is missing some of it. It votes only
     // when there is no history anywhere: the first election there ever is.
-    let blank = terms(home).is_empty() && my_last.1 == 0;
+    let blank = my_last.1 == 0;
     let fresh = their_last >= my_last && (!blank || their_last == (0, 0));
     if dry {
         // Would it be granted. Nothing is written down for a question.
@@ -444,7 +523,7 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
         if quiet_for(home) < Duration::from_millis(patience) {
             continue;
         }
-        if !usable(home) {
+        if !usable(home) || filling(home) {
             // A home that could not be replayed cannot lead. A leader will
             // send it what it is missing.
             touch(home);
@@ -457,7 +536,8 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
         let most = most(peers.len());
         let (last_term, len) = last(home);
         let next = snap::read_epoch(home) + 1;
-        let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre});
+        let id = cluster(home);
+        let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre, "id": id});
         // First whether a vote could be won, without disturbing anybody. A
         // replica cut off from the rest asks for ever and changes nothing.
         let (yes, newest) = poll(peers, &ask(next, true));
@@ -503,7 +583,19 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
 /// The new leader's first act: note where its term's bytes begin.
 pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
     let _guard = guard(home)?;
+    if cluster(home).is_none() {
+        // The first leader there ever is names the cluster.
+        let mut raw = [0u8; 8];
+        File::open("/dev/urandom")?.read_exact(&mut raw)?;
+        let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        snap::durable(&id_path(home), id.as_bytes())?;
+    }
     let mut mine = terms(home);
+    if mine.is_empty() && len > 0 {
+        // A ledger from before this home was a replica. It is the history,
+        // and is filed under a term older than any there will be.
+        mine.push((0, 0));
+    }
     // The log may have lost a torn tail on the way in.
     mine.retain(|(_, start)| *start <= len);
     if mine.last().is_none_or(|last| last.0 != term) {
@@ -697,6 +789,10 @@ fn link(
     let Ok(mut file) = File::open(log) else {
         return done(&mut child, false);
     };
+    let id = log
+        .parent()
+        .and_then(|ledger| ledger.parent())
+        .and_then(cluster);
     let (lock, wake) = &**shared;
     // Where the peer's log ends. Unknown at first: an empty append at the
     // leader's own end makes the peer say.
@@ -731,8 +827,7 @@ fn link(
                 return done(&mut child, false);
             };
             snapped = covers;
-            let header =
-                json!({"op": "snap", "term": term, "at": covers, "n": bytes.len(), "terms": terms});
+            let header = json!({"op": "snap", "term": term, "at": covers, "n": bytes.len(), "terms": terms, "id": id});
             (header, bytes)
         } else {
             let n = (want - at).min(CHUNK);
@@ -748,7 +843,7 @@ fn link(
                 continue;
             }
             (
-                json!({"term": term, "at": at, "n": n, "terms": terms}),
+                json!({"term": term, "at": at, "n": n, "terms": terms, "id": id}),
                 bytes,
             )
         };
@@ -794,11 +889,22 @@ fn link(
             }
         } else if let Some(need) = reply["need"].as_u64() {
             theirs = Some(need);
+            // Not a spin, if it keeps asking for the same thing.
+            thread::sleep(Duration::from_millis(20));
             if need < floor {
                 // It has lost what it was sent, or never had it.
                 snapped = 0;
             }
             continue;
+        } else if reply["foreign"] == true {
+            // That home belongs to another set of replicas. It is not this
+            // leader's to fill, and nothing it says counts.
+            eprintln!(
+                "inlet: replica {} belongs to another cluster; leaving it alone",
+                peer.name
+            );
+            thread::sleep(Duration::from_secs(10));
+            return done(&mut child, false);
         } else if reply["term"].as_u64().is_some_and(|t| t > term) {
             lock.lock().unwrap().deposed = true;
             wake.notify_all();
@@ -959,6 +1065,62 @@ mod tests {
             .unwrap();
         assert!(ask(6, 60));
         assert!(!ask(6, 59));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_leader_from_another_cluster_is_not_obeyed() {
+        let home = home("foreign");
+        let t = vec![(1, 0)];
+        let from = |id: &str, term: u64, at: u64, bytes: &[u8]| {
+            let req = json!({"term": term, "at": at, "n": bytes.len(), "terms": t, "id": id});
+            append(&home, &req, bytes).unwrap()
+        };
+        // A home that belonged to nobody takes the first leader's name.
+        assert_eq!(from("aaaa", 1, 0, &[b'a'; 40])["len"], 40);
+        assert_eq!(cluster(&home).as_deref(), Some("aaaa"));
+        // Another cluster's leader, with a far higher term, changes nothing.
+        assert_eq!(from("bbbb", 99, 0, &[b'z'; 80])["foreign"], true);
+        assert_eq!(snap::read_epoch(&home), 1);
+        assert_eq!(fs::read(paths::ledger(&home)).unwrap(), vec![b'a'; 40]);
+        let vote = json!({"term": 100, "candidate": "x", "last_term": 99, "len": 999, "pre": false, "id": "bbbb"});
+        assert_eq!(answer_vote(&home, &vote).unwrap()["granted"], false);
+        assert_eq!(snap::read_epoch(&home), 1);
+        // Its own goes on as before.
+        assert_eq!(from("aaaa", 1, 40, &[b'a'; 10])["len"], 50);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_home_being_filled_does_not_vote_until_it_is_full() {
+        // Its disk was lost. What it once took and acknowledged, it no
+        // longer has, and a candidate missing the same would look fresh to it.
+        let home = home("refill");
+        let t = vec![(4, 0)];
+        let vote = |home: &Path| {
+            let old = SystemTime::now() - Duration::from_secs(60);
+            File::open(heard_path(home))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            let req = json!({"term": 9, "candidate": "b", "last_term": 4, "len": 600, "pre": true});
+            answer_vote(home, &req).unwrap()["granted"] == true
+        };
+        // The leader's first word says how much there is.
+        assert_eq!(send(&home, 4, 1000, &t, b"")["need"], 0);
+        assert!(!vote(&home));
+        assert_eq!(send(&home, 4, 0, &t, &[b'a'; 500])["len"], 500);
+        assert!(!vote(&home), "half full, and b at 600 looks fresh to it");
+        assert_eq!(send(&home, 4, 500, &t, &[b'a'; 500])["len"], 1000);
+        // Full: b, at 600, is plainly behind, and one at 1000 is not.
+        assert!(!vote(&home));
+        let old = SystemTime::now() - Duration::from_secs(60);
+        File::open(heard_path(&home))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let req = json!({"term": 9, "candidate": "c", "last_term": 4, "len": 1000, "pre": true});
+        assert_eq!(answer_vote(&home, &req).unwrap()["granted"], true);
         let _ = fs::remove_dir_all(&home);
     }
 }

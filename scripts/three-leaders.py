@@ -118,14 +118,19 @@ def policy(me, b_name):
         "".join("  %s = { cmd = { %s } },\n" % (r, quote(view[r])) for r in "abc"), quote(view["n0"]))
 
 
-LOOP = "cd %s && rm -f stop hold && nohup sh -c 'while [ ! -e stop ]; do while [ -e hold ]; do sleep 1; done; ENV ./inlet --home %s up -f --replica %s >> %s.log 2>&1; sleep 0.5; done' > /dev/null 2>&1 &"
+LOOP = "cd %s && rm -f stop hold && nohup sh -c 'while [ -d %s ] && [ ! -e stop ]; do while [ -e hold ]; do sleep 1; done; ENV ./inlet --home %s up -f --replica %s >> %s.log 2>&1; sleep 0.5; done' > /dev/null 2>&1 &"
 LOOP = LOOP.replace("ENV", "INLET_ROTATE_BYTES=%d" % args.compact if args.compact else "")
+# Anything of an earlier run still alive on a far machine: its loops, its
+# daemons. One of those, left behind, leads the next run's replicas astray.
+SWEEP = "for p in $(pgrep -u $USER -x inlet) $(pgrep -u $USER -x sh); do tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q -- '%s/' && kill -9 $p; done; true" % D
 KILL = "touch %s/hold; for p in $(pgrep -x inlet); do grep -qa -- --replica /proc/$p/cmdline && kill -9 $p; done; true" % D
 procs = {}
 hold = {"a": False}
 problems = []
 tunnel = None
 try:
+    for n in ("b", "c"):
+        rsh(n, SWEEP)
     out = rsh("b", "rm -rf %s; mkdir -p %s/b/ledger %s/n0 && chmod 700 %s && hostname -s" % (D, D, D, D))
     assert out.returncode == 0, out.stderr
     b_name = out.stdout.strip()
@@ -158,7 +163,7 @@ try:
             time.sleep(0.5)
     threading.Thread(target=keep_a, daemon=True).start()
     for n in ("b", "c"):
-        rsh(n, LOOP % (D, HOME[n], n, n))
+        rsh(n, LOOP % (D, D, HOME[n], n, n))
 
     def leader(limit=90, skip=None):
         end = time.time() + limit
@@ -270,7 +275,7 @@ finally:
             print("== %s" % n)
             print(rsh(n, "cd %s; tail -6 %s.log; for f in epoch vote floor terms; do printf '%%s: ' $f; cat %s/ledger/$f 2>/dev/null; echo; done; stat -c %%s %s/ledger/log" % (D, n, HOME[n], HOME[n])).stdout)
     for n in ("b", "c"):
-        rsh(n, "rm -rf %s" % D)
+        rsh(n, SWEEP + "; rm -rf %s" % D)
     if tunnel:
         tunnel.terminate()
 if problems:

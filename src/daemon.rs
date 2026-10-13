@@ -298,7 +298,14 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     let mut elected = None;
     if let Some(me) = &replica {
         let read = || peers_of(home, me);
-        read()?;
+        let has_log = fs::metadata(paths::ledger(home)).is_ok_and(|m| m.len() > 0);
+        if !read()?.is_empty() && has_log && replica::terms(home).is_empty() {
+            // The others would start empty, elect one of themselves, and
+            // this home's ledger would be cut to match theirs.
+            return Err(err(format!(
+                "this home has a ledger from before it was a replica. Start it alone first, with replicas = {{ {me} = ... }} and nothing else, then add the others one at a time"
+            )));
+        }
         // Work this home started when it last led belongs to no leader now.
         // Whoever leads next counts those tasks as crashed and runs them
         // again; left alone they would be done twice.
