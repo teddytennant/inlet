@@ -18,7 +18,7 @@ Say what should be running. inlet keeps it running: a failed task is tried again
 
 - one static binary, 3.18MB
 - scheduler, reconciler, ledger, token proxy, board, tui
-- 20,651 lines in src/
+- 20,724 lines in src/
 - 2.5MB RSS, empty
 - 172 tests
 

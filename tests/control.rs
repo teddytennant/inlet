@@ -2634,9 +2634,16 @@ fn one_replica_grows_to_two_and_can_still_be_chosen() {
     // first is killed before it fills it: an empty home and a full one.
     thread::sleep(Duration::from_millis(1100));
     replica_set(&[("a", &a), ("b", &b)], job);
+    // The first reaches the second, and is killed as soon as it has.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !b.join("ledger/cluster").exists() {
+        assert!(Instant::now() < deadline, "the second was never reached");
+        thread::sleep(Duration::from_millis(20));
+    }
     kill9(&mut first);
     let first = replica(&a, "a");
-    // The empty one says yes: in a pair, the other is missing nothing.
+    // Filled or half filled, the second knows how far the first had got
+    // when it first spoke, and the first is at least that far along.
     leader_of(std::slice::from_ref(&a), None);
     inlet(
         &a,

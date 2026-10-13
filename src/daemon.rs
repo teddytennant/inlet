@@ -193,6 +193,8 @@ struct Daemon {
     /// Set when this daemon may not go on: replaced, or without most of its
     /// replicas. An error on the way to a client is not enough to stop it.
     fatal: Option<String>,
+    /// Take a snapshot and let go of the log behind it at the next chance.
+    force_compact: bool,
     epoch_seen: Instant,
     /// On a node: the newest epoch heard from each leader.
     epochs: HashMap<String, u64>,
@@ -298,8 +300,7 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     let mut elected = None;
     if let Some(me) = &replica {
         let read = || peers_of(home, me);
-        let has_log = fs::metadata(paths::ledger(home)).is_ok_and(|m| m.len() > 0);
-        if !read()?.is_empty() && has_log && replica::terms(home).is_empty() {
+        if !read()?.is_empty() && replica::unseeded(home) {
             // The others would start empty, elect one of themselves, and
             // this home's ledger would be cut to match theirs.
             return Err(err(format!(
@@ -381,10 +382,12 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         .collect::<std::collections::BTreeMap<_, _>>()
         .into_iter()
         .collect();
+    let mut seeded = false;
     let links = match elected {
         Some(term) => {
             let len = opened.ledger.len();
-            let terms = replica::begin_term(home, term, len)?;
+            let (terms, was_seeded) = replica::begin_term(home, term, len)?;
+            seeded = was_seeded;
             Some(replica::Links::start(home, term, &peers, terms, len))
         }
         None => None,
@@ -404,9 +407,15 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         snap::restore(&mut state, saved);
         state.fence = lease.gen;
     }
-    for decoded in &opened.records {
+    for (n, decoded) in opened.records.iter().enumerate() {
         if let Decoded::Rec(rec) = decoded {
             state.apply(rec);
+        }
+        if n % 4096 == 0 {
+            // A long replay is not a leader gone quiet.
+            if let Some(links) = &links {
+                links.beat();
+            }
         }
     }
     snap::align_caps(&mut state.purse, &policy.cfg);
@@ -495,6 +504,7 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         replica: replica.clone(),
         policy_seen: None,
         fatal: None,
+        force_compact: seeded,
         epoch_seen: Instant::now(),
         epochs: HashMap::new(),
     };
@@ -508,6 +518,16 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
             }],
             true,
         )?;
+        // Most replicas hold that record, and with it the cluster's name.
+        if let Some(links) = &daemon.links {
+            replica::keep_cluster(home, links.id())?;
+        }
+        if daemon.force_compact {
+            // An older ledger was taken in. Its past may be in a snapshot
+            // and not in the log, so the snapshot is what a new replica
+            // must be sent, and a floor is what makes that happen.
+            daemon.gc()?;
+        }
     }
     daemon.sync_nodes();
     // A swarm that stalled before the restart already said so.
@@ -583,12 +603,6 @@ fn peers_of(home: &Path, me: &str) -> Result<Vec<replica::Peer>> {
             cmd: cmd.clone(),
         })
         .collect())
-}
-
-/// How many replicas this home's policy names. 0 when it names none or
-/// cannot be read.
-pub fn replica_count(home: &Path) -> usize {
-    load_signed(home).map_or(0, |p| p.cfg.replicas.len())
 }
 
 fn names(replicas: &[(String, Vec<String>)]) -> String {
@@ -951,6 +965,11 @@ impl Daemon {
             // This home's own standby patience, and a vote asked of it.
             replica::touch(&self.home);
             self.sync_replicas();
+            if let Some(msg) = &self.fatal {
+                // Taken out of the set, or the set changed too far at once.
+                // Not after one more write: now.
+                return Err(err(msg.clone()));
+            }
         }
         Ok(())
     }
@@ -1579,7 +1598,9 @@ impl Daemon {
         let rotate = self.ledger.len() >= rotate_at && self.links.is_none();
         // With replicas the log keeps its offsets and gives up its past.
         let compact = self.links.is_some()
-            && self.ledger.len().saturating_sub(replica::floor(&self.home)) >= rotate_at;
+            && (self.force_compact
+                || self.ledger.len().saturating_sub(replica::floor(&self.home)) >= rotate_at);
+        self.force_compact = false;
         if pruned > 0 || grown >= CHECKPOINT_BYTES || rotate || compact {
             // The index and a rotation are writes a replaced leader must not make.
             self.still_leader()?;

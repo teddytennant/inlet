@@ -107,26 +107,43 @@ fn refill_path(home: &Path) -> PathBuf {
     home.join("ledger/refill")
 }
 
-/// A home that had nothing when a leader first reached it is being filled
-/// up to here. Until its log is that long it knows less than it may once
-/// have promised, and it neither votes nor stands.
-fn refill(home: &Path) -> u64 {
-    fs::read_to_string(refill_path(home))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+/// A home that had nothing when a leader first reached it is being filled.
+/// The mark is where that leader's log ended and in which term: everything
+/// this home may once have promised and lost is inside that. Until its own
+/// log is that long it does not stand, and it votes only for a candidate
+/// whose log reaches at least as far as the mark.
+fn refill(home: &Path) -> Option<(u64, u64)> {
+    let text = fs::read_to_string(refill_path(home)).ok()?;
+    let mut parts = text.split_whitespace();
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 fn filling(home: &Path) -> bool {
-    refill(home) > log_len(home)
+    refill(home).is_some_and(|(_, upto)| upto > log_len(home))
 }
 
 /// Note, on first contact, how far an empty home has to be filled.
-fn mark_refill(home: &Path, upto: u64) -> Result<()> {
-    if upto > 0 && log_len(home) == 0 && refill(home) < upto {
-        snap::durable(&refill_path(home), upto.to_string().as_bytes())?;
+fn mark_refill(home: &Path, req: &Value) -> Result<()> {
+    let upto = req["at"].as_u64().unwrap_or(0);
+    if upto == 0 || log_len(home) > 0 || refill(home).is_some_and(|(_, old)| old >= upto) {
+        return Ok(());
     }
-    Ok(())
+    let term = pairs(&req["terms"])
+        .iter()
+        .rev()
+        .find(|(_, start)| *start < upto)
+        .map_or(0, |t| t.0);
+    snap::durable(&refill_path(home), format!("{term} {upto}").as_bytes())
+}
+
+/// Full, or as full as the leader filling it: the mark has done its work.
+fn clear_refill(home: &Path, len: u64, req: &Value) {
+    let Some((_, upto)) = refill(home) else {
+        return;
+    };
+    if len >= upto || req["want"].as_u64().is_some_and(|want| len >= want) {
+        let _ = fs::remove_file(refill_path(home));
+    }
 }
 
 fn id_path(home: &Path) -> PathBuf {
@@ -283,7 +300,7 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         return Ok(json!({"ok": false, "term": current}));
     }
     adopt(home, req)?;
-    mark_refill(home, req["at"].as_u64().unwrap_or(0))?;
+    mark_refill(home, req)?;
     if term > current {
         set_epoch(home, term)?;
     }
@@ -328,9 +345,7 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         set_floor(home, at)?;
     }
     ledger::punch(&file, at);
-    if refill(home) > 0 && len >= refill(home) {
-        let _ = fs::remove_file(refill_path(home));
-    }
+    clear_refill(home, len, req);
     touch(home);
     Ok(json!({"ok": true, "len": len.min(same.max(at))}))
 }
@@ -346,7 +361,7 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         return Ok(json!({"ok": false, "term": current}));
     }
     adopt(home, req)?;
-    mark_refill(home, req["at"].as_u64().unwrap_or(0))?;
+    mark_refill(home, req)?;
     if term > current {
         // A daemon here that led an older term reads this and stops.
         set_epoch(home, term)?;
@@ -400,9 +415,7 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         file.sync_all()?;
         len += more;
     }
-    if refill(home) > 0 && len >= refill(home) {
-        let _ = fs::remove_file(refill_path(home));
-    }
+    clear_refill(home, len, req);
     // Again, now that the disk has been waited on: a slow fsync is not the
     // leader going quiet.
     touch(home);
@@ -413,20 +426,20 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
 pub fn vote(home: &Path) -> Result<()> {
     let mut text = String::new();
     std::io::stdin().read_to_string(&mut text)?;
-    let mut req: Value = serde_json::from_str(&text).map_err(|_| err("replica: bad vote"))?;
-    // This home's own count of the replicas, never the candidate's word.
-    req["pair"] = json!(crate::daemon::replica_count(home) == 2);
+    let req: Value = serde_json::from_str(&text).map_err(|_| err("replica: bad vote"))?;
     println!("{}", answer_vote(home, &req)?);
     Ok(())
 }
 
 fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     let _guard = guard(home)?;
-    if cluster(home).is_some() && req["id"].is_string() && foreign(home, req) {
+    if foreign(home, req) {
+        // Another cluster's, or one that belongs to none yet: a home that
+        // has been taken into a cluster is not led out of it.
         return Ok(json!({"granted": false, "term": 0}));
     }
-    if filling(home) || !usable(home) {
-        // Half filled, or half way through taking a snapshot.
+    if !usable(home) {
+        // Half way through taking a snapshot.
         return Ok(json!({"granted": false, "term": 0}));
     }
     let term = req["term"].as_u64().unwrap_or(0);
@@ -446,13 +459,14 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     // its disk. Either way it knows nothing of what was promised, and its
     // vote could elect a replica that is missing some of it. It votes only
     // when there is no history anywhere: the first election there ever is.
-    let blank = my_last.1 == 0;
-    // But in a set of two a write is kept only when both have it, so the
-    // other one is missing nothing, and an empty home may say so. Without
-    // this, two replicas of which one is new or has lost its disk could
-    // never choose between themselves again.
-    let pair = req["pair"] == true;
-    let fresh = their_last >= my_last && (!blank || pair || their_last == (0, 0));
+    // One a leader has begun to fill knows this much: that leader's log,
+    // as far as it went, held everything kept. A candidate at least that
+    // far along is missing nothing this home ever promised.
+    let fresh = their_last >= my_last
+        && match refill(home).filter(|_| filling(home)) {
+            Some(mark) => their_last >= mark,
+            None => my_last.1 > 0 || their_last == (0, 0),
+        };
     if dry {
         // Would it be granted. Nothing is written down for a question.
         let granted = term > current && fresh && leaderless;
@@ -588,17 +602,28 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
 }
 
 /// The new leader's first act: note where its term's bytes begin.
-pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
+/// Whether this home holds a ledger from before it was a replica.
+pub fn unseeded(home: &Path) -> bool {
+    terms(home).is_empty() && (log_len(home) > 0 || paths::snap_index(home).exists())
+}
+
+/// The cluster's name is this home's own once most replicas have taken it.
+/// Written down any sooner, a first leader that died having reached nobody
+/// would come back a stranger to the cluster the others then made.
+pub fn keep_cluster(home: &Path, id: &str) -> Result<()> {
     let _guard = guard(home)?;
     if cluster(home).is_none() {
-        // The first leader there ever is names the cluster.
-        let mut raw = [0u8; 8];
-        File::open("/dev/urandom")?.read_exact(&mut raw)?;
-        let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         snap::durable(&id_path(home), id.as_bytes())?;
     }
+    Ok(())
+}
+
+/// Returns the term table, and whether an older ledger was taken in.
+pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<(Terms, bool)> {
+    let _guard = guard(home)?;
+    let seeded = unseeded(home);
     let mut mine = terms(home);
-    if mine.is_empty() && len > 0 {
+    if seeded {
         // A ledger from before this home was a replica. It is the history,
         // and is filed under a term older than any there will be.
         mine.push((0, 0));
@@ -609,7 +634,7 @@ pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
         mine.push((term, len));
     }
     store_terms(home, &mine)?;
-    Ok(mine)
+    Ok((mine, seeded))
 }
 
 struct Shared {
@@ -629,6 +654,8 @@ struct Shared {
 
 /// The leader's side: one thread and one long-lived command per peer.
 pub struct Links {
+    /// The cluster's name: this home's, or one made up now if there is none.
+    id: String,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     home: PathBuf,
     term: u64,
@@ -648,7 +675,14 @@ impl Links {
             }),
             Condvar::new(),
         ));
+        let id = cluster(home).unwrap_or_else(|| {
+            // The first leader there ever is names the cluster.
+            let mut raw = [0u8; 8];
+            let _ = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw));
+            raw.iter().map(|b| format!("{b:02x}")).collect()
+        });
         let links = Links {
+            id,
             shared,
             home: home.to_path_buf(),
             term,
@@ -675,6 +709,7 @@ impl Links {
                 .acked
                 .insert(peer.name.clone(), (0, peer.cmd.clone()));
             shared.seen.insert(peer.name.clone(), Instant::now());
+            let id = self.id.clone();
             let (shared, peer, terms, term) = (
                 self.shared.clone(),
                 peer.clone(),
@@ -684,7 +719,7 @@ impl Links {
             let log = paths::ledger(&self.home);
             let index = paths::snap_index(&self.home);
             thread::spawn(move || loop {
-                if link(&shared, &peer, term, &terms, &log, &index) {
+                if link(&shared, &peer, term, &terms, &log, &index, &id) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -758,6 +793,10 @@ impl Links {
         self.shared.0.lock().unwrap().alive = Instant::now();
     }
 
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn deposed(&self) -> bool {
         self.shared.0.lock().unwrap().deposed
     }
@@ -772,6 +811,7 @@ fn link(
     terms: &Terms,
     log: &Path,
     index: &Path,
+    id: &str,
 ) -> bool {
     let Some((program, rest)) = peer.cmd.split_first() else {
         return true;
@@ -807,10 +847,6 @@ fn link(
     let Ok(mut file) = File::open(log) else {
         return done(&mut child, false);
     };
-    let id = log
-        .parent()
-        .and_then(|ledger| ledger.parent())
-        .and_then(cluster);
     let (lock, wake) = &**shared;
     // Where the peer's log ends. Unknown at first: an empty append at the
     // leader's own end makes the peer say.
@@ -852,7 +888,7 @@ fn link(
                 return done(&mut child, false);
             };
             snapped = covers;
-            let header = json!({"op": "snap", "term": term, "at": covers, "n": bytes.len(), "terms": terms, "id": id});
+            let header = json!({"op": "snap", "term": term, "at": covers, "n": bytes.len(), "terms": terms, "id": id, "want": want});
             (header, bytes)
         } else {
             let n = (want - at).min(CHUNK);
@@ -868,7 +904,7 @@ fn link(
                 continue;
             }
             (
-                json!({"term": term, "at": at, "n": n, "terms": terms, "id": id}),
+                json!({"term": term, "at": at, "n": n, "terms": terms, "id": id, "want": want}),
                 bytes,
             )
         };
@@ -891,6 +927,12 @@ fn link(
             CALL
         };
         let Ok(line) = rx.recv_timeout(limit) else {
+            // Whatever allowance it was given for a snapshot, it did not answer.
+            let mut shared = lock.lock().unwrap();
+            if let Some(at) = shared.seen.get_mut(&peer.name) {
+                *at = (*at).min(Instant::now());
+            }
+            drop(shared);
             return done(&mut child, false);
         };
         let Ok(reply) = serde_json::from_str::<Value>(&line) else {
@@ -1142,6 +1184,16 @@ mod tests {
         assert!(!vote(&home));
         assert_eq!(send(&home, 4, 0, &t, &[b'a'; 500])["len"], 500);
         assert!(!vote(&home), "half full, and b at 600 looks fresh to it");
+        // But one as far along as the leader that began the filling is
+        // missing nothing this home ever held. Without that, a first leader
+        // that died mid-fill could never be chosen again.
+        let old = SystemTime::now() - Duration::from_secs(60);
+        File::open(heard_path(&home))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let full = json!({"term": 9, "candidate": "a", "last_term": 4, "len": 1000, "pre": true});
+        assert_eq!(answer_vote(&home, &full).unwrap()["granted"], true);
         assert_eq!(send(&home, 4, 500, &t, &[b'a'; 500])["len"], 1000);
         // Full: b, at 600, is plainly behind, and one at 1000 is not.
         assert!(!vote(&home));
