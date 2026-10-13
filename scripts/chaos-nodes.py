@@ -93,6 +93,35 @@ def status(home):
         if out.returncode == 0:
             return json.loads(out.stdout)
         time.sleep(0.1)
+    # Nobody answered for ten seconds. Say what there is to see before
+    # giving up: who is running, who holds the ledger, what they last said.
+    import fcntl, glob
+    print("no status from %s for 10s" % home)
+    log = home + "/ledger/log"
+    try:
+        probe = open(log, "rb")
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print("  the ledger is not locked by anybody")
+        except OSError:
+            print("  the ledger is locked")
+        ino = os.stat(log).st_ino
+        for fd in glob.glob("/proc/[0-9]*/fd/*"):
+            try:
+                if os.stat(fd).st_ino == ino:
+                    p = fd.split("/")[2]
+                    print("  open in %s: %s" % (p, cmdline(p)[-110:]))
+            except OSError:
+                pass
+    except OSError as e:
+        print("  ledger: %s" % e)
+    for p in subprocess.run(["pgrep", "-f", home + " "], capture_output=True, text=True).stdout.split():
+        print("  running %s: %s" % (p, cmdline(p)[-110:]))
+    for name in ("standby.log", "leader/run/daemon.log"):
+        try:
+            print("  %s: %s" % (name, open(os.path.join(root, name)).read()[-400:].replace("\n", " | ")))
+        except OSError:
+            pass
     raise RuntimeError("no status from " + home)
 
 
