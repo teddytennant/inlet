@@ -125,11 +125,16 @@ def floor(r):
 
 
 acked, unsure = {}, 0
+grown = shrunk = False
 
 
 def client():
     global unsure
     for goal in range(1, args.tasks + 1):
+        # With --grow the client waits at each mark for the set to change,
+        # so both changes happen with work still to come.
+        while args.grow and not stopping and ((goal > args.tasks * 0.3 and not grown) or (goal > args.tasks * 0.7 and not shrunk)):
+            time.sleep(0.2)
         while not stopping:
             who, _ = leader()
             if not who:
@@ -150,30 +155,39 @@ adder = threading.Thread(target=client, daemon=True)
 adder.start()
 kills = collections.Counter()
 started = time.time()
-grown = shrunk = False
-while time.time() - started < args.seconds and adder.is_alive():
+def grow():
+    """One more replica, in every policy, and nothing is restarted for it."""
+    global grown
+    grown = True
+    write_policies(reps + ["d"])
+    reps.append("d")
+    threading.Thread(target=keep, args=("d",), daemon=True).start()
+    kills["replica added"] += 1
+
+
+def shrink(who):
+    """One of the first three goes, for good. Not the leader: it would step
+    down by itself, and this is the harder case to get wrong."""
+    global shrunk
+    shrunk = True
+    out = [r for r in ("a", "b", "c") if r != who][0]
+    write_policies([r for r in reps if r != out])
+    reps.remove(out)
+    with guard:
+        p = procs.get(out)
+    if p and p.poll() is None:
+        p.send_signal(signal.SIGKILL)
+    kills["replica %s removed" % out] += 1
+
+
+while (time.time() - started < args.seconds or (args.grow and not shrunk)) and adder.is_alive():
     time.sleep(rng.uniform(3.0, 7.0))
     who, _ = leader()
     if args.grow and not grown and len(acked) >= args.tasks * 0.25:
-        # One more replica, in every policy, and nothing is restarted for it.
-        grown = True
-        write_policies(reps + ["d"])
-        reps.append("d")
-        threading.Thread(target=keep, args=("d",), daemon=True).start()
-        kills["replica added"] += 1
+        grow()
         continue
     if args.grow and grown and not shrunk and who and len(acked) >= args.tasks * 0.6:
-        # One of the first three goes, for good. Not the leader: it would
-        # step down by itself, and this is the harder case to get wrong.
-        shrunk = True
-        out = [r for r in ("a", "b", "c") if r != who][0]
-        write_policies([r for r in reps if r != out])
-        reps.remove(out)
-        with guard:
-            p = procs.get(out)
-        if p and p.poll() is None:
-            p.send_signal(signal.SIGKILL)
-        kills["replica %s removed" % out] += 1
+        shrink(who)
         continue
     # The leader more often than not: that is the case that matters.
     name = who if who and rng.random() < 0.6 else rng.choice(reps)
