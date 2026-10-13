@@ -1275,6 +1275,8 @@ mod tests {
         wipes: usize,
         wiped: usize,
         stuck: bool,
+        /// Leaders let go of the log behind a snapshot now and then.
+        compacts: bool,
     }
 
     struct Lead {
@@ -1284,6 +1286,8 @@ mod tests {
         log: File,
         theirs: Vec<Option<u64>>,
         acked: Vec<u64>,
+        /// The newest snapshot each peer is known to hold.
+        snapped: Vec<u64>,
     }
 
     impl Sim {
@@ -1298,6 +1302,7 @@ mod tests {
                 wipes: 0,
                 wiped: 0,
                 stuck: false,
+                compacts: false,
             }
         }
 
@@ -1310,6 +1315,15 @@ mod tests {
 
         fn len(&self, i: usize) -> u64 {
             log_len(&self.homes[i])
+        }
+
+        /// Whether home `i` holds everything kept. Below its floor its log
+        /// is a hole and its snapshot stands for it, so only what is above
+        /// can be compared.
+        fn holds_kept(&self, i: usize) -> bool {
+            let mine = fs::read(paths::ledger(&self.homes[i])).unwrap();
+            let from = (floor(&self.homes[i]) as usize).min(self.kept.len());
+            mine.len() >= self.kept.len() && mine[from..self.kept.len()] == self.kept[from..]
         }
 
         /// Time passes: nobody has heard a leader for a long while.
@@ -1381,6 +1395,7 @@ mod tests {
                     log,
                     theirs: vec![None; n],
                     acked: vec![0; n],
+                    snapped: vec![0; n],
                 })
             })();
             self.disarm();
@@ -1391,12 +1406,11 @@ mod tests {
                 self.won.insert(term, i).is_none_or(|was| was == i),
                 "two leaders in term {term}"
             );
-            let mine = fs::read(paths::ledger(&home)).unwrap();
             assert!(
-                mine.starts_with(&self.kept),
+                self.holds_kept(i),
                 "r{i} was elected for term {term} without {} kept bytes (has {})",
                 self.kept.len(),
-                mine.len()
+                self.len(i)
             );
             self.leaders[i] = Some(lead);
             self.write(i);
@@ -1432,18 +1446,35 @@ mod tests {
             };
             touch(&home);
             let at = lead.theirs[j].unwrap_or(want).min(want);
-            let n = (want - at).min(chunk);
-            let mut bytes = vec![0u8; n as usize];
-            lead.log.seek(SeekFrom::Start(at)).unwrap();
-            lead.log.read_exact(&mut bytes).unwrap();
-            let header = json!({"term": lead.term, "at": at, "n": n, "terms": lead.terms, "id": lead.id, "want": want});
-            let reply = append(&peer, &header, &bytes);
+            let floor = floor(&home);
+            let reply = if lead.theirs[j].is_some() && lead.snapped[j] < floor {
+                // As the link does: the snapshot before any byte past it.
+                let bytes = fs::read(paths::snap_index(&home)).unwrap();
+                let covers = serde_json::from_slice::<Value>(&bytes).unwrap()["offset"]
+                    .as_u64()
+                    .unwrap();
+                lead.snapped[j] = covers;
+                let header = json!({"op": "snap", "term": lead.term, "at": covers, "n": bytes.len(), "terms": lead.terms, "id": lead.id, "want": want});
+                install(&peer, &header, &bytes)
+            } else {
+                let n = (want - at).min(chunk);
+                let mut bytes = vec![0u8; n as usize];
+                lead.log.seek(SeekFrom::Start(at)).unwrap();
+                lead.log.read_exact(&mut bytes).unwrap();
+                assert!(
+                    n == 0 || at >= floor,
+                    "the link read the log below its floor"
+                );
+                let header = json!({"term": lead.term, "at": at, "n": n, "terms": lead.terms, "id": lead.id, "want": want});
+                append(&peer, &header, &bytes)
+            };
             self.disarm();
             let lead = self.leaders[i].as_mut().unwrap();
             let Ok(reply) = reply else {
                 // The far end was killed part way. The link starts over.
                 lead.theirs[j] = None;
                 lead.acked[j] = 0;
+                lead.snapped[j] = 0;
                 return;
             };
             if reply["ok"] == true {
@@ -1454,6 +1485,9 @@ mod tests {
                 }
             } else if let Some(need) = reply["need"].as_u64() {
                 lead.theirs[j] = Some(need);
+                if need < floor {
+                    lead.snapped[j] = 0;
+                }
             } else if reply["term"].as_u64().is_some_and(|t| t > lead.term) {
                 self.leaders[i] = None;
             }
@@ -1476,13 +1510,26 @@ mod tests {
                 self.leaders[i] = None;
                 return;
             }
-            let mine = fs::read(paths::ledger(&home)).unwrap();
+            let term = lead.term;
             assert!(
-                mine.starts_with(&self.kept),
-                "the leader of term {} answers for a log that lost kept bytes",
-                lead.term
+                self.holds_kept(i),
+                "the leader of term {term} answers for a log that lost kept bytes"
             );
-            self.kept = mine;
+            // The true bytes: what is below this leader's floor it no longer
+            // has, and they are kept from when it did.
+            let mine = fs::read(paths::ledger(&home)).unwrap();
+            let from = (floor(&home) as usize).min(self.kept.len());
+            self.kept.truncate(from);
+            self.kept.extend_from_slice(&mine[from..]);
+            if self.compacts && self.roll(3) == 0 {
+                // Everything is kept, so a snapshot of it stands for it.
+                // The snapshot, the floor, then the hole, in that order.
+                let at = mine.len() as u64;
+                let index = json!({"offset": at}).to_string();
+                snap::durable(&paths::snap_index(&home), index.as_bytes()).unwrap();
+                set_floor(&home, at).unwrap();
+                ledger::punch(&self.leaders[i].as_ref().unwrap().log, at);
+            }
         }
 
         /// The disk under a home is replaced. Everything it held is gone,
@@ -1545,9 +1592,15 @@ mod tests {
                     self.answer(i);
                     let same = (0..n).all(|j| self.len(j) == self.len(i));
                     if self.leaders[i].is_some() && same && self.kept.len() as u64 == self.len(i) {
+                        let top = self.homes.iter().map(|h| floor(h)).max().unwrap() as usize;
                         let log = fs::read(paths::ledger(&self.homes[i])).unwrap();
-                        for home in &self.homes {
-                            assert_eq!(fs::read(paths::ledger(home)).unwrap(), log);
+                        for (j, home) in self.homes.iter().enumerate() {
+                            assert_eq!(fs::read(paths::ledger(home)).unwrap()[top..], log[top..]);
+                            assert!(self.holds_kept(j), "r{j} ended without what was kept");
+                            assert!(
+                                usable(home),
+                                "r{j} ended with a home that cannot be replayed"
+                            );
                         }
                         return;
                     }
@@ -1617,6 +1670,7 @@ mod tests {
         for seed in seeds {
             let mut sim = Sim::new(tag, n, seed);
             sim.wipes = wipes;
+            sim.compacts = tag.starts_with('c');
             sim.run(steps, faults);
             sim.settle();
             stuck += sim.stuck as u64;
@@ -1643,6 +1697,16 @@ mod tests {
     fn homes_killed_between_durable_writes_lose_nothing_kept() {
         storm("k3", 3, 0..40, 400, 6);
         storm("k5", 5, 0..15, 500, 6);
+    }
+
+    #[test]
+    fn homes_that_let_go_of_the_log_lose_nothing_kept() {
+        storm("c3", 3, 0..40, 500, u64::MAX);
+        storm("c5", 5, 0..15, 600, u64::MAX);
+        // And killed between durable writes, snapshot installs included.
+        storm("ck3", 3, 0..40, 500, 6);
+        // And with a disk lost.
+        storm_with("cw3", 3, 0..30, 500, u64::MAX, 1);
     }
 
     #[test]

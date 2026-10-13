@@ -18,9 +18,9 @@ Say what should be running. inlet keeps it running: a failed task is tried again
 
 - one static binary, 3.18MB
 - scheduler, reconciler, ledger, token proxy, board, tui
-- 21,192 lines in src/
+- 21,256 lines in src/
 - 2.5MB RSS, empty
-- 176 tests
+- 177 tests
 
 Workers run in a cell. A spend is a ledger record. Any agent CLI is a worker: the prompt goes in by argument, stdin, or file, and `inlet door run` gives it the metered proxy as a base URL.
 
