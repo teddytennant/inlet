@@ -20,6 +20,8 @@ ap.add_argument("b")
 ap.add_argument("c", help="C's host name as B knows it")
 ap.add_argument("--key", default="")
 ap.add_argument("--dir", default="/tmp/inlet-3l")
+ap.add_argument("--upstream", default="", help="a model endpoint on this machine. The node then runs here, and the tasks are examples/agent.py asking a model")
+ap.add_argument("--model", default="grok-4.5")
 ap.add_argument("--compact", type=int, default=0, help="replicas let go of the log every this many bytes")
 args = ap.parse_args()
 binary = os.path.abspath(args.inlet)
@@ -78,8 +80,12 @@ def serve_relay():
                 if not got:
                     break
                 line += got
+            words = line.decode().split()
             if line.strip() in (b"replica serve", b"replica vote"):
-                subprocess.run([binary, "--home", HOME["a"], *line.decode().split()], stdin=conn.fileno(), stdout=conn.fileno())
+                subprocess.run([binary, "--home", HOME["a"], *words], stdin=conn.fileno(), stdout=conn.fileno())
+            elif args.upstream and words[:1] == ["node"] and words[1:2] in (["status"], ["add"], ["kill"]):
+                # What a leader asks of a node, and nothing else, for the node here.
+                subprocess.run([binary, "--home", root + "/n0", *words[1:]], stdin=conn.fileno(), stdout=conn.fileno(), stderr=subprocess.DEVNULL)
             conn.close()
         threading.Thread(target=one, daemon=True).start()
 
@@ -124,9 +130,24 @@ default_budget = { tokens = 1000, seconds = 60, memory_mb = 128, pids = 32 }
 """
 
 
+if args.upstream:
+    # The node is here, where the model is. The far leaders reach it the
+    # way they reach this machine's replica.
+    VIEW["a"]["n0"] = [binary, "--home", root + "/n0"]
+    VIEW["b"]["n0"] = ["python3", D + "/client.py", D + "/a.sock", "node"]
+    VIEW["c"]["n0"] = plain + ["B", "python3", D + "/client.py", D + "/a.sock", "node"]
+EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+AGENT = COMMON.replace("tokens = 1000, seconds = 60, memory_mb = 128", "tokens = 60000, seconds = 240, memory_mb = 512") + """proxy = { upstream = "%s", key = "unused" }
+cell = { ro = { "%s" } }
+workers = { plain = { cmd = { "python3", "%s/agent.py" }, net = "none", env = { AGENT_MODEL = "%s" } } }
+""" % (args.upstream, EXAMPLES, EXAMPLES, args.model)
+GOAL = "Write a Python script solve.py that reads one integer N from its first command line argument and prints the number of primes strictly below N. This is task %s."
+CHECK = 'test "$(python3 solve.py 100)" = 25 && test "$(python3 solve.py 2)" = 0 && test "$(python3 solve.py 1000)" = 168'
+
+
 def policy(me, b_name):
     view = {k: [b_name if a == "B" else a for a in v] for k, v in VIEW[me].items()}
-    return COMMON + "node_grace = 40\nreplicas = {\n%s}\nnodes = { n0 = { cmd = { %s }, slots = 6 } }\nworkers = { plain = { on = \"nodes\" } }\n" % (
+    return (COMMON.replace("tokens = 1000, seconds = 60, memory_mb = 128", "tokens = 60000, seconds = 240, memory_mb = 512") if args.upstream else COMMON) + "node_grace = 40\nreplicas = {\n%s}\nnodes = { n0 = { cmd = { %s }, slots = 6 } }\nworkers = { plain = { on = \"nodes\" } }\n" % (
         "".join("  %s = { cmd = { %s } },\n" % (r, quote(view[r])) for r in "abc"), quote(view["n0"]))
 
 
@@ -163,7 +184,12 @@ try:
                                       "-R", "%s/a.sock:127.0.0.1:%d" % (D, PORT), args.b])
     time.sleep(3)
     assert tunnel.poll() is None, "the way back to A would not open"
-    assert rsh("b", "%s/inlet --home %s/n0 up" % (D, D)).returncode == 0
+    if args.upstream:
+        os.makedirs(root + "/n0")
+        open(root + "/n0/policy.lua", "w").write(AGENT)
+        assert subprocess.run([binary, "--home", root + "/n0", "up"], capture_output=True).returncode == 0
+    else:
+        assert rsh("b", "%s/inlet --home %s/n0 up" % (D, D)).returncode == 0
     def keep_a():
         log = open(root + "/a.log", "a")
         while "stop" not in hold:
@@ -201,7 +227,10 @@ try:
                 who, _ = leader(60)
                 if who:
                     t0 = time.time()
-                    out = inlet(who, "add", "-w", "plain", "-g", str(goal), "--verify", "test -s out")
+                    if args.upstream:
+                        out = inlet(who, "add", "-w", "plain", "-g", GOAL % goal, "--verify", CHECK)
+                    else:
+                        out = inlet(who, "add", "-w", "plain", "-g", str(goal), "--verify", "test -s out")
                     m = re.search(r"queued (\S+)", out.stdout)
                     if out.returncode == 0 and m:
                         acked[m.group(1)] = goal
@@ -254,7 +283,7 @@ try:
     if len(set(led)) < 2:
         problems.append("the lead only ever sat on %s" % sorted(set(led)))
     sums = {}
-    end = time.time() + 240
+    end = time.time() + (1200 if args.upstream else 240)
     while time.time() < end:
         who, st = leader()
         if st and st["live"] == 0 and st["queued"] == 0:
@@ -287,13 +316,19 @@ try:
         problems.append("%d done of %d answered" % (done, len(acked)))
     print("led in turn by %s. %d answered adds, %d done. floors %s. past them, sha256 %s on all three machines" % (
         " ".join(led), len(acked), done, sorted(floors.values()), sums.get("a", "")[:16]))
+    if args.upstream:
+        ns = json.loads(subprocess.run([binary, "--home", root + "/n0", "status", "--json"], capture_output=True, text=True).stdout)
+        print("tokens charged: leader %d, node %d" % (st["cap"] - st["available"], ns["cap"] - ns["available"]))
 finally:
     hold["stop"] = True
     if procs.get("a") and procs["a"].poll() is None:
         procs["a"].send_signal(signal.SIGTERM)
     for n in ("b", "c"):
         rsh(n, "touch %s/stop; for p in $(pgrep -x inlet); do grep -qa -- --replica /proc/$p/cmdline && kill $p; done; true" % D)
-    rsh("b", "%s/inlet --home %s/n0 down; sleep 1" % (D, D))
+    if args.upstream:
+        subprocess.run([binary, "--home", root + "/n0", "down"], capture_output=True)
+    else:
+        rsh("b", "%s/inlet --home %s/n0 down; sleep 1" % (D, D))
     if problems:
         for n in ("b", "c"):
             print("== %s" % n)
