@@ -206,6 +206,8 @@ pub struct Config {
     /// Every home that keeps a copy of the ledger, this one included, and
     /// the command that reaches each.
     pub replicas: BTreeMap<String, Vec<String>>,
+    /// What the replicas, whichever leads, are called by their nodes.
+    pub cluster: String,
     /// A node silent this long is given up on, and its tasks are placed again.
     pub node_grace_ms: u64,
     /// `node_loss = "wait"`: a silent node's tasks stay its tasks until it
@@ -378,6 +380,9 @@ fn read_config(lua: &Lua) -> Result<Config> {
         if table.contains_key("max_backoff")? {
             cfg.retry.max_backoff_ms = read_span(table.get::<Value>("max_backoff")?)?;
         }
+    }
+    if let Some(name) = g.get::<Option<String>>("cluster")? {
+        cfg.cluster = name;
     }
     if let Some(table) = g.get::<Option<Table>>("replicas")? {
         for pair in table.pairs::<String, Table>() {
@@ -741,6 +746,7 @@ pub fn preset(setup: &str) -> Config {
         retain_ms: 30 * 86_400_000,
         nodes: BTreeMap::new(),
         replicas: BTreeMap::new(),
+        cluster: "inlet".into(),
         node_grace_ms: 60_000,
         node_wait: false,
     }

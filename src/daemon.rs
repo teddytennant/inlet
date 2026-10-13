@@ -188,7 +188,7 @@ struct Daemon {
     links: Option<replica::Links>,
     /// This replica's name, and the set it last gave its links.
     replica: Option<String>,
-    replicas: Vec<String>,
+    replicas: Vec<(String, Vec<String>)>,
     policy_seen: Option<std::time::SystemTime>,
     /// Set when this daemon may not go on: replaced, or without most of its
     /// replicas. An error on the way to a client is not enough to stop it.
@@ -362,7 +362,18 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         ));
     }
     let opened = ledger::open_file(file, snap_offset)?;
-    let replica_names: Vec<String> = policy.cfg.replicas.keys().cloned().collect();
+    // The set the links are given, not the set some later read of the file
+    // finds. If the file has moved on, the first beat sees that it has.
+    let replica_names: Vec<(String, Vec<String>)> = policy
+        .cfg
+        .replicas
+        .iter()
+        .filter(|(name, _)| Some(*name) == replica.as_ref())
+        .map(|(name, cmd)| (name.clone(), cmd.clone()))
+        .chain(peers.iter().map(|p| (p.name.clone(), p.cmd.clone())))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
     let links = match elected {
         Some(term) => {
             let len = opened.ledger.len();
@@ -375,16 +386,9 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     // Every replica answers to the same name, so a node keeps its leases
     // and knows an old leader from a new one across a change of leader.
     let me = match &replica {
-        Some(_) => format!(
-            "replicas:{}",
-            policy
-                .cfg
-                .replicas
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        // Not made from the members' names: the set can change, and the
+        // name a node knows its leader by must not change with it.
+        Some(_) => format!("replicas:{}", policy.cfg.cluster),
         None => node.clone(),
     };
     let mut state = State::new(&policy.cfg);
@@ -482,9 +486,7 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         links,
         replicas: replica_names,
         replica: replica.clone(),
-        policy_seen: fs::metadata(paths::policy(home))
-            .and_then(|m| m.modified())
-            .ok(),
+        policy_seen: None,
         fatal: None,
         epoch_seen: Instant::now(),
         epochs: HashMap::new(),
@@ -574,6 +576,11 @@ fn peers_of(home: &Path, me: &str) -> Result<Vec<replica::Peer>> {
             cmd: cmd.clone(),
         })
         .collect())
+}
+
+fn names(replicas: &[(String, Vec<String>)]) -> String {
+    let names: Vec<&str> = replicas.iter().map(|(name, _)| name.as_str()).collect();
+    names.join(", ")
 }
 
 fn stop_leftover(home: &Path) {
@@ -920,7 +927,13 @@ impl Daemon {
         {
             return Err(self.deposed());
         }
-        if self.links.is_some() {
+        if let Some(links) = &self.links {
+            if links.alone_for() >= replica::QUORUM_WAIT {
+                let msg = "most replicas are out of reach; stopping rather than lead alone";
+                self.soft.clear();
+                self.fatal = Some(msg.into());
+                return Err(err(msg));
+            }
             // This home's own standby patience, and a vote asked of it.
             replica::touch(&self.home);
             self.sync_replicas();
@@ -939,18 +952,24 @@ impl Daemon {
         if seen == self.policy_seen {
             return;
         }
-        self.policy_seen = seen;
         let (Some(me), Some(links)) = (self.replica.clone(), &self.links) else {
             return;
         };
+        // A file caught half written, or ahead of its signature, is read
+        // again on the next beat. Only one that loaded is done with.
         let Ok(cfg) = load_signed(&self.home).map(|p| p.cfg) else {
-            eprintln!("inlet: the policy on disk does not load; keeping the replicas as they were");
             return;
         };
-        let now: Vec<String> = cfg.replicas.keys().cloned().collect();
+        self.policy_seen = seen;
+        let now: Vec<(String, Vec<String>)> = cfg
+            .replicas
+            .iter()
+            .map(|(name, cmd)| (name.clone(), cmd.clone()))
+            .collect();
         if now == self.replicas {
             return;
         }
+        // A name reached a new way is another home: one out and one in.
         let changed = now.iter().filter(|n| !self.replicas.contains(n)).count()
             + self.replicas.iter().filter(|n| !now.contains(n)).count();
         if changed > 1 {
@@ -959,11 +978,11 @@ impl Daemon {
             // each with a majority of its own.
             self.fatal = Some(format!(
                 "replicas change one at a time, and the policy changes more than one of {}; stopping",
-                self.replicas.join(", ")
+                names(&self.replicas)
             ));
             return;
         }
-        if !now.contains(&me) {
+        if !now.iter().any(|(name, _)| *name == me) {
             self.fatal = Some("this replica has been taken out of the policy".into());
             return;
         }
@@ -977,7 +996,7 @@ impl Daemon {
             })
             .collect();
         links.set_peers(&peers);
-        eprintln!("inlet: replicas are now {}", now.join(", "));
+        eprintln!("inlet: replicas are now {}", names(&now));
         self.replicas = now;
     }
 
@@ -993,7 +1012,10 @@ impl Daemon {
         }
         // The wait may have been long, and this home may have voted for
         // another in the meantime. Then its own copy does not count, and
-        // what looked like most replicas was not.
+        // what looked like most replicas was not. Under the same lock a
+        // vote is given under: one that began before this write is waited
+        // for, and one that begins after sees the write.
+        let _guard = replica::guard(&self.home)?;
         if snap::read_epoch(&self.home) > self.epoch {
             return Err(self.deposed());
         }

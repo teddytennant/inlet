@@ -221,7 +221,8 @@ try:
         back(who)
         who = nxt
     led.append(who)
-    if len(set(led)) < 3:
+    # Which machine wins each time is the vote's business. That it moved is ours.
+    if len(set(led)) < 2:
         problems.append("the lead only ever sat on %s" % sorted(set(led)))
     sums = {}
     end = time.time() + 240

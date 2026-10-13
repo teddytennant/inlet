@@ -45,7 +45,7 @@ const QUIET_MS: u64 = 4_000;
 /// One call to a peer may take this long.
 const CALL: Duration = Duration::from_secs(4);
 /// A write waits this long for most replicas before the leader gives up.
-const QUORUM_WAIT: Duration = Duration::from_secs(15);
+pub const QUORUM_WAIT: Duration = Duration::from_secs(15);
 const CHUNK: u64 = 1 << 20;
 
 pub type Terms = Vec<(u64, u64)>;
@@ -84,7 +84,11 @@ fn snapshot_at(home: &Path) -> Option<u64> {
 /// Whether this home could be replayed: its snapshot reaches the floor.
 pub fn usable(home: &Path) -> bool {
     let floor = floor(home);
-    floor == 0 || snapshot_at(home).is_some_and(|at| at >= floor && at <= log_len(home))
+    let len = log_len(home);
+    match snapshot_at(home) {
+        Some(at) => at >= floor && at <= len,
+        None => floor == 0,
+    }
 }
 
 /// The term of the last byte in the log, and where the log ends. A term
@@ -142,7 +146,7 @@ fn log_len(home: &Path) -> u64 {
 }
 
 /// One at a time on this home: two leaders' links, or a link and a vote.
-fn guard(home: &Path) -> Result<File> {
+pub fn guard(home: &Path) -> Result<File> {
     fs::create_dir_all(home.join("ledger"))?;
     let file = OpenOptions::new()
         .create(true)
@@ -248,14 +252,14 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         if at > old {
             set_floor(home, at)?;
         }
-        file.set_len(at)?;
-        file.sync_all()?;
-        len = at;
         let known: Terms = theirs
             .into_iter()
             .filter(|(_, start)| *start <= at)
             .collect();
         store_terms(home, &known)?;
+        file.set_len(at)?;
+        file.sync_all()?;
+        len = at;
         if at < old {
             set_floor(home, at)?;
         }
@@ -357,7 +361,12 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     let free = voted_term < term || voted_for == candidate;
     // A replica that can still hear a leader does not help unseat it.
     let leaderless = quiet_for(home) >= Duration::from_millis(QUIET_MS);
-    let fresh = their_last >= my_last;
+    // A home with no history of its own is new to the set, or has lost
+    // its disk. Either way it knows nothing of what was promised, and its
+    // vote could elect a replica that is missing some of it. It votes only
+    // when there is no history anywhere: the first election there ever is.
+    let blank = terms(home).is_empty() && my_last.1 == 0;
+    let fresh = their_last >= my_last && (!blank || their_last == (0, 0));
     if dry {
         // Would it be granted. Nothing is written down for a question.
         let granted = term > current && fresh && leaderless;
@@ -505,6 +514,8 @@ pub fn begin_term(home: &Path, term: u64, len: u64) -> Result<Terms> {
 }
 
 struct Shared {
+    /// When each peer last answered.
+    seen: std::collections::HashMap<String, Instant>,
     /// Followers behind this are sent the snapshot, not bytes.
     floor: u64,
     want: u64,
@@ -529,6 +540,7 @@ impl Links {
                 floor: floor(home),
                 want: len,
                 acked: Default::default(),
+                seen: Default::default(),
                 deposed: false,
             }),
             Condvar::new(),
@@ -559,6 +571,7 @@ impl Links {
             shared
                 .acked
                 .insert(peer.name.clone(), (0, peer.cmd.clone()));
+            shared.seen.insert(peer.name.clone(), Instant::now());
             let (shared, peer, terms, term) = (
                 self.shared.clone(),
                 peer.clone(),
@@ -611,6 +624,28 @@ impl Links {
         let mut shared = lock.lock().unwrap();
         shared.floor = shared.floor.max(at);
         wake.notify_all();
+    }
+
+    /// How long since most replicas, this one counted, were last in reach.
+    /// A leader with nothing to write would otherwise never find out.
+    pub fn alone_for(&self) -> Duration {
+        let shared = self.shared.0.lock().unwrap();
+        let need = most(shared.acked.len()) - 1;
+        if need == 0 {
+            return Duration::ZERO;
+        }
+        let mut ages: Vec<Duration> = shared
+            .acked
+            .keys()
+            .map(|name| {
+                shared
+                    .seen
+                    .get(name)
+                    .map_or(Duration::MAX, |at| at.elapsed())
+            })
+            .collect();
+        ages.sort();
+        ages[need - 1]
     }
 
     pub fn deposed(&self) -> bool {
@@ -708,6 +743,8 @@ fn link(
             if n > 0 && at < lock.lock().unwrap().floor {
                 // The leader let go of this part of the log while it was
                 // being read. What was read may be the hole.
+                snapped = 0;
+                thread::sleep(Duration::from_millis(50));
                 continue;
             }
             (
@@ -721,7 +758,13 @@ fn link(
         {
             return done(&mut child, false);
         }
-        let Ok(line) = rx.recv_timeout(CALL) else {
+        // A snapshot is large and is fsynced more than once at the far end.
+        let limit = if header["op"] == "snap" {
+            CALL * 15
+        } else {
+            CALL
+        };
+        let Ok(line) = rx.recv_timeout(limit) else {
             return done(&mut child, false);
         };
         let Ok(reply) = serde_json::from_str::<Value>(&line) else {
@@ -731,6 +774,7 @@ fn link(
             let len = reply["len"].as_u64().unwrap_or(0);
             theirs = Some(len);
             let mut shared = lock.lock().unwrap();
+            shared.seen.insert(peer.name.clone(), Instant::now());
             // More than the leader has is a log this leader has not vouched for.
             let want = shared.want;
             match shared.acked.get_mut(&peer.name) {
@@ -760,6 +804,8 @@ fn link(
             wake.notify_all();
             return done(&mut child, true);
         } else {
+            // Busy, most likely. Nothing is known to have arrived.
+            snapped = 0;
             thread::sleep(Duration::from_millis(200));
             continue;
         }
@@ -890,6 +936,29 @@ mod tests {
         assert_eq!(send(&home, 5, 60, &t3, &[b'b'; 10])["len"], 70);
         assert_eq!(last(&home), (3, 70));
         assert_eq!(terms(&home), t3);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_home_with_no_history_votes_only_when_nobody_has_any() {
+        // New to the set, or its disk was lost: it cannot know what was
+        // promised, so it does not help choose who keeps the promises.
+        let home = home("blank");
+        let ask = |last_term: u64, len: u64| {
+            let req = json!({"term": 7, "candidate": "b", "last_term": last_term, "len": len, "pre": true});
+            answer_vote(&home, &req).unwrap()["granted"] == true
+        };
+        assert!(!ask(3, 500));
+        // The first election there ever is: every home is like this one.
+        assert!(ask(0, 0));
+        // Once a leader has filled it, it votes as any other.
+        send(&home, 6, 0, &vec![(6, 0)], &[b'a'; 60]);
+        File::open(heard_path(&home))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        assert!(ask(6, 60));
+        assert!(!ask(6, 59));
         let _ = fs::remove_dir_all(&home);
     }
 }
