@@ -306,6 +306,10 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
                 cmd: cmd.clone(),
             })
             .collect();
+        // Work this home started when it last led belongs to no leader now.
+        // Whoever leads next counts those tasks as crashed and runs them
+        // again; left alone they would be done twice.
+        stop_leftover(home);
         elected = Some(replica::stand_by(home, me, &peers)?);
     }
     // The lock first, and nothing read until it is held. A standby waits
@@ -548,6 +552,32 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
     }
     daemon.flush_soft()?;
     Ok(())
+}
+
+fn stop_leftover(home: &Path) {
+    let Ok(notes) = fs::read_dir(home.join("run/live")) else {
+        return;
+    };
+    let mut stopped = 0;
+    for note in notes.flatten() {
+        let v: Option<Value> = fs::read(note.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        if let Some(v) = v {
+            let pid = v["pid"].as_i64().unwrap_or(0) as i32;
+            if pid > 1 && proc_start(pid) == v["start"].as_u64() {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                stopped += 1;
+            }
+        }
+        let _ = fs::remove_file(note.path());
+    }
+    if stopped > 0 {
+        eprintln!("inlet: stopped {stopped} workers left from when this replica led");
+    }
 }
 
 fn install_signals(tx: Sender<Incoming>) -> Result<()> {

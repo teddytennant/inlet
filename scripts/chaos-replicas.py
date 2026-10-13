@@ -210,7 +210,9 @@ stopping = True
 with guard:
     for p in procs.values():
         if p.poll() is None:
-            p.send_signal(signal.SIGINT)
+            # Not SIGINT: a shell that started this script in the background
+            # has set that to be ignored, and a replica standing by inherits it.
+            p.send_signal(signal.SIGTERM)
 for n in nodes:
     run(homes[n], "down")
 time.sleep(2)
@@ -222,7 +224,7 @@ for _ in range(30):
     if not left:
         break
     time.sleep(0.5)
-check(not left, "processes left: %s" % left[:5])
+check(not left, "processes left: %s" % [cmdline(p)[-80:] for p in left[:6]])
 print("seed %d  %s" % (args.seed, dict(kills)))
 print("adds answered %d  unsure %d  terms %s  log %d bytes" % (len(acked), unsure, terms, len(logs[reps[0]])))
 if problems:

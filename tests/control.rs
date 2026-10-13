@@ -2339,3 +2339,43 @@ fn a_leader_without_most_of_its_replicas_stops() {
     );
     assert_eq!(before, 0);
 }
+
+#[test]
+fn work_a_replica_started_stops_when_it_no_longer_leads() {
+    let homes = replica_homes(
+        "left",
+        r#"job = { cmd = { "/bin/sh", "-c", "sleep 60; echo hi > out" } },"#,
+        "",
+    );
+    let names = ["a", "b", "c"];
+    let mut daemons: Vec<Daemon> = homes
+        .iter()
+        .zip(names)
+        .map(|(home, name)| replica(home, name))
+        .collect();
+    let first = leader_of(&homes, None);
+    inlet(
+        &homes[first],
+        &["add", "-w", "job", "-g", "long", "--no-verify"],
+    );
+    let st = wait(&homes[first], &daemons[first], |v| {
+        tasks(v).iter().any(|t| t["pid"].as_i64().unwrap_or(0) > 0)
+    });
+    let pid = tasks(&st)[0]["pid"].as_i64().unwrap() as i32;
+    // The leader dies and its worker outlives it, as workers do.
+    kill9(&mut daemons[first]);
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the worker died with the daemon"
+    );
+    let second = leader_of(&homes, Some(first));
+    assert_ne!(second, first);
+    // Back as a replica, it is not the leader, and the work is not its own.
+    daemons[first] = replica(&homes[first], names[first]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the old leader's worker ran on");
+        thread::sleep(Duration::from_millis(100));
+    }
+}

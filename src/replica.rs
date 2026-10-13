@@ -209,6 +209,9 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     if known != mine {
         store_terms(home, &known)?;
     }
+    // Again, now that the disk has been waited on: a slow fsync is not the
+    // leader going quiet.
+    touch(home);
     Ok(json!({"ok": true, "len": len}))
 }
 
@@ -613,7 +616,9 @@ mod tests {
             answer_vote(&home, &req).unwrap()["granted"] == true
         };
         // A leader was just heard from: nobody is helped to unseat it.
+        touch(&home);
         assert!(!ask(2, "b", 1, 60, true));
+        touch(&home);
         assert!(!ask(2, "b", 1, 60, false));
         // Long quiet now.
         let old = SystemTime::now() - Duration::from_secs(60);
