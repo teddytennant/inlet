@@ -675,7 +675,25 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests count durable writes down to a crash: when this reaches zero
+    /// the write does not happen and the caller gets an error, which is
+    /// what a process killed at that point leaves behind.
+    pub(crate) static CRASH_IN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
+
 pub(crate) fn durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    {
+        let left = CRASH_IN.with(|c| c.get());
+        if left == 0 {
+            return Err(err("crash"));
+        }
+        if left > 0 {
+            CRASH_IN.with(|c| c.set(left - 1));
+        }
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

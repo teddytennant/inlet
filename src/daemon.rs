@@ -311,7 +311,8 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         // Whoever leads next counts those tasks as crashed and runs them
         // again; left alone they would be done twice.
         stop_leftover(home);
-        elected = Some(replica::stand_by(home, me, &read)?);
+        let cluster = load_signed(home)?.cfg.cluster;
+        elected = Some(replica::stand_by(home, me, &cluster, &read)?);
         peers = read()?;
     }
     // The lock first, and nothing read until it is held. A standby waits
@@ -388,7 +389,10 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
             let len = opened.ledger.len();
             let (terms, was_seeded) = replica::begin_term(home, term, len)?;
             seeded = was_seeded;
-            Some(replica::Links::start(home, term, &peers, terms, len))
+            let cluster = policy.cfg.cluster.clone();
+            Some(replica::Links::start(
+                home, term, &peers, terms, len, cluster,
+            ))
         }
         None => None,
     };
@@ -524,10 +528,6 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
             }],
             true,
         )?;
-        // Most replicas hold that record, and with it the cluster's name.
-        if let Some(links) = &daemon.links {
-            replica::keep_cluster(home, links.id())?;
-        }
         if daemon.force_compact {
             // An older ledger was taken in. Its past may be in a snapshot
             // and not in the log, so the snapshot is what a new replica

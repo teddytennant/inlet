@@ -150,8 +150,8 @@ fn id_path(home: &Path) -> PathBuf {
     home.join("ledger/cluster")
 }
 
-/// Which set of replicas this home belongs to: a number made up by the
-/// first leader there ever was and handed on with everything it sends.
+/// Which set of replicas this home belongs to: the policy's `cluster`,
+/// written here the first time anything is asked of the home in its name.
 pub fn cluster(home: &Path) -> Option<String> {
     let id = fs::read_to_string(id_path(home)).ok()?;
     Some(id.trim().to_string()).filter(|id| !id.is_empty())
@@ -170,13 +170,10 @@ fn foreign(home: &Path, req: &Value) -> bool {
     }
 }
 
-/// A home takes a cluster's name with its bytes, not before. A name taken
-/// at a leader's first word, from a leader that then died having given
-/// nobody anything, would belong to a cluster that never was.
-fn adopt(home: &Path, req: &Value, len: u64) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
+/// A home that belonged to no cluster belongs to the first that speaks to
+/// it. The name is the policy's, the same on every replica of a set, so
+/// there is no moment at which two leaders of one set could differ on it.
+fn adopt(home: &Path, req: &Value) -> Result<()> {
     if let (None, Some(id)) = (cluster(home), req["id"].as_str()) {
         snap::durable(&id_path(home), id.as_bytes())?;
     }
@@ -211,12 +208,27 @@ pub fn touch(home: &Path) {
     let _ = fs::write(heard_path(home), b"");
 }
 
+/// A leader has just been chosen and has a log to read before it can say
+/// a word. Count it as heard from for that long, on top of the usual.
+fn grace(home: &Path) {
+    touch(home);
+    if let Ok(file) = File::open(heard_path(home)) {
+        let _ = file.set_modified(SystemTime::now() + Duration::from_secs(10));
+    }
+}
+
 fn quiet_for(home: &Path) -> Duration {
     fs::metadata(heard_path(home))
         .and_then(|m| m.modified())
         .ok()
-        // A time still to come is a vote just given: quiet for no time yet.
-        .map(|at| SystemTime::now().duration_since(at).unwrap_or_default())
+        .map(|at| match at.duration_since(SystemTime::now()) {
+            // A time a little way off is a vote just given: quiet for no
+            // time yet. One far off is a clock that was set back, and says
+            // nothing about when a leader was last heard.
+            Ok(ahead) if ahead <= Duration::from_secs(15) => Duration::ZERO,
+            Ok(_) => Duration::from_secs(3600),
+            Err(behind) => behind.duration(),
+        })
         .unwrap_or(Duration::from_secs(3600))
 }
 
@@ -353,7 +365,7 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     }
     ledger::punch(&file, at);
     clear_refill(home, len, req);
-    adopt(home, req, len)?;
+    adopt(home, req)?;
     touch(home);
     Ok(json!({"ok": true, "len": len.min(same.max(at))}))
 }
@@ -423,7 +435,7 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         len += more;
     }
     clear_refill(home, len, req);
-    adopt(home, req, len)?;
+    adopt(home, req)?;
     // Again, now that the disk has been waited on: a slow fsync is not the
     // leader going quiet.
     touch(home);
@@ -489,12 +501,9 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
         snap::durable(&vote_path(home), format!("{term} {candidate}").as_bytes())?;
         // The one chosen has a log to read before it can say a word. Give
         // it that long, on top of the usual patience, before looking again.
-        touch(home);
-        if let Ok(file) = File::open(heard_path(home)) {
-            let _ = file.set_modified(SystemTime::now() + Duration::from_secs(10));
-        }
+        grace(home);
     }
-    Ok(json!({"granted": granted, "term": snap::read_epoch(home), "id": cluster(home)}))
+    Ok(json!({"granted": granted, "term": snap::read_epoch(home)}))
 }
 
 #[derive(Clone)]
@@ -519,7 +528,10 @@ fn jitter(span: u64) -> u64 {
 
 /// Ask every peer, at once, and count the ones that say yes. This replica's
 /// own yes is counted by the caller.
-fn poll(peers: &[Peer], req: &Value) -> (usize, u64, Option<String>) {
+/// How many granted, and the newest term any of them named.
+type Tally = (usize, u64);
+
+fn poll(peers: &[Peer], req: &Value) -> Tally {
     let (tx, rx) = mpsc::channel();
     for peer in peers {
         let (tx, cmd, body) = (tx.clone(), peer.cmd.clone(), req.to_string());
@@ -535,20 +547,32 @@ fn poll(peers: &[Peer], req: &Value) -> (usize, u64, Option<String>) {
         });
     }
     drop(tx);
-    let (mut yes, mut newest, mut id) = (0, 0, None);
+    let (mut yes, mut newest) = (0, 0);
     for v in rx.iter().flatten() {
         if v["granted"] == true {
             yes += 1;
-            // The cluster's name, from one that holds bytes under it.
-            id = id.or(v["id"].as_str().map(str::to_string));
         }
         newest = newest.max(v["term"].as_u64().unwrap_or(0));
     }
-    (yes, newest, id)
+    (yes, newest)
 }
 
 /// Wait, as a standby, until this replica is elected. Returns its term.
-pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) -> Result<u64> {
+pub fn stand_by(
+    home: &Path,
+    me: &str,
+    id: &str,
+    peers: &dyn Fn() -> Result<Vec<Peer>>,
+) -> Result<u64> {
+    match cluster(home) {
+        Some(mine) if mine != id => {
+            return Err(err(format!(
+                "this home holds the ledger of cluster {mine:?}, and the policy says {id:?}"
+            )));
+        }
+        Some(_) => {}
+        None => snap::durable(&id_path(home), id.as_bytes())?,
+    }
     eprintln!("inlet: replica {me} standing by");
     // Patience counted from now: a replica that just started has heard
     // nobody, and that is not the same as the leader being gone.
@@ -569,73 +593,74 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
         // Read again each time: the set of replicas is the policy's, and
         // the policy may have changed since this one sat down.
         let peers = &peers()?;
-        let most = most(peers.len());
-        let (last_term, len) = last(home);
-        let next = snap::read_epoch(home) + 1;
-        let id = cluster(home);
-        let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre, "id": id});
-        // First whether a vote could be won, without disturbing anybody. A
-        // replica cut off from the rest asks for ever and changes nothing.
-        let (yes, newest, _) = poll(peers, &ask(next, true));
-        if yes + 1 < most {
-            if newest >= next {
-                // They are in a later term than this replica knew of. Asking
-                // again for the same one would be refused for ever.
-                let _guard = guard(home)?;
-                if newest > snap::read_epoch(home) {
-                    set_epoch(home, newest)?;
-                }
-            }
-            touch(home);
-            continue;
+        let ask = |req: &Value| poll(peers, req);
+        if let Some(term) = campaign(home, me, id, most(peers.len()), &ask)? {
+            eprintln!("inlet: replica {me} elected for term {term}");
+            return Ok(term);
         }
-        let term = {
-            let _guard = guard(home)?;
-            if quiet_for(home) < Duration::from_millis(QUIET_MS) || last(home) != (last_term, len) {
-                // Somebody else got there while this one was asking.
-                continue;
-            }
-            let term = snap::read_epoch(home).max(voted(home).0) + 1;
-            set_epoch(home, term)?;
-            snap::durable(&vote_path(home), format!("{term} {me}").as_bytes())?;
-            term
-        };
-        let (yes, newest, named) = poll(peers, &ask(term, false));
-        if newest > term {
+    }
+}
+
+/// One try at being elected. `ask` puts a request to every other replica
+/// and says how many granted it, the newest term any of them named, and
+/// the cluster's name if a granting one had it.
+fn campaign(
+    home: &Path,
+    me: &str,
+    id: &str,
+    most: usize,
+    ask: &dyn Fn(&Value) -> Tally,
+) -> Result<Option<u64>> {
+    let (last_term, len) = last(home);
+    let next = snap::read_epoch(home) + 1;
+    let req = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre, "id": id});
+    // First whether a vote could be won, without disturbing anybody. A
+    // replica cut off from the rest asks for ever and changes nothing.
+    let (yes, newest) = ask(&req(next, true));
+    if yes + 1 < most {
+        if newest >= next {
+            // They are in a later term than this replica knew of. Asking
+            // again for the same one would be refused for ever.
             let _guard = guard(home)?;
             if newest > snap::read_epoch(home) {
                 set_epoch(home, newest)?;
             }
         }
-        if yes + 1 >= most && snap::read_epoch(home) == term {
-            if let Some(id) = named {
-                // A leader that lost its name, or never had one, leads the
-                // cluster its voters are in and does not make another.
-                keep_cluster(home, &id)?;
-            }
-            eprintln!("inlet: replica {me} elected for term {term}");
-            touch(home);
-            return Ok(term);
-        }
         touch(home);
+        return Ok(None);
     }
+    let term = {
+        let _guard = guard(home)?;
+        if quiet_for(home) < Duration::from_millis(QUIET_MS) || last(home) != (last_term, len) {
+            // Somebody else got there while this one was asking.
+            return Ok(None);
+        }
+        let term = snap::read_epoch(home).max(voted(home).0) + 1;
+        set_epoch(home, term)?;
+        snap::durable(&vote_path(home), format!("{term} {me}").as_bytes())?;
+        term
+    };
+    let (yes, newest) = ask(&req(term, false));
+    if newest > term {
+        let _guard = guard(home)?;
+        if newest > snap::read_epoch(home) {
+            set_epoch(home, newest)?;
+        }
+    }
+    if yes + 1 >= most && snap::read_epoch(home) == term {
+        // Its own home votes too, and must give it the same time to
+        // read its log that the others do.
+        grace(home);
+        return Ok(Some(term));
+    }
+    touch(home);
+    Ok(None)
 }
 
 /// The new leader's first act: note where its term's bytes begin.
 /// Whether this home holds a ledger from before it was a replica.
 pub fn unseeded(home: &Path) -> bool {
     terms(home).is_empty() && (log_len(home) > 0 || paths::snap_index(home).exists())
-}
-
-/// The cluster's name is this home's own once most replicas have taken it.
-/// Written down any sooner, a first leader that died having reached nobody
-/// would come back a stranger to the cluster the others then made.
-pub fn keep_cluster(home: &Path, id: &str) -> Result<()> {
-    let _guard = guard(home)?;
-    if cluster(home).is_none() {
-        snap::durable(&id_path(home), id.as_bytes())?;
-    }
-    Ok(())
 }
 
 /// Returns the term table, and whether an older ledger was taken in.
@@ -674,7 +699,7 @@ struct Shared {
 
 /// The leader's side: one thread and one long-lived command per peer.
 pub struct Links {
-    /// The cluster's name: this home's, or one made up now if there is none.
+    /// The cluster's name, sent with everything.
     id: String,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     home: PathBuf,
@@ -683,7 +708,14 @@ pub struct Links {
 }
 
 impl Links {
-    pub fn start(home: &Path, term: u64, peers: &[Peer], terms: Terms, len: u64) -> Links {
+    pub fn start(
+        home: &Path,
+        term: u64,
+        peers: &[Peer],
+        terms: Terms,
+        len: u64,
+        id: String,
+    ) -> Links {
         let shared = Arc::new((
             Mutex::new(Shared {
                 floor: floor(home),
@@ -695,12 +727,6 @@ impl Links {
             }),
             Condvar::new(),
         ));
-        let id = cluster(home).unwrap_or_else(|| {
-            // The first leader there ever is names the cluster.
-            let mut raw = [0u8; 8];
-            let _ = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw));
-            raw.iter().map(|b| format!("{b:02x}")).collect()
-        });
         let links = Links {
             id,
             shared,
@@ -811,10 +837,6 @@ impl Links {
     /// The leader's loop is turning.
     pub fn beat(&self) {
         self.shared.0.lock().unwrap().alive = Instant::now();
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
     }
 
     pub fn deposed(&self) -> bool {
@@ -1234,34 +1256,398 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// A whole set of replicas in one thread, driven at random: elections,
+    /// writes, links that are up or down, daemons that die, and processes
+    /// killed between one durable write and the next. Everything a home
+    /// does is the real code. What is modelled is the leader's side, which
+    /// in the daemon is threads and pipes.
+    struct Sim {
+        homes: Vec<PathBuf>,
+        /// The daemon leading on each home, if one is: its term, its term
+        /// table, the log held open and locked, and what each peer has.
+        leaders: Vec<Option<Lead>>,
+        /// Every byte a client was told was kept.
+        kept: Vec<u8>,
+        won: std::collections::HashMap<u64, usize>,
+        rng: u64,
+        stamp: u8,
+        /// How many disks may be lost in a run, and how many have been.
+        wipes: usize,
+        wiped: usize,
+        stuck: bool,
+    }
+
+    struct Lead {
+        term: u64,
+        terms: Terms,
+        id: String,
+        log: File,
+        theirs: Vec<Option<u64>>,
+        acked: Vec<u64>,
+    }
+
+    impl Sim {
+        fn new(tag: &str, n: usize, seed: u64) -> Sim {
+            Sim {
+                homes: (0..n).map(|i| home(&format!("{tag}-{seed}-{i}"))).collect(),
+                leaders: (0..n).map(|_| None).collect(),
+                kept: Vec::new(),
+                won: Default::default(),
+                rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                stamp: 0,
+                wipes: 0,
+                wiped: 0,
+                stuck: false,
+            }
+        }
+
+        fn roll(&mut self, n: u64) -> u64 {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            self.rng % n
+        }
+
+        fn len(&self, i: usize) -> u64 {
+            log_len(&self.homes[i])
+        }
+
+        /// Time passes: nobody has heard a leader for a long while.
+        fn quiet(&self, i: usize) {
+            touch(&self.homes[i]);
+            let old = SystemTime::now() - Duration::from_secs(60);
+            let _ = File::open(heard_path(&self.homes[i])).and_then(|f| f.set_modified(old));
+        }
+
+        /// Maybe the next thing this thread does is killed part way.
+        fn arm(&mut self, odds: u64) {
+            let n = if self.roll(odds) == 0 {
+                self.roll(4) as i64
+            } else {
+                -1
+            };
+            snap::CRASH_IN.with(|c| c.set(n));
+        }
+
+        fn disarm(&self) {
+            snap::CRASH_IN.with(|c| c.set(-1));
+        }
+
+        fn elect(&mut self, i: usize, up: &[bool], faults: u64) {
+            if self.leaders[i].is_some() {
+                return;
+            }
+            let home = self.homes[i].clone();
+            if !usable(&home)
+                || filling(&home)
+                || quiet_for(&home) < Duration::from_millis(QUIET_MS)
+            {
+                return;
+            }
+            let n = self.homes.len();
+            let homes = self.homes.clone();
+            let ask = |req: &Value| -> Tally {
+                let (mut yes, mut newest) = (0, 0);
+                for (j, peer) in homes.iter().enumerate() {
+                    if j == i || !up[j] {
+                        continue;
+                    }
+                    let Ok(v) = answer_vote(peer, req) else {
+                        continue;
+                    };
+                    if v["granted"] == true {
+                        yes += 1;
+                    }
+                    newest = newest.max(v["term"].as_u64().unwrap_or(0));
+                }
+                (yes, newest)
+            };
+            self.arm(faults);
+            let won = campaign(&home, &format!("r{i}"), "sim", most(n - 1), &ask);
+            let Ok(Some(term)) = won else {
+                self.disarm();
+                return;
+            };
+            // Elected. What the daemon does next: lock, note the term, link.
+            let started = (|| -> Result<Lead> {
+                let log = ledger::try_lock(&paths::ledger(&home), true)?
+                    .ok_or_else(|| err("log is held"))?;
+                let len = log.metadata()?.len();
+                let (terms, _) = begin_term(&home, term, len)?;
+                Ok(Lead {
+                    term,
+                    terms,
+                    id: "sim".into(),
+                    log,
+                    theirs: vec![None; n],
+                    acked: vec![0; n],
+                })
+            })();
+            self.disarm();
+            let Ok(lead) = started else {
+                return;
+            };
+            assert!(
+                self.won.insert(term, i).is_none_or(|was| was == i),
+                "two leaders in term {term}"
+            );
+            let mine = fs::read(paths::ledger(&home)).unwrap();
+            assert!(
+                mine.starts_with(&self.kept),
+                "r{i} was elected for term {term} without {} kept bytes (has {})",
+                self.kept.len(),
+                mine.len()
+            );
+            self.leaders[i] = Some(lead);
+            self.write(i);
+        }
+
+        /// The leader on `i` appends a record to its own log.
+        fn write(&mut self, i: usize) {
+            let home = self.homes[i].clone();
+            self.stamp = self.stamp.wrapping_add(1);
+            let (stamp, n) = (self.stamp, 20 + self.roll(60) as usize);
+            let Some(lead) = &mut self.leaders[i] else {
+                return;
+            };
+            if snap::read_epoch(&home) > lead.term {
+                self.leaders[i] = None;
+                return;
+            }
+            touch(&home);
+            lead.log.seek(SeekFrom::End(0)).unwrap();
+            lead.log.write_all(&vec![stamp; n]).unwrap();
+            lead.log.sync_all().unwrap();
+        }
+
+        /// One exchange on the link from the leader on `i` to home `j`.
+        fn send(&mut self, i: usize, j: usize, faults: u64) {
+            let (home, peer) = (self.homes[i].clone(), self.homes[j].clone());
+            let want = self.len(i);
+            let chunk = 1 + self.roll(120);
+            self.arm(faults);
+            let Some(lead) = &mut self.leaders[i] else {
+                self.disarm();
+                return;
+            };
+            touch(&home);
+            let at = lead.theirs[j].unwrap_or(want).min(want);
+            let n = (want - at).min(chunk);
+            let mut bytes = vec![0u8; n as usize];
+            lead.log.seek(SeekFrom::Start(at)).unwrap();
+            lead.log.read_exact(&mut bytes).unwrap();
+            let header = json!({"term": lead.term, "at": at, "n": n, "terms": lead.terms, "id": lead.id, "want": want});
+            let reply = append(&peer, &header, &bytes);
+            self.disarm();
+            let lead = self.leaders[i].as_mut().unwrap();
+            let Ok(reply) = reply else {
+                // The far end was killed part way. The link starts over.
+                lead.theirs[j] = None;
+                lead.acked[j] = 0;
+                return;
+            };
+            if reply["ok"] == true {
+                let len = reply["len"].as_u64().unwrap();
+                lead.theirs[j] = Some(len);
+                if len <= want {
+                    lead.acked[j] = len;
+                }
+            } else if let Some(need) = reply["need"].as_u64() {
+                lead.theirs[j] = Some(need);
+            } else if reply["term"].as_u64().is_some_and(|t| t > lead.term) {
+                self.leaders[i] = None;
+            }
+        }
+
+        /// What `ship` does: if most replicas hold the log, and this home
+        /// has not voted for another meanwhile, the client is answered.
+        fn answer(&mut self, i: usize) {
+            let home = self.homes[i].clone();
+            let Some(lead) = &self.leaders[i] else {
+                return;
+            };
+            let len = self.len(i);
+            let have = 1 + lead.acked.iter().filter(|a| **a >= len).count();
+            if have < most(self.homes.len() - 1) {
+                return;
+            }
+            let _guard = guard(&home).unwrap();
+            if snap::read_epoch(&home) > lead.term {
+                self.leaders[i] = None;
+                return;
+            }
+            let mine = fs::read(paths::ledger(&home)).unwrap();
+            assert!(
+                mine.starts_with(&self.kept),
+                "the leader of term {} answers for a log that lost kept bytes",
+                lead.term
+            );
+            self.kept = mine;
+        }
+
+        /// The disk under a home is replaced. Everything it held is gone,
+        /// what it had promised included.
+        fn wipe(&mut self, i: usize) {
+            if self.leaders[i].is_some() {
+                return;
+            }
+            let _ = fs::remove_dir_all(self.homes[i].join("ledger"));
+            fs::create_dir_all(self.homes[i].join("ledger")).unwrap();
+            self.wiped += 1;
+        }
+
+        fn run(&mut self, steps: usize, faults: u64) {
+            let n = self.homes.len();
+            for step in 0..steps {
+                if self.wipes > 0 && step > 50 && self.wiped < self.wipes && self.roll(150) == 0 {
+                    let i = self.roll(n as u64) as usize;
+                    self.wipe(i);
+                }
+                let i = self.roll(n as u64) as usize;
+                let j = self.roll(n as u64) as usize;
+                match self.roll(20) {
+                    0..=2 => {
+                        for k in 0..n {
+                            if self.roll(3) > 0 && self.leaders[k].is_none() {
+                                self.quiet(k);
+                            }
+                        }
+                        let up: Vec<bool> = (0..n).map(|_| self.roll(5) > 0).collect();
+                        self.elect(i, &up, faults);
+                    }
+                    3..=6 => self.write(i),
+                    7..=15 if i != j => self.send(i, j, faults),
+                    16..=17 => self.answer(i),
+                    // The daemon dies. Its home, and what is on it, stay.
+                    18 if self.roll(3) == 0 => self.leaders[i] = None,
+                    // A leader that has stopped being heard, alive or not.
+                    19 => self.quiet(i),
+                    _ => {}
+                }
+            }
+        }
+
+        /// No more faults, every link up. A leader must come of it, every
+        /// home must end with the same log, and nothing kept may be missing.
+        fn settle(&mut self) {
+            let n = self.homes.len();
+            self.disarm();
+            let all = vec![true; n];
+            for round in 0..200 {
+                let leading: Vec<usize> = (0..n).filter(|i| self.leaders[*i].is_some()).collect();
+                if let [i] = leading[..] {
+                    self.write(i);
+                    for _ in 0..40 {
+                        for j in (0..n).filter(|j| *j != i) {
+                            self.send(i, j, u64::MAX);
+                        }
+                    }
+                    self.answer(i);
+                    let same = (0..n).all(|j| self.len(j) == self.len(i));
+                    if self.leaders[i].is_some() && same && self.kept.len() as u64 == self.len(i) {
+                        let log = fs::read(paths::ledger(&self.homes[i])).unwrap();
+                        for home in &self.homes {
+                            assert_eq!(fs::read(paths::ledger(home)).unwrap(), log);
+                        }
+                        return;
+                    }
+                    continue;
+                }
+                // None, or more than one that has not yet learned better.
+                for i in leading {
+                    self.write(i);
+                    for j in (0..n).filter(|j| *j != i) {
+                        self.send(i, j, u64::MAX);
+                    }
+                }
+                for k in 0..n {
+                    if self.leaders[k].is_none() {
+                        self.quiet(k);
+                    }
+                }
+                self.elect(round % n, &all, u64::MAX);
+            }
+            let state: Vec<String> = (0..n)
+                .map(|i| {
+                    let h = &self.homes[i];
+                    format!(
+                        "r{i}: leads {} epoch {} len {} last {:?} mark {:?} id {:?} usable {}",
+                        self.leaders[i].is_some(),
+                        snap::read_epoch(h),
+                        log_len(h),
+                        last(h),
+                        refill(h),
+                        cluster(h),
+                        usable(h)
+                    )
+                })
+                .collect();
+            // A lost disk can leave too few homes that know enough to choose
+            // a leader safely. Then nobody leads, and somebody has to say
+            // which home has the ledger. Without a lost disk, never.
+            assert!(
+                self.wiped > 0,
+                "with every home up and no more faults, nobody came to lead:\n{}",
+                state.join("\n")
+            );
+            self.stuck = true;
+        }
+
+        fn done(self) {
+            for home in &self.homes {
+                let _ = fs::remove_dir_all(home);
+            }
+        }
+    }
+
+    fn storm(tag: &str, n: usize, seeds: std::ops::Range<u64>, steps: usize, faults: u64) {
+        storm_with(tag, n, seeds, steps, faults, 0)
+    }
+
+    fn storm_with(
+        tag: &str,
+        n: usize,
+        seeds: std::ops::Range<u64>,
+        steps: usize,
+        faults: u64,
+        wipes: usize,
+    ) {
+        let mut stuck = 0;
+        let runs = seeds.end - seeds.start;
+        for seed in seeds {
+            let mut sim = Sim::new(tag, n, seed);
+            sim.wipes = wipes;
+            sim.run(steps, faults);
+            sim.settle();
+            stuck += sim.stuck as u64;
+            sim.done();
+        }
+        // Stuck is allowed after a lost disk, but it must be the exception.
+        assert!(
+            stuck * 4 <= runs,
+            "{stuck} of {runs} runs ended with nobody able to lead"
+        );
+    }
+
     #[test]
-    fn a_name_is_taken_with_bytes_and_handed_on_with_a_vote() {
-        let home = home("name");
-        let t = vec![(1, 0)];
-        let from = |at: u64, bytes: &[u8]| {
-            let req = json!({"term": 1, "at": at, "n": bytes.len(), "terms": t, "id": "aaaa"});
-            append(&home, &req, bytes).unwrap()
-        };
-        // A first word, and nothing after it: that leader may have died
-        // having given nobody anything, and its name with it.
-        from(50, b"");
-        assert_eq!(cluster(&home), None);
-        assert_eq!(from(0, &[b'a'; 50])["len"], 50);
-        assert_eq!(cluster(&home).as_deref(), Some("aaaa"));
-        // The leader itself wrote its name down only after most had its
-        // record, and died first. It comes back with the log and no name.
-        // It is not a stranger, and the vote tells it the name.
-        let old = SystemTime::now() - Duration::from_secs(60);
-        File::open(heard_path(&home))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        let ask = json!({"term": 2, "candidate": "a", "last_term": 1, "len": 50, "pre": false, "id": null});
-        let reply = answer_vote(&home, &ask).unwrap();
-        assert_eq!(reply["granted"], true);
-        assert_eq!(reply["id"], "aaaa");
-        // Having voted, it waits out the new leader's reading of its log.
-        assert!(quiet_for(&home) < Duration::from_secs(1));
-        let _ = fs::remove_dir_all(&home);
+    fn three_homes_at_random_lose_nothing_kept_and_end_with_a_leader() {
+        storm("s3", 3, 0..40, 400, u64::MAX);
+    }
+
+    #[test]
+    fn five_homes_at_random_lose_nothing_kept_and_end_with_a_leader() {
+        storm("s5", 5, 0..20, 500, u64::MAX);
+    }
+
+    #[test]
+    fn homes_killed_between_durable_writes_lose_nothing_kept() {
+        storm("k3", 3, 0..40, 400, 6);
+        storm("k5", 5, 0..15, 500, 6);
+    }
+
+    #[test]
+    fn a_home_that_loses_its_disk_costs_nothing_kept() {
+        storm_with("w3", 3, 0..40, 500, u64::MAX, 1);
+        storm_with("w5", 5, 0..15, 600, u64::MAX, 1);
     }
 }
