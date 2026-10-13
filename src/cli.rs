@@ -649,6 +649,61 @@ fn doctor(home: &Path) -> Result<()> {
             }
         }
     }
+    if let Some(p) = policy
+        .as_ref()
+        .ok()
+        .map(|p| &p.cfg)
+        .filter(|cfg| !cfg.replicas.is_empty())
+    {
+        let n = p.replicas.len();
+        line(
+            n % 2 == 1,
+            "replicas",
+            format!(
+                "{n} in cluster {:?}{}",
+                p.cluster,
+                if n % 2 == 1 {
+                    ""
+                } else {
+                    ": an even number gains nothing over one fewer and can tie; use 3 or 5, and pass through 4 only on the way"
+                }
+            ),
+        );
+        for (name, cmd) in &p.replicas {
+            let reached = crate::replica::reachable(cmd);
+            line(
+                reached,
+                "replica",
+                format!(
+                    "{name} {}",
+                    if reached {
+                        "answers"
+                    } else {
+                        "does not answer"
+                    }
+                ),
+            );
+        }
+        line(true, "ledger", crate::replica::describe(home));
+        let here: Vec<&str> = p
+            .workers
+            .iter()
+            .filter(|(_, w)| w.on.is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        line(
+            here.is_empty(),
+            "workers",
+            if here.is_empty() {
+                "all on nodes".into()
+            } else {
+                format!(
+                    "{} run on the leader's own machine: their work does not move with the ledger and is run again when the leader changes. Give them on = \"nodes\"",
+                    here.join(", ")
+                )
+            },
+        );
+    }
     let free = crate::daemon::free_bytes(home).unwrap_or(0);
     line(
         free >= 1024 * 1024 * 1024,

@@ -2682,3 +2682,23 @@ fn one_replica_grows_to_two_and_can_still_be_chosen() {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn doctor_says_what_a_set_of_replicas_will_not_do() {
+    let homes = replica_homes("doc", r#"job = { cmd = { "true" } },"#, "");
+    let out = run(&homes[0], &["doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // Three is right, and all three homes answer without a daemon on any.
+    assert!(text.contains("ok    replicas   3 in cluster"), "{text}");
+    assert_eq!(text.matches("answers").count(), 3, "{text}");
+    assert!(
+        text.contains("empty, and votes only while every replica is"),
+        "{text}"
+    );
+    // Work in the leader's own cells does not move with the ledger.
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("FAIL  workers    job run on the leader's own machine"),
+        "{text}"
+    );
+}

@@ -81,6 +81,38 @@ fn snapshot_at(home: &Path) -> Option<u64> {
     serde_json::from_slice::<Value>(&bytes).ok()?["offset"].as_u64()
 }
 
+/// One line on what this home holds, for whoever is asked why no leader
+/// can be chosen.
+pub fn describe(home: &Path) -> String {
+    let (term, len) = last(home);
+    let state = if !usable(home) {
+        "cannot be replayed until a leader sends its snapshot"
+    } else if filling(home) {
+        "being filled, and votes only for a replica that holds more"
+    } else if len == 0 {
+        "empty, and votes only while every replica is"
+    } else {
+        "whole"
+    };
+    format!(
+        "term {}, ledger {len} bytes last written in term {term}, floor {}: {state}",
+        snap::read_epoch(home),
+        floor(home)
+    )
+}
+
+/// Whether the home a command reaches answers at all.
+pub fn reachable(cmd: &[String]) -> bool {
+    let ask = json!({"term": 0, "candidate": "doctor", "last_term": 0, "len": 0, "pre": true});
+    node::call(
+        cmd,
+        &["replica".into(), "vote".into()],
+        Some(ask.to_string().as_bytes()),
+        CALL,
+    )
+    .is_some_and(|out| serde_json::from_str::<Value>(out.trim()).is_ok())
+}
+
 /// Whether this home could be replayed: its snapshot reaches the floor.
 pub fn usable(home: &Path) -> bool {
     let floor = floor(home);
@@ -578,6 +610,7 @@ pub fn stand_by(
     // nobody, and that is not the same as the leader being gone.
     touch(home);
     let mut patience = QUIET_MS + jitter(QUIET_MS);
+    let mut said = Instant::now();
     loop {
         thread::sleep(Duration::from_millis(200));
         if quiet_for(home) < Duration::from_millis(patience) {
@@ -597,6 +630,13 @@ pub fn stand_by(
         if let Some(term) = campaign(home, me, id, most(peers.len()), &ask)? {
             eprintln!("inlet: replica {me} elected for term {term}");
             return Ok(term);
+        }
+        if said.elapsed() >= Duration::from_secs(60) {
+            // Not chosen, and nobody else has been either, for a while now.
+            said = Instant::now();
+            eprintln!(
+                "inlet: replica {me} has heard no leader and was not chosen; inlet doctor on each replica says what it holds"
+            );
         }
     }
 }
