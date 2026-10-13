@@ -504,7 +504,13 @@ fn run(home: &Path, standby: bool, replica: Option<String>) -> Result<()> {
         replica: replica.clone(),
         policy_seen: None,
         fatal: None,
-        force_compact: seeded,
+        // From the disk, not from what this start happened to do: a start
+        // that took an older ledger in and died before compacting it must
+        // not leave the next one thinking there is nothing to do.
+        force_compact: seeded
+            || (replica.is_some()
+                && replica::floor(home) == 0
+                && replica::terms(home).first() == Some(&(0, 0))),
         epoch_seen: Instant::now(),
         epochs: HashMap::new(),
     };

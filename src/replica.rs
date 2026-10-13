@@ -163,13 +163,20 @@ pub fn cluster(home: &Path) -> Option<String> {
 fn foreign(home: &Path, req: &Value) -> bool {
     match (cluster(home), req["id"].as_str()) {
         (Some(mine), Some(theirs)) => mine != theirs,
-        (Some(_), None) => true,
-        (None, _) => false,
+        // One side has no name yet. That is a replica at its beginning, or
+        // one whose first leader died before the name was settled; it is
+        // not another cluster.
+        _ => false,
     }
 }
 
-/// A home that belonged to nobody belongs to the first leader to fill it.
-fn adopt(home: &Path, req: &Value) -> Result<()> {
+/// A home takes a cluster's name with its bytes, not before. A name taken
+/// at a leader's first word, from a leader that then died having given
+/// nobody anything, would belong to a cluster that never was.
+fn adopt(home: &Path, req: &Value, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
     if let (None, Some(id)) = (cluster(home), req["id"].as_str()) {
         snap::durable(&id_path(home), id.as_bytes())?;
     }
@@ -208,7 +215,8 @@ fn quiet_for(home: &Path) -> Duration {
     fs::metadata(heard_path(home))
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|at| SystemTime::now().duration_since(at).ok())
+        // A time still to come is a vote just given: quiet for no time yet.
+        .map(|at| SystemTime::now().duration_since(at).unwrap_or_default())
         .unwrap_or(Duration::from_secs(3600))
 }
 
@@ -299,7 +307,6 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     if term < current {
         return Ok(json!({"ok": false, "term": current}));
     }
-    adopt(home, req)?;
     mark_refill(home, req)?;
     if term > current {
         set_epoch(home, term)?;
@@ -346,6 +353,7 @@ fn install(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     }
     ledger::punch(&file, at);
     clear_refill(home, len, req);
+    adopt(home, req, len)?;
     touch(home);
     Ok(json!({"ok": true, "len": len.min(same.max(at))}))
 }
@@ -360,7 +368,6 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
     if term < current {
         return Ok(json!({"ok": false, "term": current}));
     }
-    adopt(home, req)?;
     mark_refill(home, req)?;
     if term > current {
         // A daemon here that led an older term reads this and stops.
@@ -416,6 +423,7 @@ fn append(home: &Path, req: &Value, bytes: &[u8]) -> Result<Value> {
         len += more;
     }
     clear_refill(home, len, req);
+    adopt(home, req, len)?;
     // Again, now that the disk has been waited on: a slow fsync is not the
     // leader going quiet.
     touch(home);
@@ -479,9 +487,14 @@ fn answer_vote(home: &Path, req: &Value) -> Result<Value> {
     }
     if granted {
         snap::durable(&vote_path(home), format!("{term} {candidate}").as_bytes())?;
+        // The one chosen has a log to read before it can say a word. Give
+        // it that long, on top of the usual patience, before looking again.
         touch(home);
+        if let Ok(file) = File::open(heard_path(home)) {
+            let _ = file.set_modified(SystemTime::now() + Duration::from_secs(10));
+        }
     }
-    Ok(json!({"granted": granted, "term": snap::read_epoch(home)}))
+    Ok(json!({"granted": granted, "term": snap::read_epoch(home), "id": cluster(home)}))
 }
 
 #[derive(Clone)]
@@ -506,7 +519,7 @@ fn jitter(span: u64) -> u64 {
 
 /// Ask every peer, at once, and count the ones that say yes. This replica's
 /// own yes is counted by the caller.
-fn poll(peers: &[Peer], req: &Value) -> (usize, u64) {
+fn poll(peers: &[Peer], req: &Value) -> (usize, u64, Option<String>) {
     let (tx, rx) = mpsc::channel();
     for peer in peers {
         let (tx, cmd, body) = (tx.clone(), peer.cmd.clone(), req.to_string());
@@ -522,14 +535,16 @@ fn poll(peers: &[Peer], req: &Value) -> (usize, u64) {
         });
     }
     drop(tx);
-    let (mut yes, mut newest) = (0, 0);
+    let (mut yes, mut newest, mut id) = (0, 0, None);
     for v in rx.iter().flatten() {
         if v["granted"] == true {
             yes += 1;
+            // The cluster's name, from one that holds bytes under it.
+            id = id.or(v["id"].as_str().map(str::to_string));
         }
         newest = newest.max(v["term"].as_u64().unwrap_or(0));
     }
-    (yes, newest)
+    (yes, newest, id)
 }
 
 /// Wait, as a standby, until this replica is elected. Returns its term.
@@ -561,7 +576,7 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
         let ask = |term: u64, pre: bool| json!({"term": term, "candidate": me, "last_term": last_term, "len": len, "pre": pre, "id": id});
         // First whether a vote could be won, without disturbing anybody. A
         // replica cut off from the rest asks for ever and changes nothing.
-        let (yes, newest) = poll(peers, &ask(next, true));
+        let (yes, newest, _) = poll(peers, &ask(next, true));
         if yes + 1 < most {
             if newest >= next {
                 // They are in a later term than this replica knew of. Asking
@@ -585,7 +600,7 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
             snap::durable(&vote_path(home), format!("{term} {me}").as_bytes())?;
             term
         };
-        let (yes, newest) = poll(peers, &ask(term, false));
+        let (yes, newest, named) = poll(peers, &ask(term, false));
         if newest > term {
             let _guard = guard(home)?;
             if newest > snap::read_epoch(home) {
@@ -593,6 +608,11 @@ pub fn stand_by(home: &Path, me: &str, peers: &dyn Fn() -> Result<Vec<Peer>>) ->
             }
         }
         if yes + 1 >= most && snap::read_epoch(home) == term {
+            if let Some(id) = named {
+                // A leader that lost its name, or never had one, leads the
+                // cluster its voters are in and does not make another.
+                keep_cluster(home, &id)?;
+            }
             eprintln!("inlet: replica {me} elected for term {term}");
             touch(home);
             return Ok(term);
@@ -935,6 +955,13 @@ fn link(
             drop(shared);
             return done(&mut child, false);
         };
+        if header["op"] == "snap" {
+            // Answered: the allowance is over, whatever the answer was.
+            let mut shared = lock.lock().unwrap();
+            if let Some(at) = shared.seen.get_mut(&peer.name) {
+                *at = (*at).min(Instant::now());
+            }
+        }
         let Ok(reply) = serde_json::from_str::<Value>(&line) else {
             return done(&mut child, false);
         };
@@ -1204,6 +1231,37 @@ mod tests {
             .unwrap();
         let req = json!({"term": 9, "candidate": "c", "last_term": 4, "len": 1000, "pre": true});
         assert_eq!(answer_vote(&home, &req).unwrap()["granted"], true);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_name_is_taken_with_bytes_and_handed_on_with_a_vote() {
+        let home = home("name");
+        let t = vec![(1, 0)];
+        let from = |at: u64, bytes: &[u8]| {
+            let req = json!({"term": 1, "at": at, "n": bytes.len(), "terms": t, "id": "aaaa"});
+            append(&home, &req, bytes).unwrap()
+        };
+        // A first word, and nothing after it: that leader may have died
+        // having given nobody anything, and its name with it.
+        from(50, b"");
+        assert_eq!(cluster(&home), None);
+        assert_eq!(from(0, &[b'a'; 50])["len"], 50);
+        assert_eq!(cluster(&home).as_deref(), Some("aaaa"));
+        // The leader itself wrote its name down only after most had its
+        // record, and died first. It comes back with the log and no name.
+        // It is not a stranger, and the vote tells it the name.
+        let old = SystemTime::now() - Duration::from_secs(60);
+        File::open(heard_path(&home))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let ask = json!({"term": 2, "candidate": "a", "last_term": 1, "len": 50, "pre": false, "id": null});
+        let reply = answer_vote(&home, &ask).unwrap();
+        assert_eq!(reply["granted"], true);
+        assert_eq!(reply["id"], "aaaa");
+        // Having voted, it waits out the new leader's reading of its log.
+        assert!(quiet_for(&home) < Duration::from_secs(1));
         let _ = fs::remove_dir_all(&home);
     }
 }
